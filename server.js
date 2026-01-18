@@ -1,12 +1,10 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const jwt = require('jsonwebtoken');
 const admin = require('firebase-admin');
-const { OAuth2Client } = require('google-auth-library');
 const { Resend } = require('resend');
 const cron = require('node-cron');
-const jwksClient = require('jwks-rsa');
+const crypto = require('crypto');
 
 // ============================================
 // FIREBASE INITIALIZATION
@@ -25,26 +23,6 @@ console.log('🔥 Firebase initialized');
 // ============================================
 const resend = new Resend(process.env.RESEND_API_KEY);
 console.log('📧 Resend initialized');
-
-// ============================================
-// GOOGLE OAUTH CLIENT
-// ============================================
-const GOOGLE_CLIENT_ID = '649355169810-kir1ih5clek7qh1kndl4774ndsrg0stl.apps.googleusercontent.com';
-const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
-
-// ============================================
-// 🍎 APPLE AUTH CONFIG - OPTIMIZED & SIMPLIFIED
-// ============================================
-// ✅ ONLY thing you need: Your Apple Service ID (Bundle ID)
-const APPLE_CLIENT_ID = 'com.73.stillalive.signin';
-
-// ✅ Apple's JWKS client for token verification (NO .p8 file needed!)
-const appleJwksClient = jwksClient({
-    jwksUri: 'https://appleid.apple.com/auth/keys',
-    cache: true,
-    cacheMaxEntries: 5,
-    cacheMaxAge: 600000 // 10 minutes (reduced from 10 hours for better security)
-});
 
 // ============================================
 // EXPRESS APP SETUP
@@ -67,7 +45,7 @@ const MAX_CHECK_IN_FREQUENCY = 30;
 // HELPER FUNCTIONS
 // ============================================
 
-// Generate 6-character code (no confusing chars: 0, O, I, 1)
+// Generate 6-character code
 const generateCode = () => {
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
     let code = '';
@@ -77,31 +55,49 @@ const generateCode = () => {
     return code;
 };
 
-// Generate JWT token
-const generateToken = (user) => {
-    return jwt.sign(
-        { uid: user.uid, email: user.email },
-        process.env.JWT_SECRET || 'your-secret-key-change-in-production',
-        { expiresIn: '30d' }
-    );
-};
+// 🔥 FIXED: Get existing user or create new one
+const getUserByDeviceId = async (deviceId) => {
+    if (!deviceId) {
+        return { success: false, error: 'Device ID is required' };
+    }
 
-// Auth middleware
-const authenticate = async (req, res, next) => {
     try {
-        const token = req.headers.authorization?.split(' ')[1];
-        if (!token) {
-            return res.status(401).json({ success: false, error: 'No token provided' });
+        const userRef = db.collection('users').doc(deviceId);
+        const userDoc = await userRef.get();
+
+        if (userDoc.exists) {
+            // User already exists - return existing data
+            return {
+                success: true,
+                user: { id: deviceId, ...userDoc.data() },
+                isNew: false
+            };
         }
 
-        const decoded = jwt.verify(
-            token,
-            process.env.JWT_SECRET || 'your-secret-key-change-in-production'
-        );
-        req.user = decoded;
-        next();
+        // User doesn't exist - create new user
+        const userData = {
+            deviceId,
+            displayName: 'User',
+            code: null,
+            squadMembers: [],
+            checkInFrequency: 1,
+            streak: 0,
+            lastCheckIn: null,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        };
+
+        await userRef.set(userData);
+        console.log('✅ New user created with device:', deviceId);
+
+        return {
+            success: true,
+            user: { id: deviceId, ...userData },
+            isNew: true
+        };
     } catch (error) {
-        return res.status(401).json({ success: false, error: 'Invalid token' });
+        console.error('❌ Error in getUserByDeviceId:', error);
+        return { success: false, error: error.message };
     }
 };
 
@@ -153,7 +149,7 @@ const getSeverityEmoji = (overdueTime) => {
 
 const sendMissedCheckInEmail = async (user, squadMemberEmail, overdueTime) => {
     try {
-        const userName = user.displayName || user.email.split('@')[0];
+        const userName = user.displayName || 'Your friend';
         const firstName = userName.split(' ')[0];
         const streak = user.streak || 0;
         const frequency = user.checkInFrequency || 1;
@@ -479,16 +475,10 @@ const sendMissedCheckInEmail = async (user, squadMemberEmail, overdueTime) => {
                     <p>💡 <strong>Why this matters:</strong> ${personalizedMessage}</p>
                 </div>
                 
-                <div class="cta-section">
-                    <a href="mailto:${user.email}" class="cta-button">
-                        📧 Contact ${firstName} Now
-                    </a>
-                </div>
-                
                 <div class="tips-section">
                     <h3>🤔 What should you do?</h3>
                     <ul>
-                        <li><strong>Reach out immediately</strong> - Send a text, call, or email ${firstName}</li>
+                        <li><strong>Reach out immediately</strong> - Send a text, call, or check on ${firstName}</li>
                         <li><strong>Check their usual spots</strong> - Visit or contact mutual friends/family</li>
                         <li><strong>Trust your instincts</strong> - If something feels wrong, it might be</li>
                         <li><strong>Emergency services</strong> - Don't hesitate to call if you're seriously concerned</li>
@@ -534,52 +524,6 @@ const sendMissedCheckInEmail = async (user, squadMemberEmail, overdueTime) => {
     } catch (error) {
         console.error('❌ Send email error:', error);
         return { success: false, error };
-    }
-};
-
-// ============================================
-// 🍎 APPLE AUTH HELPER - SIMPLIFIED & OPTIMIZED
-// ============================================
-
-/**
- * ✅ SIMPLIFIED Apple Token Verification
- * NO .p8 file needed! Just verifies tokens from iOS/web clients
- */
-// ============================================
-// 🍎 APPLE AUTH CONFIG - iOS ONLY
-// ============================================
-const verifyAppleToken = async (identityToken) => {
-    try {
-        console.log('🔍 Verifying Apple token...');
-        
-        const decodedToken = jwt.decode(identityToken, { complete: true });
-        
-        if (!decodedToken) {
-            throw new Error('Invalid Apple ID token format');
-        }
-
-        const { kid } = decodedToken.header;
-        console.log('🔑 Apple token kid:', kid);
-        
-        const key = await appleJwksClient.getSigningKey(kid);
-        const publicKey = key.getPublicKey();
-
-        const verified = jwt.verify(identityToken, publicKey, {
-            algorithms: ['RS256'],
-            issuer: 'https://appleid.apple.com',
-            audience: APPLE_CLIENT_ID  // Your Service ID
-        });
-
-        console.log('✅ Apple token verified:', verified.sub);
-        
-        return {
-            appleId: verified.sub,
-            email: verified.email || null,
-            emailVerified: verified.email_verified === 'true' || verified.email_verified === true
-        };
-    } catch (error) {
-        console.error('❌ Apple token verification failed:', error.message);
-        throw new Error(`Apple auth failed: ${error.message}`);
     }
 };
 
@@ -649,7 +593,7 @@ const checkMissedCheckIns = async () => {
                 }
 
                 missedCount++;
-                console.log(`⚠️ MISSED: ${userData.displayName || userData.email} (overdue: ${formatTimeDifference(overdueTime)})`);
+                console.log(`⚠️ MISSED: ${userData.displayName || 'User'} (overdue: ${formatTimeDifference(overdueTime)})`);
 
                 for (const member of squadMembers) {
                     const emailPromise = sendMissedCheckInEmail(userData, member.email, overdueTime)
@@ -669,8 +613,7 @@ const checkMissedCheckIns = async () => {
                 batch.set(alertRef, {
                     alertKey,
                     userId,
-                    userEmail: userData.email,
-                    userName: userData.displayName || userData.email,
+                    userName: userData.displayName || 'User',
                     lastCheckIn: admin.firestore.Timestamp.fromDate(lastCheckIn),
                     alertSentAt: admin.firestore.FieldValue.serverTimestamp(),
                     squadMembersNotified: squadMembers.map(m => m.email),
@@ -720,276 +663,53 @@ app.get('/health', (req, res) => {
         features: {
             emailAlerts: true,
             cronJob: true,
-            googleAuth: true,
-            appleAuth: true
+            deviceIdAuth: true
         }
     });
 });
 
 // ============================================
-// AUTH ROUTES
+// DEVICE AUTH MIDDLEWARE - FIXED
 // ============================================
 
-app.post('/api/auth/google', async (req, res) => {
+const getDeviceId = async (req, res, next) => {
     try {
-        const { idToken } = req.body;
+        const { deviceId } = req.body;
 
-        if (!idToken) {
-            return res.status(400).json({ success: false, error: 'idToken required' });
-        }
-
-        console.log('🔑 Verifying Google token...');
-
-        const ticket = await googleClient.verifyIdToken({
-            idToken: idToken,
-            audience: GOOGLE_CLIENT_ID,
-        });
-
-        const payload = ticket.getPayload();
-        const uid = payload['sub'];
-        const email = payload['email'];
-        const name = payload['name'];
-        const picture = payload['picture'];
-
-        console.log('✅ Google token verified:', email);
-
-        const userRef = db.collection('users').doc(uid);
-        const userDoc = await userRef.get();
-
-        let userData;
-
-        if (userDoc.exists) {
-            userData = { uid, ...userDoc.data() };
-            await userRef.update({
-                lastLogin: admin.firestore.FieldValue.serverTimestamp(),
+        if (!deviceId) {
+            return res.status(400).json({
+                success: false,
+                error: 'Device ID required'
             });
-            console.log('✅ User logged in:', email);
-        } else {
-            userData = {
-                uid,
-                email,
-                displayName: name || email.split('@')[0],
-                photoURL: picture || '',
-                code: null,
-                squadMembers: [],
-                checkInFrequency: 1,
-                streak: 0,
-                lastCheckIn: null,
-                authProvider: 'google',
-                createdAt: admin.firestore.FieldValue.serverTimestamp(),
-                lastLogin: admin.firestore.FieldValue.serverTimestamp(),
-            };
-            await userRef.set(userData);
-            console.log('✅ New user created:', email);
         }
 
-        const token = generateToken({ uid, email });
+        // Get existing user or create new one if doesn't exist
+        const result = await getUserByDeviceId(deviceId);
 
-        res.json({
-            success: true,
-            token,
-            user: {
-                uid: userData.uid,
-                email: userData.email,
-                displayName: userData.displayName,
-                photoURL: userData.photoURL,
-                code: userData.code,
-                squadMembers: userData.squadMembers || [],
-                checkInFrequency: userData.checkInFrequency || 1,
-                streak: userData.streak || 0,
-                lastCheckIn: userData.lastCheckIn,
-            },
-        });
+        if (!result.success) {
+            return res.status(500).json({
+                success: false,
+                error: result.error
+            });
+        }
+
+        req.deviceId = deviceId;
+        req.user = result.user;
+        req.isNewUser = result.isNew;
+        next();
     } catch (error) {
-        console.error('❌ Google login error:', error);
-        res.status(401).json({
-            success: false,
-            error: 'Login failed',
-            message: error.message
-        });
+        console.error('❌ Device auth error:', error);
+        res.status(500).json({ success: false, error: 'Device authentication failed' });
     }
-});
+};
 
 // ============================================
-// 🍎 APPLE AUTH - OPTIMIZED & PRODUCTION READY
+// USER ROUTES - OPTIMIZED
 // ============================================
 
-app.post('/api/auth/apple', async (req, res) => {
+app.post('/api/users/me', getDeviceId, async (req, res) => {
     try {
-        const { idToken, email, displayName } = req.body;
-
-        if (!idToken) {
-            return res.status(400).json({ success: false, error: 'Apple identityToken required' });
-        }
-
-        console.log('🍎 Verifying Apple token...');
-
-        // ✅ Verify Apple token (NO .p8 file needed!)
-        const applePayload = await verifyAppleToken(idToken);
-
-        if (!applePayload || !applePayload.appleId) {
-            throw new Error('Invalid Apple token payload');
-        }
-
-        // ✅ Create unique UID with apple_ prefix (prevents conflicts with Google)
-        const uid = `apple_${applePayload.appleId}`;
-
-        // ✅ Handle email (Apple only provides it on FIRST login)
-        const userEmail = applePayload.email || email || `${applePayload.appleId}@privaterelay.appleid.com`;
-
-        // ✅ Handle display name
-        let userName = displayName;
-        if (!userName) {
-            if (applePayload.email && applePayload.email.includes('@')) {
-                userName = applePayload.email.split('@')[0];
-            } else if (email && email.includes('@')) {
-                userName = email.split('@')[0];
-            } else {
-                userName = 'Apple User';
-            }
-        }
-
-        console.log('✅ Apple token verified:', userEmail);
-
-        const userRef = db.collection('users').doc(uid);
-        const userDoc = await userRef.get();
-
-        let userData;
-
-        if (userDoc.exists) {
-            // ✅ Existing user - update last login
-            userData = { uid, ...userDoc.data() };
-
-            const updateData = {
-                lastLogin: admin.firestore.FieldValue.serverTimestamp()
-            };
-
-            // Only update email if Apple provides a real one
-            if (applePayload.email) {
-                updateData.email = applePayload.email;
-            }
-
-            // Only update displayName if provided
-            if (displayName) {
-                updateData.displayName = displayName;
-            }
-
-            await userRef.update(updateData);
-            console.log('✅ Apple user logged in:', userEmail);
-        } else {
-            // ✅ New user - create record
-            userData = {
-                uid,
-                email: userEmail,
-                displayName: userName,
-                photoURL: '', // Apple doesn't provide profile photos
-                code: null,
-                squadMembers: [],
-                checkInFrequency: 1,
-                streak: 0,
-                lastCheckIn: null,
-                authProvider: 'apple',
-                appleId: applePayload.appleId,
-                createdAt: admin.firestore.FieldValue.serverTimestamp(),
-                lastLogin: admin.firestore.FieldValue.serverTimestamp(),
-            };
-            await userRef.set(userData);
-            console.log('✅ New Apple user created:', userEmail);
-        }
-
-        // ✅ Generate JWT token (same format as Google)
-        const token = generateToken({ uid, email: userEmail });
-
-        res.json({
-            success: true,
-            token,
-            user: {
-                uid: userData.uid,
-                email: userData.email,
-                displayName: userData.displayName,
-                photoURL: userData.photoURL,
-                code: userData.code,
-                squadMembers: userData.squadMembers || [],
-                checkInFrequency: userData.checkInFrequency || 1,
-                streak: userData.streak || 0,
-                lastCheckIn: userData.lastCheckIn,
-            },
-        });
-    } catch (error) {
-        console.error('❌ Apple login error:', error);
-        res.status(401).json({
-            success: false,
-            error: 'Apple login failed',
-            message: error.message
-        });
-    }
-});
-
-app.post('/api/auth/logout', authenticate, async (req, res) => {
-    try {
-        console.log('🚪 User logged out:', req.user.email);
-        res.json({
-            success: true,
-            message: 'Logged out successfully',
-        });
-    } catch (error) {
-        console.error('❌ Logout error:', error);
-        res.status(500).json({ success: false, error: 'Logout failed' });
-    }
-});
-
-app.delete('/api/auth/delete-account', authenticate, async (req, res) => {
-    try {
-        const userId = req.user.uid;
-        console.log('🗑️ Deleting account:', req.user.email);
-
-        await db.collection('users').doc(userId).delete();
-
-        const targetSnapshot = await db
-            .collection('watching')
-            .where('targetUserId', '==', userId)
-            .get();
-        const targetDeletes = targetSnapshot.docs.map(doc => doc.ref.delete());
-        await Promise.all(targetDeletes);
-
-        const checkinsSnapshot = await db
-            .collection('checkins')
-            .where('userId', '==', userId)
-            .get();
-        const checkinDeletes = checkinsSnapshot.docs.map(doc => doc.ref.delete());
-        await Promise.all(checkinDeletes);
-
-        const alertsSnapshot = await db
-            .collection('missedCheckInAlerts')
-            .where('userId', '==', userId)
-            .get();
-        const alertDeletes = alertsSnapshot.docs.map(doc => doc.ref.delete());
-        await Promise.all(alertDeletes);
-
-        console.log('✅ Account deleted:', req.user.email);
-
-        res.json({
-            success: true,
-            deleted: {
-                user: true,
-                watchingEntries: targetSnapshot.size,
-                checkins: checkinsSnapshot.size,
-                alerts: alertsSnapshot.size,
-            },
-        });
-    } catch (error) {
-        console.error('❌ Delete account error:', error);
-        res.status(500).json({ success: false, error: 'Failed to delete account' });
-    }
-});
-
-// ============================================
-// USER ROUTES
-// ============================================
-
-app.get('/api/users/me', authenticate, async (req, res) => {
-    try {
-        const userDoc = await db.collection('users').doc(req.user.uid).get();
+        const userDoc = await db.collection('users').doc(req.deviceId).get();
 
         if (!userDoc.exists) {
             return res.status(404).json({ success: false, error: 'User not found' });
@@ -1000,10 +720,48 @@ app.get('/api/users/me', authenticate, async (req, res) => {
         res.json({
             success: true,
             user: {
-                uid: req.user.uid,
-                email: userData.email,
+                deviceId: req.deviceId,
                 displayName: userData.displayName,
-                photoURL: userData.photoURL,
+                code: userData.code,
+                squadMembers: userData.squadMembers || [],
+                checkInFrequency: userData.checkInFrequency || 1,
+                streak: userData.streak || 0,
+                lastCheckIn: userData.lastCheckIn,
+                createdAt: userData.createdAt,
+            },
+            isNewUser: req.isNewUser || false,
+        });
+    } catch (error) {
+        console.error('❌ Get user error:', error);
+        res.status(500).json({ success: false, error: 'Failed to get user' });
+    }
+});
+
+app.post('/api/users/update-name', getDeviceId, async (req, res) => {
+    try {
+        const { displayName } = req.body;
+
+        if (!displayName || displayName.trim().length === 0) {
+            return res.status(400).json({ success: false, error: 'Display name required' });
+        }
+
+        const userRef = db.collection('users').doc(req.deviceId);
+
+        await userRef.update({
+            displayName: displayName.trim(),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+
+        console.log('✅ Display name updated:', req.deviceId, '→', displayName);
+
+        const updatedDoc = await userRef.get();
+        const userData = updatedDoc.data();
+
+        res.json({
+            success: true,
+            user: {
+                deviceId: req.deviceId,
+                displayName: userData.displayName,
                 code: userData.code,
                 squadMembers: userData.squadMembers || [],
                 checkInFrequency: userData.checkInFrequency || 1,
@@ -1012,12 +770,12 @@ app.get('/api/users/me', authenticate, async (req, res) => {
             },
         });
     } catch (error) {
-        console.error('❌ Get user error:', error);
-        res.status(500).json({ success: false, error: 'Failed to get user' });
+        console.error('❌ Update name error:', error);
+        res.status(500).json({ success: false, error: 'Failed to update name' });
     }
 });
 
-app.put('/api/users/checkin-frequency', authenticate, async (req, res) => {
+app.post('/api/users/checkin-frequency', getDeviceId, async (req, res) => {
     try {
         const { frequency } = req.body;
 
@@ -1034,19 +792,14 @@ app.put('/api/users/checkin-frequency', authenticate, async (req, res) => {
             });
         }
 
-        const userRef = db.collection('users').doc(req.user.uid);
-        const userDoc = await userRef.get();
-
-        if (!userDoc.exists) {
-            return res.status(404).json({ success: false, error: 'User not found' });
-        }
+        const userRef = db.collection('users').doc(req.deviceId);
 
         await userRef.update({
             checkInFrequency: days,
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
 
-        console.log('✅ Check-in frequency updated:', req.user.email, '→', days, 'days');
+        console.log('✅ Check-in frequency updated:', req.deviceId, '→', days, 'days');
 
         res.json({
             success: true,
@@ -1059,9 +812,9 @@ app.put('/api/users/checkin-frequency', authenticate, async (req, res) => {
     }
 });
 
-app.post('/api/users/generate-code', authenticate, async (req, res) => {
+app.post('/api/users/generate-code', getDeviceId, async (req, res) => {
     try {
-        const userRef = db.collection('users').doc(req.user.uid);
+        const userRef = db.collection('users').doc(req.deviceId);
         const userDoc = await userRef.get();
 
         if (!userDoc.exists) {
@@ -1105,7 +858,7 @@ app.post('/api/users/generate-code', authenticate, async (req, res) => {
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
 
-        console.log('✅ Code generated:', req.user.email, '→', code);
+        console.log('✅ Code generated:', req.deviceId, '→', code);
 
         res.json({
             success: true,
@@ -1118,10 +871,124 @@ app.post('/api/users/generate-code', authenticate, async (req, res) => {
 });
 
 // ============================================
+// CHECK-IN ROUTES - OPTIMIZED
+// ============================================
+
+app.post('/api/users/checkin', getDeviceId, async (req, res) => {
+    try {
+        const userRef = db.collection('users').doc(req.deviceId);
+        const userDoc = await userRef.get();
+
+        if (!userDoc.exists) {
+            return res.status(404).json({ success: false, error: 'User not found' });
+        }
+
+        const userData = userDoc.data();
+        const now = new Date();
+        const lastCheckIn = userData.lastCheckIn?.toDate();
+
+        const checkInFrequency = userData.checkInFrequency || 1;
+        const intervalMs = getCheckInIntervalMs(checkInFrequency);
+
+        let newStreak = userData.streak || 0;
+
+        if (lastCheckIn) {
+            const timeSinceLastCheckIn = now - lastCheckIn;
+
+            if (timeSinceLastCheckIn <= intervalMs * 2) {
+                newStreak += 1;
+            } else {
+                newStreak = 1;
+            }
+        } else {
+            newStreak = 1;
+        }
+
+        const checkInTimestamp = admin.firestore.Timestamp.fromDate(now);
+
+        const batch = db.batch();
+
+        batch.update(userRef, {
+            lastCheckIn: checkInTimestamp,
+            streak: newStreak,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+
+        const checkinRef = db.collection('checkins').doc();
+        batch.set(checkinRef, {
+            userId: req.deviceId,
+            checkedInAt: checkInTimestamp,
+            streak: newStreak,
+        });
+
+        await batch.commit();
+
+        console.log('✅ Check-in:', req.deviceId, '→ Streak:', newStreak);
+
+        res.json({
+            success: true,
+            user: {
+                deviceId: req.deviceId,
+                displayName: userData.displayName,
+                code: userData.code,
+                squadMembers: userData.squadMembers || [],
+                checkInFrequency: userData.checkInFrequency || 1,
+                streak: newStreak,
+                lastCheckIn: checkInTimestamp,
+            },
+        });
+    } catch (error) {
+        console.error('❌ Check-in error:', error);
+        res.status(500).json({ success: false, error: 'Failed to check in' });
+    }
+});
+
+app.post('/api/users/checkin/status', getDeviceId, async (req, res) => {
+    try {
+        const userDoc = await db.collection('users').doc(req.deviceId).get();
+
+        if (!userDoc.exists) {
+            return res.status(404).json({ success: false, error: 'User not found' });
+        }
+
+        const userData = userDoc.data();
+        const now = new Date();
+        const lastCheckIn = userData.lastCheckIn?.toDate();
+
+        const checkInFrequency = userData.checkInFrequency || 1;
+        const intervalMs = getCheckInIntervalMs(checkInFrequency);
+
+        let canCheckIn = true;
+        let timeRemaining = 0;
+
+        if (lastCheckIn) {
+            const timeSinceLastCheckIn = now - lastCheckIn;
+
+            if (timeSinceLastCheckIn < intervalMs) {
+                canCheckIn = false;
+                timeRemaining = intervalMs - timeSinceLastCheckIn;
+            }
+        }
+
+        res.json({
+            success: true,
+            canCheckIn,
+            timeRemaining,
+            checkInFrequency,
+            lastCheckIn: lastCheckIn?.toISOString() || null,
+            streak: userData.streak || 0,
+        });
+    } catch (error) {
+        console.error('❌ Get check-in status error:', error);
+        res.status(500).json({ success: false, error: 'Failed to get status' });
+    }
+});
+
+// ============================================
 // SQUAD ROUTES
 // ============================================
 
-app.post('/api/squad/add-member', authenticate, async (req, res) => {
+app.post('/api/squad/add-member', getDeviceId, async (req, res) => {
     try {
         const { email } = req.body;
 
@@ -1129,7 +996,7 @@ app.post('/api/squad/add-member', authenticate, async (req, res) => {
             return res.status(400).json({ success: false, error: 'Email required' });
         }
 
-        const userRef = db.collection('users').doc(req.user.uid);
+        const userRef = db.collection('users').doc(req.deviceId);
         const userDoc = await userRef.get();
 
         if (!userDoc.exists) {
@@ -1175,7 +1042,7 @@ app.post('/api/squad/add-member', authenticate, async (req, res) => {
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
 
-        console.log('✅ Squad member added:', req.user.email, '→', emailLower);
+        console.log('✅ Squad member added:', req.deviceId, '→', emailLower);
 
         res.json({
             success: true,
@@ -1188,9 +1055,9 @@ app.post('/api/squad/add-member', authenticate, async (req, res) => {
     }
 });
 
-app.get('/api/squad/members', authenticate, async (req, res) => {
+app.post('/api/squad/members', getDeviceId, async (req, res) => {
     try {
-        const userDoc = await db.collection('users').doc(req.user.uid).get();
+        const userDoc = await db.collection('users').doc(req.deviceId).get();
 
         if (!userDoc.exists) {
             return res.status(404).json({ success: false, error: 'User not found' });
@@ -1208,11 +1075,11 @@ app.get('/api/squad/members', authenticate, async (req, res) => {
     }
 });
 
-app.delete('/api/squad/members/:id', authenticate, async (req, res) => {
+app.post('/api/squad/members/:id/remove', getDeviceId, async (req, res) => {
     try {
         const { id } = req.params;
 
-        const userRef = db.collection('users').doc(req.user.uid);
+        const userRef = db.collection('users').doc(req.deviceId);
         const userDoc = await userRef.get();
 
         if (!userDoc.exists) {
@@ -1233,7 +1100,7 @@ app.delete('/api/squad/members/:id', authenticate, async (req, res) => {
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
 
-        console.log('✅ Squad member removed:', req.user.email, '→ ID:', id);
+        console.log('✅ Squad member removed:', req.deviceId, '→ ID:', id);
 
         res.json({
             success: true,
@@ -1247,7 +1114,7 @@ app.delete('/api/squad/members/:id', authenticate, async (req, res) => {
 });
 
 // ============================================
-// WATCHING ROUTES
+// WATCHING ROUTES (SAME AS BEFORE)
 // ============================================
 
 app.post('/api/watching/add', async (req, res) => {
@@ -1457,118 +1324,55 @@ app.delete('/api/watching/:id', async (req, res) => {
 });
 
 // ============================================
-// CHECK-IN ROUTES - OPTIMIZED
+// ACCOUNT MANAGEMENT
 // ============================================
 
-app.post('/api/users/checkin', authenticate, async (req, res) => {
+app.post('/api/account/delete', getDeviceId, async (req, res) => {
     try {
-        const userRef = db.collection('users').doc(req.user.uid);
-        const userDoc = await userRef.get();
+        const deviceId = req.deviceId;
+        console.log('🗑️ Deleting account for device:', deviceId);
 
-        if (!userDoc.exists) {
-            return res.status(404).json({ success: false, error: 'User not found' });
-        }
+        // Delete user
+        await db.collection('users').doc(deviceId).delete();
 
-        const userData = userDoc.data();
-        const now = new Date();
-        const lastCheckIn = userData.lastCheckIn?.toDate();
+        // Delete watching entries where this user is being watched
+        const targetSnapshot = await db
+            .collection('watching')
+            .where('targetUserId', '==', deviceId)
+            .get();
+        const targetDeletes = targetSnapshot.docs.map(doc => doc.ref.delete());
+        await Promise.all(targetDeletes);
 
-        const checkInFrequency = userData.checkInFrequency || 1;
-        const intervalMs = getCheckInIntervalMs(checkInFrequency);
+        // Delete checkins
+        const checkinsSnapshot = await db
+            .collection('checkins')
+            .where('userId', '==', deviceId)
+            .get();
+        const checkinDeletes = checkinsSnapshot.docs.map(doc => doc.ref.delete());
+        await Promise.all(checkinDeletes);
 
-        let newStreak = userData.streak || 0;
+        // Delete alerts
+        const alertsSnapshot = await db
+            .collection('missedCheckInAlerts')
+            .where('userId', '==', deviceId)
+            .get();
+        const alertDeletes = alertsSnapshot.docs.map(doc => doc.ref.delete());
+        await Promise.all(alertDeletes);
 
-        if (lastCheckIn) {
-            const timeSinceLastCheckIn = now - lastCheckIn;
-
-            if (timeSinceLastCheckIn <= intervalMs * 2) {
-                newStreak += 1;
-            } else {
-                newStreak = 1;
-            }
-        } else {
-            newStreak = 1;
-        }
-
-        const checkInTimestamp = admin.firestore.Timestamp.fromDate(now);
-
-        const batch = db.batch();
-
-        batch.update(userRef, {
-            lastCheckIn: checkInTimestamp,
-            streak: newStreak,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-
-        const checkinRef = db.collection('checkins').doc();
-        batch.set(checkinRef, {
-            userId: req.user.uid,
-            checkedInAt: checkInTimestamp,
-            streak: newStreak,
-        });
-
-        await batch.commit();
-
-        console.log('✅ Check-in:', req.user.email, '→ Streak:', newStreak);
+        console.log('✅ Account deleted for device:', deviceId);
 
         res.json({
             success: true,
-            user: {
-                uid: req.user.uid,
-                email: userData.email,
-                displayName: userData.displayName,
-                photoURL: userData.photoURL,
-                code: userData.code,
-                squadMembers: userData.squadMembers || [],
-                checkInFrequency: userData.checkInFrequency || 1,
-                streak: newStreak,
-                lastCheckIn: checkInTimestamp,
+            deleted: {
+                user: true,
+                watchingEntries: targetSnapshot.size,
+                checkins: checkinsSnapshot.size,
+                alerts: alertsSnapshot.size,
             },
         });
     } catch (error) {
-        console.error('❌ Check-in error:', error);
-        res.status(500).json({ success: false, error: 'Failed to check in' });
-    }
-});
-
-app.get('/api/users/checkin/status', authenticate, async (req, res) => {
-    try {
-        const userDoc = await db.collection('users').doc(req.user.uid).get();
-
-        if (!userDoc.exists) {
-            return res.status(404).json({ success: false, error: 'User not found' });
-        }
-
-        const userData = userDoc.data();
-        const now = new Date();
-        const lastCheckIn = userData.lastCheckIn?.toDate();
-
-        const checkInFrequency = userData.checkInFrequency || 1;
-        const intervalMs = getCheckInIntervalMs(checkInFrequency);
-
-        let canCheckIn = true;
-        let timeRemaining = 0;
-
-        if (lastCheckIn) {
-            const timeSinceLastCheckIn = now - lastCheckIn;
-
-            if (timeSinceLastCheckIn < intervalMs) {
-                canCheckIn = false;
-                timeRemaining = intervalMs - timeSinceLastCheckIn;
-            }
-        }
-
-        res.json({
-            success: true,
-            canCheckIn,
-            timeRemaining,
-            checkInFrequency,
-            lastCheckIn: lastCheckIn?.toISOString() || null,
-            streak: userData.streak || 0,
-        });
-    } catch (error) {
-        console.error('❌ Get check-in status error:', error);
-        res.status(500).json({ success: false, error: 'Failed to get status' });
+        console.error('❌ Delete account error:', error);
+        res.status(500).json({ success: false, error: 'Failed to delete account' });
     }
 });
 
@@ -1596,9 +1400,9 @@ app.use((err, req, res, next) => {
 // ============================================
 // START SERVER
 // ============================================
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
     console.log(`\n${'='.repeat(60)}`);
-    console.log(`🚀 STILL ALIVE SERVER - PRODUCTION READY`);
+    console.log(`🚀 STILL ALIVE SERVER - DEVICE ID ONLY`);
     console.log(`${'='.repeat(60)}\n`);
     console.log(`📡 Server:          http://localhost:${PORT}`);
     console.log(`📝 Environment:     ${process.env.NODE_ENV || 'development'}`);
@@ -1607,13 +1411,12 @@ app.listen(PORT, () => {
     console.log(`💰 Cost optimized:  ✅ Batch queries`);
     console.log(`🎨 Email design:    ✅ Ultra personalized`);
     console.log(`⚡ Check-in:        ✅ Optimized (batched)`);
-    console.log(`🍎 Apple Auth:      ✅ SIMPLIFIED (NO .p8 needed!)`);
-    console.log(`🔐 Auth Providers:  ✅ Google + ✅ Apple\n`);
-    console.log(`📋 API Routes:`);
-    console.log(`   🔐 Google:   POST /api/auth/google`);
-    console.log(`   🍎 Apple:    POST /api/auth/apple`);
-    console.log(`   👤 User:     GET/PUT /api/users/*`);
-    console.log(`   👥 Squad:    GET/POST/DELETE /api/squad/*`);
+    console.log(`🔐 Auth:            ✅ Device ID only (NO LOGIN)`);
+    console.log(`🔧 Fixes:           ✅ No duplicate users`);
+    console.log(`🔧 Fixes:           ✅ Return existing data`);
+    console.log(`\n📋 API Routes:`);
+    console.log(`   👤 User:     POST /api/users/* (requires deviceId in body)`);
+    console.log(`   👥 Squad:    POST /api/squad/* (requires deviceId in body)`);
     console.log(`   👁️  Watch:    GET/POST/DELETE /api/watching/*`);
     console.log(`\n${'='.repeat(60)}`);
 });
