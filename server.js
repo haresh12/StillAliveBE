@@ -7,16 +7,28 @@ const cron = require('node-cron');
 const crypto = require('crypto');
 
 // ============================================
-// FIREBASE INITIALIZATION
+// FIREBASE INITIALIZATION FROM ENV
 // ============================================
-const serviceAccount = require('./firebase-service-account.json');
+const serviceAccount = {
+    type: process.env.FIREBASE_TYPE,
+    project_id: process.env.FIREBASE_PROJECT_ID,
+    private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
+    private_key: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+    client_email: process.env.FIREBASE_CLIENT_EMAIL,
+    client_id: process.env.FIREBASE_CLIENT_ID,
+    auth_uri: process.env.FIREBASE_AUTH_URI,
+    token_uri: process.env.FIREBASE_TOKEN_URI,
+    auth_provider_x509_cert_url: process.env.FIREBASE_AUTH_PROVIDER_CERT_URL,
+    client_x509_cert_url: process.env.FIREBASE_CLIENT_CERT_URL,
+    universe_domain: process.env.FIREBASE_UNIVERSE_DOMAIN
+};
 
 admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
 });
 
 const db = admin.firestore();
-console.log('🔥 Firebase initialized');
+console.log('🔥 Firebase initialized from environment variables');
 
 // ============================================
 // RESEND INITIALIZATION
@@ -663,7 +675,8 @@ app.get('/health', (req, res) => {
         features: {
             emailAlerts: true,
             cronJob: true,
-            deviceIdAuth: true
+            deviceIdAuth: true,
+            firebaseFromEnv: true
         }
     });
 });
@@ -1114,7 +1127,7 @@ app.post('/api/squad/members/:id/remove', getDeviceId, async (req, res) => {
 });
 
 // ============================================
-// WATCHING ROUTES (SAME AS BEFORE)
+// WATCHING ROUTES
 // ============================================
 
 app.post('/api/watching/add', async (req, res) => {
@@ -1414,6 +1427,7 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log(`🔐 Auth:            ✅ Device ID only (NO LOGIN)`);
     console.log(`🔧 Fixes:           ✅ No duplicate users`);
     console.log(`🔧 Fixes:           ✅ Return existing data`);
+    console.log(`🔥 Firebase:        ✅ Loaded from .env`);
     console.log(`\n📋 API Routes:`);
     console.log(`   👤 User:     POST /api/users/* (requires deviceId in body)`);
     console.log(`   👥 Squad:    POST /api/squad/* (requires deviceId in body)`);
