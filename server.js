@@ -10,21 +10,21 @@ const crypto = require('crypto');
 // FIREBASE INITIALIZATION FROM ENV
 // ============================================
 const serviceAccount = {
-    type: process.env.FIREBASE_TYPE,
-    project_id: process.env.FIREBASE_PROJECT_ID,
-    private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
-    private_key: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
-    client_email: process.env.FIREBASE_CLIENT_EMAIL,
-    client_id: process.env.FIREBASE_CLIENT_ID,
-    auth_uri: process.env.FIREBASE_AUTH_URI,
-    token_uri: process.env.FIREBASE_TOKEN_URI,
-    auth_provider_x509_cert_url: process.env.FIREBASE_AUTH_PROVIDER_CERT_URL,
-    client_x509_cert_url: process.env.FIREBASE_CLIENT_CERT_URL,
-    universe_domain: process.env.FIREBASE_UNIVERSE_DOMAIN
+  type: process.env.FIREBASE_TYPE,
+  project_id: process.env.FIREBASE_PROJECT_ID,
+  private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
+  private_key: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+  client_email: process.env.FIREBASE_CLIENT_EMAIL,
+  client_id: process.env.FIREBASE_CLIENT_ID,
+  auth_uri: process.env.FIREBASE_AUTH_URI,
+  token_uri: process.env.FIREBASE_TOKEN_URI,
+  auth_provider_x509_cert_url: process.env.FIREBASE_AUTH_PROVIDER_CERT_URL,
+  client_x509_cert_url: process.env.FIREBASE_CLIENT_CERT_URL,
+  universe_domain: process.env.FIREBASE_UNIVERSE_DOMAIN
 };
 
 admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
+  credential: admin.credential.cert(serviceAccount),
 });
 
 const db = admin.firestore();
@@ -49,7 +49,7 @@ app.use(express.json());
 // CONSTANTS
 // ============================================
 const MAX_SQUAD_MEMBERS = 5;
-const MAX_WATCHING = 5;
+// ✅ REMOVED MAX_WATCHING - UNLIMITED NOW!
 const MIN_CHECK_IN_FREQUENCY = 1;
 const MAX_CHECK_IN_FREQUENCY = 30;
 
@@ -59,65 +59,77 @@ const MAX_CHECK_IN_FREQUENCY = 30;
 
 // Generate 6-character code
 const generateCode = () => {
-    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-    let code = '';
-    for (let i = 0; i < 6; i++) {
-        code += chars[Math.floor(Math.random() * chars.length)];
-    }
-    return code;
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code = '';
+  for (let i = 0; i < 6; i++) {
+    code += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return code;
 };
 
 // 🔥 FIXED: Get existing user or create new one
 const getUserByDeviceId = async (deviceId) => {
-    if (!deviceId) {
-        return { success: false, error: 'Device ID is required' };
+  if (!deviceId) {
+    return { success: false, error: 'Device ID is required' };
+  }
+
+  try {
+    const userRef = db.collection('users').doc(deviceId);
+    const userDoc = await userRef.get();
+
+    if (userDoc.exists) {
+      // User already exists - return existing data
+      return {
+        success: true,
+        user: { id: deviceId, ...userDoc.data() },
+        isNew: false
+      };
     }
 
-    try {
-        const userRef = db.collection('users').doc(deviceId);
-        const userDoc = await userRef.get();
+    // User doesn't exist - create new user
+    const userData = {
+      deviceId,
+      displayName: 'User',
+      code: null,
+      squadMembers: [],
+      checkInFrequency: 1,
+      streak: 0,
+      totalCheckIns: 0, // ✅ NEW: Track total lifetime check-ins
+      lastCheckIn: null,
 
-        if (userDoc.exists) {
-            // User already exists - return existing data
-            return {
-                success: true,
-                user: { id: deviceId, ...userDoc.data() },
-                isNew: false
-            };
-        }
+      // ✅ NEW: how many people are watching THIS user
+      watchersCount: 0,
 
-        // User doesn't exist - create new user
-        const userData = {
-            deviceId,
-            displayName: 'User',
-            code: null,
-            squadMembers: [],
-            checkInFrequency: 1,
-            streak: 0,
-            lastCheckIn: null,
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        };
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
 
-        await userRef.set(userData);
-        console.log('✅ New user created with device:', deviceId);
+    await userRef.set(userData);
+    console.log('✅ New user created with device:', deviceId);
 
-        return {
-            success: true,
-            user: { id: deviceId, ...userData },
-            isNew: true
-        };
-    } catch (error) {
-        console.error('❌ Error in getUserByDeviceId:', error);
-        return { success: false, error: error.message };
-    }
+    return {
+      success: true,
+      user: { id: deviceId, ...userData },
+      isNew: true
+    };
+  } catch (error) {
+    console.error('❌ Error in getUserByDeviceId:', error);
+    return { success: false, error: error.message };
+  }
 };
 
 // 🔥 FOR TESTING: 1 day = 2 minutes (FOR PRODUCTION: Change to 24 * 60 * 60 * 1000)
 const getCheckInIntervalMs = (frequency) => {
-    const days = parseInt(frequency) || 1;
-    return days * 2 * 60 * 1000; // 🔥 2 minutes per "day" for testing
-    // return days * 24 * 60 * 60 * 1000; // 🔥 USE THIS FOR PRODUCTION
+  const days = parseInt(frequency) || 1;
+  return days * 2 * 60 * 1000; // 🔥 2 minutes per "day" for testing
+  // return days * 24 * 60 * 60 * 1000; // 🔥 USE THIS FOR PRODUCTION
+};
+
+// ✅ NEW: safe watchersCount parse (never negative)
+const safeWatchersCount = (val) => {
+  const n = Number(val || 0);
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, n);
 };
 
 // ============================================
@@ -125,51 +137,51 @@ const getCheckInIntervalMs = (frequency) => {
 // ============================================
 
 const formatTimeDifference = (milliseconds) => {
-    const seconds = Math.floor(milliseconds / 1000);
-    const minutes = Math.floor(seconds / 60);
-    const hours = Math.floor(minutes / 60);
-    const days = Math.floor(hours / 24);
+  const seconds = Math.floor(milliseconds / 1000);
+  const minutes = Math.floor(seconds / 60);
+  const hours = Math.floor(minutes / 60);
+  const days = Math.floor(hours / 24);
 
-    if (days > 0) return `${days} day${days !== 1 ? 's' : ''}`;
-    if (hours > 0) return `${hours} hour${hours !== 1 ? 's' : ''}`;
-    if (minutes > 0) return `${minutes} minute${minutes !== 1 ? 's' : ''}`;
-    return `${seconds} second${seconds !== 1 ? 's' : ''}`;
+  if (days > 0) return `${days} day${days !== 1 ? 's' : ''}`;
+  if (hours > 0) return `${hours} hour${hours !== 1 ? 's' : ''}`;
+  if (minutes > 0) return `${minutes} minute${minutes !== 1 ? 's' : ''}`;
+  return `${seconds} second${seconds !== 1 ? 's' : ''}`;
 };
 
 const getPersonalizedMessage = (streak, overdueTime) => {
-    const hours = Math.floor(overdueTime / (1000 * 60 * 60));
+  const hours = Math.floor(overdueTime / (1000 * 60 * 60));
 
-    if (streak >= 100) {
-        return `${streak}-day streak was impressive. This is very unusual behavior for them.`;
-    } else if (streak >= 30) {
-        return `They had a ${streak}-day streak going. Something might be wrong.`;
-    } else if (hours > 48) {
-        return `It's been over 2 days. This is serious - please check on them immediately.`;
-    } else if (hours > 24) {
-        return `More than 24 hours without contact. Time to reach out.`;
-    } else {
-        return `They're usually very consistent. Worth checking in with them.`;
-    }
+  if (streak >= 100) {
+    return `${streak}-day streak was impressive. This is very unusual behavior for them.`;
+  } else if (streak >= 30) {
+    return `They had a ${streak}-day streak going. Something might be wrong.`;
+  } else if (hours > 48) {
+    return `It's been over 2 days. This is serious - please check on them immediately.`;
+  } else if (hours > 24) {
+    return `More than 24 hours without contact. Time to reach out.`;
+  } else {
+    return `They're usually very consistent. Worth checking in with them.`;
+  }
 };
 
 const getSeverityEmoji = (overdueTime) => {
-    const hours = Math.floor(overdueTime / (1000 * 60 * 60));
-    if (hours > 48) return '🚨';
-    if (hours > 24) return '⚠️';
-    return '⏰';
+  const hours = Math.floor(overdueTime / (1000 * 60 * 60));
+  if (hours > 48) return '🚨';
+  if (hours > 24) return '⚠️';
+  return '⏰';
 };
 
 const sendMissedCheckInEmail = async (user, squadMemberEmail, overdueTime) => {
-    try {
-        const userName = user.displayName || 'Your friend';
-        const firstName = userName.split(' ')[0];
-        const streak = user.streak || 0;
-        const frequency = user.checkInFrequency || 1;
-        const timeOverdue = formatTimeDifference(overdueTime);
-        const personalizedMessage = getPersonalizedMessage(streak, overdueTime);
-        const severityEmoji = getSeverityEmoji(overdueTime);
+  try {
+    const userName = user.displayName || 'Your friend';
+    const firstName = userName.split(' ')[0];
+    const streak = user.streak || 0;
+    const frequency = user.checkInFrequency || 1;
+    const timeOverdue = formatTimeDifference(overdueTime);
+    const personalizedMessage = getPersonalizedMessage(streak, overdueTime);
+    const severityEmoji = getSeverityEmoji(overdueTime);
 
-        const emailHtml = `
+    const emailHtml = `
 <!DOCTYPE html>
 <html>
 <head>
@@ -519,24 +531,24 @@ const sendMissedCheckInEmail = async (user, squadMemberEmail, overdueTime) => {
 </html>
         `;
 
-        const { data, error } = await resend.emails.send({
-            from: 'Still Alive <onboarding@resend.dev>',
-            to: [squadMemberEmail],
-            subject: `${severityEmoji} ${userName} missed their check-in - Immediate attention needed`,
-            html: emailHtml,
-        });
+    const { data, error } = await resend.emails.send({
+      from: 'Still Alive <onboarding@resend.dev>',
+      to: [squadMemberEmail],
+      subject: `${severityEmoji} ${userName} missed their check-in - Immediate attention needed`,
+      html: emailHtml,
+    });
 
-        if (error) {
-            console.error('❌ Email send error:', error);
-            return { success: false, error };
-        }
-
-        console.log(`✅ Email sent to ${squadMemberEmail} about ${userName}`);
-        return { success: true, data };
-    } catch (error) {
-        console.error('❌ Send email error:', error);
-        return { success: false, error };
+    if (error) {
+      console.error('❌ Email send error:', error);
+      return { success: false, error };
     }
+
+    console.log(`✅ Email sent to ${squadMemberEmail} about ${userName}`);
+    return { success: true, data };
+  } catch (error) {
+    console.error('❌ Send email error:', error);
+    return { success: false, error };
+  }
 };
 
 // ============================================
@@ -544,123 +556,123 @@ const sendMissedCheckInEmail = async (user, squadMemberEmail, overdueTime) => {
 // ============================================
 
 const checkMissedCheckIns = async () => {
-    try {
-        console.log('🔍 Checking for missed check-ins...');
-        const startTime = Date.now();
+  try {
+    console.log('🔍 Checking for missed check-ins...');
+    const startTime = Date.now();
 
-        const now = new Date();
+    const now = new Date();
 
-        const usersSnapshot = await db
-            .collection('users')
-            .where('lastCheckIn', '!=', null)
-            .get();
+    const usersSnapshot = await db
+      .collection('users')
+      .where('lastCheckIn', '!=', null)
+      .get();
 
-        if (usersSnapshot.empty) {
-            console.log('ℹ️ No users to check');
-            return;
-        }
-
-        let totalUsers = 0;
-        let usersWithSquad = 0;
-        let missedCount = 0;
-        let emailsSent = 0;
-        let emailsFailed = 0;
-
-        const batch = db.batch();
-        const emailPromises = [];
-
-        for (const userDoc of usersSnapshot.docs) {
-            totalUsers++;
-            const userId = userDoc.id;
-            const userData = userDoc.data();
-
-            const squadMembers = userData.squadMembers || [];
-            if (squadMembers.length === 0) {
-                continue;
-            }
-
-            usersWithSquad++;
-
-            const lastCheckIn = userData.lastCheckIn?.toDate();
-            if (!lastCheckIn) {
-                continue;
-            }
-
-            const checkInFrequency = userData.checkInFrequency || 1;
-            const intervalMs = getCheckInIntervalMs(checkInFrequency);
-            const gracePeriodMs = intervalMs * 2;
-            const timeSinceCheckIn = now - lastCheckIn;
-
-            if (timeSinceCheckIn > gracePeriodMs) {
-                const overdueTime = timeSinceCheckIn - gracePeriodMs;
-                const alertKey = `${userId}_${lastCheckIn.getTime()}`;
-
-                const existingAlert = await db
-                    .collection('missedCheckInAlerts')
-                    .doc(alertKey)
-                    .get();
-
-                if (existingAlert.exists) {
-                    continue;
-                }
-
-                missedCount++;
-                console.log(`⚠️ MISSED: ${userData.displayName || 'User'} (overdue: ${formatTimeDifference(overdueTime)})`);
-
-                for (const member of squadMembers) {
-                    const emailPromise = sendMissedCheckInEmail(userData, member.email, overdueTime)
-                        .then(result => {
-                            if (result.success) {
-                                emailsSent++;
-                            } else {
-                                emailsFailed++;
-                            }
-                            return result;
-                        });
-
-                    emailPromises.push(emailPromise);
-                }
-
-                const alertRef = db.collection('missedCheckInAlerts').doc(alertKey);
-                batch.set(alertRef, {
-                    alertKey,
-                    userId,
-                    userName: userData.displayName || 'User',
-                    lastCheckIn: admin.firestore.Timestamp.fromDate(lastCheckIn),
-                    alertSentAt: admin.firestore.FieldValue.serverTimestamp(),
-                    squadMembersNotified: squadMembers.map(m => m.email),
-                    overdueTime,
-                    checkInFrequency,
-                });
-            }
-        }
-
-        if (missedCount > 0) {
-            await batch.commit();
-        }
-
-        await Promise.all(emailPromises);
-
-        const duration = Date.now() - startTime;
-        console.log(`\n✅ Check complete in ${duration}ms:`);
-        console.log(`   📊 Total users: ${totalUsers}`);
-        console.log(`   👥 With squad: ${usersWithSquad}`);
-        console.log(`   ⚠️  Missed: ${missedCount}`);
-        console.log(`   ✅ Emails sent: ${emailsSent}`);
-        console.log(`   ❌ Emails failed: ${emailsFailed}\n`);
-    } catch (error) {
-        console.error('❌ Check missed check-ins error:', error);
+    if (usersSnapshot.empty) {
+      console.log('ℹ️ No users to check');
+      return;
     }
+
+    let totalUsers = 0;
+    let usersWithSquad = 0;
+    let missedCount = 0;
+    let emailsSent = 0;
+    let emailsFailed = 0;
+
+    const batch = db.batch();
+    const emailPromises = [];
+
+    for (const userDoc of usersSnapshot.docs) {
+      totalUsers++;
+      const userId = userDoc.id;
+      const userData = userDoc.data();
+
+      const squadMembers = userData.squadMembers || [];
+      if (squadMembers.length === 0) {
+        continue;
+      }
+
+      usersWithSquad++;
+
+      const lastCheckIn = userData.lastCheckIn?.toDate();
+      if (!lastCheckIn) {
+        continue;
+      }
+
+      const checkInFrequency = userData.checkInFrequency || 1;
+      const intervalMs = getCheckInIntervalMs(checkInFrequency);
+      const gracePeriodMs = intervalMs * 2;
+      const timeSinceCheckIn = now - lastCheckIn;
+
+      if (timeSinceCheckIn > gracePeriodMs) {
+        const overdueTime = timeSinceCheckIn - gracePeriodMs;
+        const alertKey = `${userId}_${lastCheckIn.getTime()}`;
+
+        const existingAlert = await db
+          .collection('missedCheckInAlerts')
+          .doc(alertKey)
+          .get();
+
+        if (existingAlert.exists) {
+          continue;
+        }
+
+        missedCount++;
+        console.log(`⚠️ MISSED: ${userData.displayName || 'User'} (overdue: ${formatTimeDifference(overdueTime)})`);
+
+        for (const member of squadMembers) {
+          const emailPromise = sendMissedCheckInEmail(userData, member.email, overdueTime)
+            .then(result => {
+              if (result.success) {
+                emailsSent++;
+              } else {
+                emailsFailed++;
+              }
+              return result;
+            });
+
+          emailPromises.push(emailPromise);
+        }
+
+        const alertRef = db.collection('missedCheckInAlerts').doc(alertKey);
+        batch.set(alertRef, {
+          alertKey,
+          userId,
+          userName: userData.displayName || 'User',
+          lastCheckIn: admin.firestore.Timestamp.fromDate(lastCheckIn),
+          alertSentAt: admin.firestore.FieldValue.serverTimestamp(),
+          squadMembersNotified: squadMembers.map(m => m.email),
+          overdueTime,
+          checkInFrequency,
+        });
+      }
+    }
+
+    if (missedCount > 0) {
+      await batch.commit();
+    }
+
+    await Promise.all(emailPromises);
+
+    const duration = Date.now() - startTime;
+    console.log(`\n✅ Check complete in ${duration}ms:`);
+    console.log(`   📊 Total users: ${totalUsers}`);
+    console.log(`   👥 With squad: ${usersWithSquad}`);
+    console.log(`   ⚠️  Missed: ${missedCount}`);
+    console.log(`   ✅ Emails sent: ${emailsSent}`);
+    console.log(`   ❌ Emails failed: ${emailsFailed}\n`);
+  } catch (error) {
+    console.error('❌ Check missed check-ins error:', error);
+  }
 };
 
 cron.schedule('*/5 * * * *', () => {
-    console.log('⏰ Running missed check-in cron job...');
-    checkMissedCheckIns();
+  console.log('⏰ Running missed check-in cron job...');
+  checkMissedCheckIns();
 });
 
 setTimeout(() => {
-    console.log('🚀 Running initial check...');
-    checkMissedCheckIns();
+  console.log('🚀 Running initial check...');
+  checkMissedCheckIns();
 }, 5000);
 
 // ============================================
@@ -668,17 +680,19 @@ setTimeout(() => {
 // ============================================
 
 app.get('/health', (req, res) => {
-    res.json({
-        status: 'ok',
-        timestamp: new Date().toISOString(),
-        version: '2.0.1',
-        features: {
-            emailAlerts: true,
-            cronJob: true,
-            deviceIdAuth: true,
-            firebaseFromEnv: true
-        }
-    });
+  res.json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    version: '2.0.2', // ✅ UPDATED VERSION
+    features: {
+      emailAlerts: true,
+      cronJob: true,
+      deviceIdAuth: true,
+      firebaseFromEnv: true,
+      totalCheckIns: true, // ✅ NEW FEATURE
+      streakTracking: true, // ✅ NEW FEATURE
+    }
+  });
 });
 
 // ============================================
@@ -686,34 +700,34 @@ app.get('/health', (req, res) => {
 // ============================================
 
 const getDeviceId = async (req, res, next) => {
-    try {
-        const { deviceId } = req.body;
+  try {
+    const { deviceId } = req.body;
 
-        if (!deviceId) {
-            return res.status(400).json({
-                success: false,
-                error: 'Device ID required'
-            });
-        }
-
-        // Get existing user or create new one if doesn't exist
-        const result = await getUserByDeviceId(deviceId);
-
-        if (!result.success) {
-            return res.status(500).json({
-                success: false,
-                error: result.error
-            });
-        }
-
-        req.deviceId = deviceId;
-        req.user = result.user;
-        req.isNewUser = result.isNew;
-        next();
-    } catch (error) {
-        console.error('❌ Device auth error:', error);
-        res.status(500).json({ success: false, error: 'Device authentication failed' });
+    if (!deviceId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Device ID required'
+      });
     }
+
+    // Get existing user or create new one if doesn't exist
+    const result = await getUserByDeviceId(deviceId);
+
+    if (!result.success) {
+      return res.status(500).json({
+        success: false,
+        error: result.error
+      });
+    }
+
+    req.deviceId = deviceId;
+    req.user = result.user;
+    req.isNewUser = result.isNew;
+    next();
+  } catch (error) {
+    console.error('❌ Device auth error:', error);
+    res.status(500).json({ success: false, error: 'Device authentication failed' });
+  }
 };
 
 // ============================================
@@ -721,280 +735,296 @@ const getDeviceId = async (req, res, next) => {
 // ============================================
 
 app.post('/api/users/me', getDeviceId, async (req, res) => {
-    try {
-        const userDoc = await db.collection('users').doc(req.deviceId).get();
+  try {
+    const userDoc = await db.collection('users').doc(req.deviceId).get();
 
-        if (!userDoc.exists) {
-            return res.status(404).json({ success: false, error: 'User not found' });
-        }
-
-        const userData = userDoc.data();
-
-        res.json({
-            success: true,
-            user: {
-                deviceId: req.deviceId,
-                displayName: userData.displayName,
-                code: userData.code,
-                squadMembers: userData.squadMembers || [],
-                checkInFrequency: userData.checkInFrequency || 1,
-                streak: userData.streak || 0,
-                lastCheckIn: userData.lastCheckIn,
-                createdAt: userData.createdAt,
-            },
-            isNewUser: req.isNewUser || false,
-        });
-    } catch (error) {
-        console.error('❌ Get user error:', error);
-        res.status(500).json({ success: false, error: 'Failed to get user' });
+    if (!userDoc.exists) {
+      return res.status(404).json({ success: false, error: 'User not found' });
     }
+
+    const userData = userDoc.data();
+
+    res.json({
+      success: true,
+      user: {
+        deviceId: req.deviceId,
+        displayName: userData.displayName,
+        code: userData.code,
+        squadMembers: userData.squadMembers || [],
+        checkInFrequency: userData.checkInFrequency || 1,
+        streak: userData.streak || 0,
+        totalCheckIns: userData.totalCheckIns || 0, // ✅ NEW
+        lastCheckIn: userData.lastCheckIn,
+        createdAt: userData.createdAt,
+        watchersCount: safeWatchersCount(userData.watchersCount),
+      },
+      isNewUser: req.isNewUser || false,
+    });
+  } catch (error) {
+    console.error('❌ Get user error:', error);
+    res.status(500).json({ success: false, error: 'Failed to get user' });
+  }
 });
 
 app.post('/api/users/update-name', getDeviceId, async (req, res) => {
-    try {
-        const { displayName } = req.body;
+  try {
+    const { displayName } = req.body;
 
-        if (!displayName || displayName.trim().length === 0) {
-            return res.status(400).json({ success: false, error: 'Display name required' });
-        }
-
-        const userRef = db.collection('users').doc(req.deviceId);
-
-        await userRef.update({
-            displayName: displayName.trim(),
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-
-        console.log('✅ Display name updated:', req.deviceId, '→', displayName);
-
-        const updatedDoc = await userRef.get();
-        const userData = updatedDoc.data();
-
-        res.json({
-            success: true,
-            user: {
-                deviceId: req.deviceId,
-                displayName: userData.displayName,
-                code: userData.code,
-                squadMembers: userData.squadMembers || [],
-                checkInFrequency: userData.checkInFrequency || 1,
-                streak: userData.streak || 0,
-                lastCheckIn: userData.lastCheckIn,
-            },
-        });
-    } catch (error) {
-        console.error('❌ Update name error:', error);
-        res.status(500).json({ success: false, error: 'Failed to update name' });
+    if (!displayName || displayName.trim().length === 0) {
+      return res.status(400).json({ success: false, error: 'Display name required' });
     }
+
+    const userRef = db.collection('users').doc(req.deviceId);
+
+    await userRef.update({
+      displayName: displayName.trim(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    console.log('✅ Display name updated:', req.deviceId, '→', displayName);
+
+    const updatedDoc = await userRef.get();
+    const userData = updatedDoc.data();
+
+    res.json({
+      success: true,
+      user: {
+        deviceId: req.deviceId,
+        displayName: userData.displayName,
+        code: userData.code,
+        squadMembers: userData.squadMembers || [],
+        checkInFrequency: userData.checkInFrequency || 1,
+        streak: userData.streak || 0,
+        totalCheckIns: userData.totalCheckIns || 0, // ✅ NEW
+        lastCheckIn: userData.lastCheckIn,
+        watchersCount: safeWatchersCount(userData.watchersCount),
+      },
+    });
+  } catch (error) {
+    console.error('❌ Update name error:', error);
+    res.status(500).json({ success: false, error: 'Failed to update name' });
+  }
 });
 
 app.post('/api/users/checkin-frequency', getDeviceId, async (req, res) => {
-    try {
-        const { frequency } = req.body;
+  try {
+    const { frequency } = req.body;
 
-        if (!frequency) {
-            return res.status(400).json({ success: false, error: 'Frequency required' });
-        }
-
-        const days = parseInt(frequency);
-
-        if (isNaN(days) || days < MIN_CHECK_IN_FREQUENCY || days > MAX_CHECK_IN_FREQUENCY) {
-            return res.status(400).json({
-                success: false,
-                error: `Frequency must be between ${MIN_CHECK_IN_FREQUENCY} and ${MAX_CHECK_IN_FREQUENCY} days`
-            });
-        }
-
-        const userRef = db.collection('users').doc(req.deviceId);
-
-        await userRef.update({
-            checkInFrequency: days,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-
-        console.log('✅ Check-in frequency updated:', req.deviceId, '→', days, 'days');
-
-        res.json({
-            success: true,
-            checkInFrequency: days,
-            message: `Check-in frequency set to ${days} day${days > 1 ? 's' : ''}`,
-        });
-    } catch (error) {
-        console.error('❌ Update frequency error:', error);
-        res.status(500).json({ success: false, error: 'Failed to update frequency' });
+    if (!frequency) {
+      return res.status(400).json({ success: false, error: 'Frequency required' });
     }
+
+    const days = parseInt(frequency);
+
+    if (isNaN(days) || days < MIN_CHECK_IN_FREQUENCY || days > MAX_CHECK_IN_FREQUENCY) {
+      return res.status(400).json({
+        success: false,
+        error: `Frequency must be between ${MIN_CHECK_IN_FREQUENCY} and ${MAX_CHECK_IN_FREQUENCY} days`
+      });
+    }
+
+    const userRef = db.collection('users').doc(req.deviceId);
+
+    await userRef.update({
+      checkInFrequency: days,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    console.log('✅ Check-in frequency updated:', req.deviceId, '→', days, 'days');
+
+    res.json({
+      success: true,
+      checkInFrequency: days,
+      message: `Check-in frequency set to ${days} day${days > 1 ? 's' : ''}`,
+    });
+  } catch (error) {
+    console.error('❌ Update frequency error:', error);
+    res.status(500).json({ success: false, error: 'Failed to update frequency' });
+  }
 });
 
 app.post('/api/users/generate-code', getDeviceId, async (req, res) => {
-    try {
-        const userRef = db.collection('users').doc(req.deviceId);
-        const userDoc = await userRef.get();
+  try {
+    const userRef = db.collection('users').doc(req.deviceId);
+    const userDoc = await userRef.get();
 
-        if (!userDoc.exists) {
-            return res.status(404).json({ success: false, error: 'User not found' });
-        }
-
-        if (userDoc.data().code) {
-            return res.json({
-                success: true,
-                code: userDoc.data().code,
-                message: 'Code already exists',
-            });
-        }
-
-        let code = generateCode();
-        let attempts = 0;
-
-        while (attempts < 10) {
-            const existingCode = await db
-                .collection('users')
-                .where('code', '==', code)
-                .get();
-
-            if (existingCode.empty) {
-                break;
-            }
-
-            code = generateCode();
-            attempts++;
-        }
-
-        if (attempts >= 10) {
-            return res.status(500).json({
-                success: false,
-                error: 'Failed to generate unique code. Please try again.'
-            });
-        }
-
-        await userRef.update({
-            code,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-
-        console.log('✅ Code generated:', req.deviceId, '→', code);
-
-        res.json({
-            success: true,
-            code,
-        });
-    } catch (error) {
-        console.error('❌ Generate code error:', error);
-        res.status(500).json({ success: false, error: 'Failed to generate code' });
+    if (!userDoc.exists) {
+      return res.status(404).json({ success: false, error: 'User not found' });
     }
+
+    if (userDoc.data().code) {
+      return res.json({
+        success: true,
+        code: userDoc.data().code,
+        message: 'Code already exists',
+      });
+    }
+
+    let code = generateCode();
+    let attempts = 0;
+
+    while (attempts < 10) {
+      const existingCode = await db
+        .collection('users')
+        .where('code', '==', code)
+        .get();
+
+      if (existingCode.empty) {
+        break;
+      }
+
+      code = generateCode();
+      attempts++;
+    }
+
+    if (attempts >= 10) {
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to generate unique code. Please try again.'
+      });
+    }
+
+    await userRef.update({
+      code,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    console.log('✅ Code generated:', req.deviceId, '→', code);
+
+    res.json({
+      success: true,
+      code,
+    });
+  } catch (error) {
+    console.error('❌ Generate code error:', error);
+    res.status(500).json({ success: false, error: 'Failed to generate code' });
+  }
 });
 
 // ============================================
-// CHECK-IN ROUTES - OPTIMIZED
+// ✅✅✅ FIXED CHECK-IN ROUTE - DUAL TRACKING ✅✅✅
 // ============================================
 
 app.post('/api/users/checkin', getDeviceId, async (req, res) => {
-    try {
-        const userRef = db.collection('users').doc(req.deviceId);
-        const userDoc = await userRef.get();
+  try {
+    const userRef = db.collection('users').doc(req.deviceId);
+    const userDoc = await userRef.get();
 
-        if (!userDoc.exists) {
-            return res.status(404).json({ success: false, error: 'User not found' });
-        }
-
-        const userData = userDoc.data();
-        const now = new Date();
-        const lastCheckIn = userData.lastCheckIn?.toDate();
-
-        const checkInFrequency = userData.checkInFrequency || 1;
-        const intervalMs = getCheckInIntervalMs(checkInFrequency);
-
-        let newStreak = userData.streak || 0;
-
-        if (lastCheckIn) {
-            const timeSinceLastCheckIn = now - lastCheckIn;
-
-            if (timeSinceLastCheckIn <= intervalMs * 2) {
-                newStreak += 1;
-            } else {
-                newStreak = 1;
-            }
-        } else {
-            newStreak = 1;
-        }
-
-        const checkInTimestamp = admin.firestore.Timestamp.fromDate(now);
-
-        const batch = db.batch();
-
-        batch.update(userRef, {
-            lastCheckIn: checkInTimestamp,
-            streak: newStreak,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-
-        const checkinRef = db.collection('checkins').doc();
-        batch.set(checkinRef, {
-            userId: req.deviceId,
-            checkedInAt: checkInTimestamp,
-            streak: newStreak,
-        });
-
-        await batch.commit();
-
-        console.log('✅ Check-in:', req.deviceId, '→ Streak:', newStreak);
-
-        res.json({
-            success: true,
-            user: {
-                deviceId: req.deviceId,
-                displayName: userData.displayName,
-                code: userData.code,
-                squadMembers: userData.squadMembers || [],
-                checkInFrequency: userData.checkInFrequency || 1,
-                streak: newStreak,
-                lastCheckIn: checkInTimestamp,
-            },
-        });
-    } catch (error) {
-        console.error('❌ Check-in error:', error);
-        res.status(500).json({ success: false, error: 'Failed to check in' });
+    if (!userDoc.exists) {
+      return res.status(404).json({ success: false, error: 'User not found' });
     }
+
+    const userData = userDoc.data();
+    const now = new Date();
+    const lastCheckIn = userData.lastCheckIn?.toDate();
+    const checkInFrequency = userData.checkInFrequency || 1;
+    const intervalMs = getCheckInIntervalMs(checkInFrequency);
+
+    // ✅ ALWAYS increment total check-ins (lifetime counter)
+    const newTotalCheckIns = (userData.totalCheckIns || 0) + 1;
+
+    // ✅ FIXED: Streak logic - properly increment or reset
+    let newStreak = userData.streak || 0;
+
+    if (lastCheckIn) {
+      const timeSinceLastCheckIn = now - lastCheckIn;
+
+      if (timeSinceLastCheckIn <= intervalMs * 2) {
+        // ✅ FIXED: INCREMENT the streak instead of setting to 1
+        newStreak = newStreak + 1;
+      } else {
+        // Reset streak if too much time passed
+        newStreak = 1;
+      }
+    } else {
+      // First check-in ever
+      newStreak = 1;
+    }
+
+    const checkInTimestamp = admin.firestore.Timestamp.fromDate(now);
+    const batch = db.batch();
+
+    // Update user with BOTH streak and totalCheckIns
+    batch.update(userRef, {
+      lastCheckIn: checkInTimestamp,
+      streak: newStreak,
+      totalCheckIns: newTotalCheckIns, // ✅ NEW
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    // Log check-in
+    const checkinRef = db.collection('checkins').doc();
+    batch.set(checkinRef, {
+      userId: req.deviceId,
+      checkedInAt: checkInTimestamp,
+      streak: newStreak,
+      totalCheckIns: newTotalCheckIns, // ✅ NEW
+    });
+
+    await batch.commit();
+
+    console.log('✅ Check-in:', req.deviceId, '→ Streak:', newStreak, '| Total:', newTotalCheckIns);
+
+    res.json({
+      success: true,
+      user: {
+        deviceId: req.deviceId,
+        displayName: userData.displayName,
+        code: userData.code,
+        squadMembers: userData.squadMembers || [],
+        checkInFrequency: userData.checkInFrequency || 1,
+        streak: newStreak,
+        totalCheckIns: newTotalCheckIns, // ✅ NEW
+        lastCheckIn: checkInTimestamp,
+        watchersCount: safeWatchersCount(userData.watchersCount),
+      },
+    });
+  } catch (error) {
+    console.error('❌ Check-in error:', error);
+    res.status(500).json({ success: false, error: 'Failed to check in' });
+  }
 });
 
 app.post('/api/users/checkin/status', getDeviceId, async (req, res) => {
-    try {
-        const userDoc = await db.collection('users').doc(req.deviceId).get();
+  try {
+    const userDoc = await db.collection('users').doc(req.deviceId).get();
 
-        if (!userDoc.exists) {
-            return res.status(404).json({ success: false, error: 'User not found' });
-        }
-
-        const userData = userDoc.data();
-        const now = new Date();
-        const lastCheckIn = userData.lastCheckIn?.toDate();
-
-        const checkInFrequency = userData.checkInFrequency || 1;
-        const intervalMs = getCheckInIntervalMs(checkInFrequency);
-
-        let canCheckIn = true;
-        let timeRemaining = 0;
-
-        if (lastCheckIn) {
-            const timeSinceLastCheckIn = now - lastCheckIn;
-
-            if (timeSinceLastCheckIn < intervalMs) {
-                canCheckIn = false;
-                timeRemaining = intervalMs - timeSinceLastCheckIn;
-            }
-        }
-
-        res.json({
-            success: true,
-            canCheckIn,
-            timeRemaining,
-            checkInFrequency,
-            lastCheckIn: lastCheckIn?.toISOString() || null,
-            streak: userData.streak || 0,
-        });
-    } catch (error) {
-        console.error('❌ Get check-in status error:', error);
-        res.status(500).json({ success: false, error: 'Failed to get status' });
+    if (!userDoc.exists) {
+      return res.status(404).json({ success: false, error: 'User not found' });
     }
+
+    const userData = userDoc.data();
+    const now = new Date();
+    const lastCheckIn = userData.lastCheckIn?.toDate();
+
+    const checkInFrequency = userData.checkInFrequency || 1;
+    const intervalMs = getCheckInIntervalMs(checkInFrequency);
+
+    let canCheckIn = true;
+    let timeRemaining = 0;
+
+    if (lastCheckIn) {
+      const timeSinceLastCheckIn = now - lastCheckIn;
+
+      if (timeSinceLastCheckIn < intervalMs) {
+        canCheckIn = false;
+        timeRemaining = intervalMs - timeSinceLastCheckIn;
+      }
+    }
+
+    res.json({
+      success: true,
+      canCheckIn,
+      timeRemaining,
+      checkInFrequency,
+      lastCheckIn: lastCheckIn?.toISOString() || null,
+      streak: userData.streak || 0,
+      totalCheckIns: userData.totalCheckIns || 0, // ✅ NEW
+    });
+  } catch (error) {
+    console.error('❌ Get check-in status error:', error);
+    res.status(500).json({ success: false, error: 'Failed to get status' });
+  }
 });
 
 // ============================================
@@ -1002,128 +1032,128 @@ app.post('/api/users/checkin/status', getDeviceId, async (req, res) => {
 // ============================================
 
 app.post('/api/squad/add-member', getDeviceId, async (req, res) => {
-    try {
-        const { email } = req.body;
+  try {
+    const { email } = req.body;
 
-        if (!email) {
-            return res.status(400).json({ success: false, error: 'Email required' });
-        }
-
-        const userRef = db.collection('users').doc(req.deviceId);
-        const userDoc = await userRef.get();
-
-        if (!userDoc.exists) {
-            return res.status(404).json({ success: false, error: 'User not found' });
-        }
-
-        const userData = userDoc.data();
-        let squadMembers = userData.squadMembers || [];
-
-        if (squadMembers.length >= MAX_SQUAD_MEMBERS) {
-            return res.status(400).json({
-                success: false,
-                error: `Maximum ${MAX_SQUAD_MEMBERS} squad members allowed`
-            });
-        }
-
-        const emailLower = email.toLowerCase().trim();
-        if (squadMembers.find((m) => m.email === emailLower)) {
-            return res.status(400).json({
-                success: false,
-                error: 'This email is already in your squad'
-            });
-        }
-
-        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-        if (!emailRegex.test(emailLower)) {
-            return res.status(400).json({
-                success: false,
-                error: 'Invalid email format'
-            });
-        }
-
-        const newMember = {
-            id: Date.now().toString(),
-            email: emailLower,
-            addedAt: new Date().toISOString(),
-        };
-
-        squadMembers.push(newMember);
-
-        await userRef.update({
-            squadMembers,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-
-        console.log('✅ Squad member added:', req.deviceId, '→', emailLower);
-
-        res.json({
-            success: true,
-            member: newMember,
-            squadMembers,
-        });
-    } catch (error) {
-        console.error('❌ Add squad member error:', error);
-        res.status(500).json({ success: false, error: 'Failed to add squad member' });
+    if (!email) {
+      return res.status(400).json({ success: false, error: 'Email required' });
     }
+
+    const userRef = db.collection('users').doc(req.deviceId);
+    const userDoc = await userRef.get();
+
+    if (!userDoc.exists) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    const userData = userDoc.data();
+    let squadMembers = userData.squadMembers || [];
+
+    if (squadMembers.length >= MAX_SQUAD_MEMBERS) {
+      return res.status(400).json({
+        success: false,
+        error: `Maximum ${MAX_SQUAD_MEMBERS} squad members allowed`
+      });
+    }
+
+    const emailLower = email.toLowerCase().trim();
+    if (squadMembers.find((m) => m.email === emailLower)) {
+      return res.status(400).json({
+        success: false,
+        error: 'This email is already in your squad'
+      });
+    }
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(emailLower)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid email format'
+      });
+    }
+
+    const newMember = {
+      id: Date.now().toString(),
+      email: emailLower,
+      addedAt: new Date().toISOString(),
+    };
+
+    squadMembers.push(newMember);
+
+    await userRef.update({
+      squadMembers,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    console.log('✅ Squad member added:', req.deviceId, '→', emailLower);
+
+    res.json({
+      success: true,
+      member: newMember,
+      squadMembers,
+    });
+  } catch (error) {
+    console.error('❌ Add squad member error:', error);
+    res.status(500).json({ success: false, error: 'Failed to add squad member' });
+  }
 });
 
 app.post('/api/squad/members', getDeviceId, async (req, res) => {
-    try {
-        const userDoc = await db.collection('users').doc(req.deviceId).get();
+  try {
+    const userDoc = await db.collection('users').doc(req.deviceId).get();
 
-        if (!userDoc.exists) {
-            return res.status(404).json({ success: false, error: 'User not found' });
-        }
-
-        const squadMembers = userDoc.data().squadMembers || [];
-
-        res.json({
-            success: true,
-            members: squadMembers,
-        });
-    } catch (error) {
-        console.error('❌ Get squad members error:', error);
-        res.status(500).json({ success: false, error: 'Failed to get squad members' });
+    if (!userDoc.exists) {
+      return res.status(404).json({ success: false, error: 'User not found' });
     }
+
+    const squadMembers = userDoc.data().squadMembers || [];
+
+    res.json({
+      success: true,
+      members: squadMembers,
+    });
+  } catch (error) {
+    console.error('❌ Get squad members error:', error);
+    res.status(500).json({ success: false, error: 'Failed to get squad members' });
+  }
 });
 
 app.post('/api/squad/members/:id/remove', getDeviceId, async (req, res) => {
-    try {
-        const { id } = req.params;
+  try {
+    const { id } = req.params;
 
-        const userRef = db.collection('users').doc(req.deviceId);
-        const userDoc = await userRef.get();
+    const userRef = db.collection('users').doc(req.deviceId);
+    const userDoc = await userRef.get();
 
-        if (!userDoc.exists) {
-            return res.status(404).json({ success: false, error: 'User not found' });
-        }
-
-        let squadMembers = userDoc.data().squadMembers || [];
-
-        const originalLength = squadMembers.length;
-        squadMembers = squadMembers.filter((m) => m.id !== id);
-
-        if (squadMembers.length === originalLength) {
-            return res.status(404).json({ success: false, error: 'Squad member not found' });
-        }
-
-        await userRef.update({
-            squadMembers,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-
-        console.log('✅ Squad member removed:', req.deviceId, '→ ID:', id);
-
-        res.json({
-            success: true,
-            message: 'Squad member removed',
-            squadMembers,
-        });
-    } catch (error) {
-        console.error('❌ Remove squad member error:', error);
-        res.status(500).json({ success: false, error: 'Failed to remove squad member' });
+    if (!userDoc.exists) {
+      return res.status(404).json({ success: false, error: 'User not found' });
     }
+
+    let squadMembers = userDoc.data().squadMembers || [];
+
+    const originalLength = squadMembers.length;
+    squadMembers = squadMembers.filter((m) => m.id !== id);
+
+    if (squadMembers.length === originalLength) {
+      return res.status(404).json({ success: false, error: 'Squad member not found' });
+    }
+
+    await userRef.update({
+      squadMembers,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    console.log('✅ Squad member removed:', req.deviceId, '→ ID:', id);
+
+    res.json({
+      success: true,
+      message: 'Squad member removed',
+      squadMembers,
+    });
+  } catch (error) {
+    console.error('❌ Remove squad member error:', error);
+    res.status(500).json({ success: false, error: 'Failed to remove squad member' });
+  }
 });
 
 // ============================================
@@ -1131,209 +1161,237 @@ app.post('/api/squad/members/:id/remove', getDeviceId, async (req, res) => {
 // ============================================
 
 app.post('/api/watching/add', async (req, res) => {
-    try {
-        const { deviceId, code, customName } = req.body;
+  try {
+    const { deviceId, code, customName } = req.body;
 
-        if (!deviceId) {
-            return res.status(400).json({ success: false, error: 'Device ID required' });
-        }
-
-        if (!code) {
-            return res.status(400).json({ success: false, error: 'Code required' });
-        }
-
-        const codeUpper = code.toUpperCase().trim();
-
-        if (codeUpper.length !== 6) {
-            return res.status(400).json({
-                success: false,
-                error: 'Code must be 6 characters'
-            });
-        }
-
-        const targetSnapshot = await db
-            .collection('users')
-            .where('code', '==', codeUpper)
-            .limit(1)
-            .get();
-
-        if (targetSnapshot.empty) {
-            return res.status(404).json({
-                success: false,
-                error: 'Invalid code. This code does not exist.'
-            });
-        }
-
-        const targetUser = targetSnapshot.docs[0];
-        const targetUserId = targetUser.id;
-        const targetUserData = targetUser.data();
-
-        const existingWatch = await db
-            .collection('watching')
-            .where('watcherId', '==', deviceId)
-            .where('targetUserId', '==', targetUserId)
-            .get();
-
-        if (!existingWatch.empty) {
-            return res.status(400).json({
-                success: false,
-                error: 'You are already watching this person'
-            });
-        }
-
-        const watchingCount = await db
-            .collection('watching')
-            .where('watcherId', '==', deviceId)
-            .get();
-
-        if (watchingCount.size >= MAX_WATCHING) {
-            return res.status(400).json({
-                success: false,
-                error: `Maximum ${MAX_WATCHING} people allowed`
-            });
-        }
-
-        const watchData = {
-            watcherId: deviceId,
-            targetUserId,
-            targetCode: codeUpper,
-            customName: customName?.trim() || targetUserData.displayName || `User ${codeUpper}`,
-            addedAt: admin.firestore.FieldValue.serverTimestamp(),
-        };
-
-        const watchRef = await db.collection('watching').add(watchData);
-
-        console.log('✅ Watching added:', deviceId, '→', codeUpper);
-
-        res.json({
-            success: true,
-            watch: {
-                id: watchRef.id,
-                ...watchData,
-                addedAt: new Date().toISOString(),
-            },
-        });
-    } catch (error) {
-        console.error('❌ Add watching error:', error);
-        res.status(500).json({ success: false, error: 'Failed to add watching' });
+    if (!deviceId) {
+      return res.status(400).json({ success: false, error: 'Device ID required' });
     }
+
+    if (!code) {
+      return res.status(400).json({ success: false, error: 'Code required' });
+    }
+
+    const codeUpper = code.toUpperCase().trim();
+
+    if (codeUpper.length !== 6) {
+      return res.status(400).json({
+        success: false,
+        error: 'Code must be 6 characters'
+      });
+    }
+
+    const targetSnapshot = await db
+      .collection('users')
+      .where('code', '==', codeUpper)
+      .limit(1)
+      .get();
+
+    if (targetSnapshot.empty) {
+      return res.status(404).json({
+        success: false,
+        error: 'Invalid code. This code does not exist.'
+      });
+    }
+
+    const targetUser = targetSnapshot.docs[0];
+    const targetUserId = targetUser.id;
+    const targetUserData = targetUser.data();
+
+    const existingWatch = await db
+      .collection('watching')
+      .where('watcherId', '==', deviceId)
+      .where('targetUserId', '==', targetUserId)
+      .get();
+
+    if (!existingWatch.empty) {
+      return res.status(400).json({
+        success: false,
+        error: 'You are already watching this person'
+      });
+    }
+
+    const watchRef = db.collection('watching').doc();
+    const targetUserRef = db.collection('users').doc(targetUserId);
+
+    const watchData = {
+      watcherId: deviceId,
+      targetUserId,
+      targetCode: codeUpper,
+      customName: customName?.trim() || targetUserData.displayName || `User ${codeUpper}`,
+      addedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    await db.runTransaction(async (t) => {
+      const targetSnap = await t.get(targetUserRef);
+
+      t.set(watchRef, watchData);
+
+      if (targetSnap.exists) {
+        const current = safeWatchersCount(targetSnap.data()?.watchersCount);
+        t.update(targetUserRef, {
+          watchersCount: current + 1,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      }
+    });
+
+    console.log('✅ Watching added:', deviceId, '→', codeUpper);
+
+    res.json({
+      success: true,
+      watch: {
+        id: watchRef.id,
+        ...watchData,
+        addedAt: new Date().toISOString(),
+      },
+    });
+  } catch (error) {
+    console.error('❌ Add watching error:', error);
+    res.status(500).json({ success: false, error: 'Failed to add watching' });
+  }
 });
 
 app.get('/api/watching/list', async (req, res) => {
-    try {
-        const { deviceId } = req.query;
+  try {
+    const { deviceId } = req.query;
 
-        if (!deviceId) {
-            return res.status(400).json({ success: false, error: 'Device ID required' });
-        }
-
-        const watchingSnapshot = await db
-            .collection('watching')
-            .where('watcherId', '==', deviceId)
-            .get();
-
-        const watching = [];
-        const now = new Date();
-
-        for (const doc of watchingSnapshot.docs) {
-            const data = doc.data();
-
-            const targetUserDoc = await db.collection('users').doc(data.targetUserId).get();
-
-            if (!targetUserDoc.exists) {
-                continue;
-            }
-
-            const targetUser = targetUserDoc.data();
-            const lastCheckIn = targetUser?.lastCheckIn?.toDate();
-
-            const checkInFrequency = targetUser?.checkInFrequency || 1;
-            const intervalMs = getCheckInIntervalMs(checkInFrequency);
-
-            let status = 'alive';
-            let missedSince = null;
-            let timeSinceCheckIn = 0;
-
-            if (lastCheckIn) {
-                timeSinceCheckIn = now - lastCheckIn;
-
-                if (timeSinceCheckIn > intervalMs) {
-                    status = 'missed';
-                    missedSince = lastCheckIn.toISOString();
-                }
-            } else {
-                status = 'missed';
-            }
-
-            watching.push({
-                id: doc.id,
-                code: data.targetCode,
-                name: data.customName,
-                addedAt: data.addedAt?.toDate()?.toISOString() || new Date().toISOString(),
-                status,
-                lastCheckIn: lastCheckIn?.toISOString() || null,
-                missedSince,
-                timeSinceCheckIn,
-                checkInFrequency,
-                targetUser: {
-                    uid: data.targetUserId,
-                    displayName: targetUser?.displayName || 'Unknown User',
-                    photoURL: targetUser?.photoURL || '',
-                    streak: targetUser?.streak || 0,
-                },
-            });
-        }
-
-        console.log(`✅ Watching list fetched (${deviceId}): ${watching.length} people`);
-
-        res.json({
-            success: true,
-            watching,
-        });
-    } catch (error) {
-        console.error('❌ Get watching list error:', error);
-        res.status(500).json({ success: false, error: 'Failed to get watching list' });
+    if (!deviceId) {
+      return res.status(400).json({ success: false, error: 'Device ID required' });
     }
+
+    const watchingSnapshot = await db
+      .collection('watching')
+      .where('watcherId', '==', deviceId)
+      .get();
+
+    const watching = [];
+    const now = new Date();
+
+    for (const doc of watchingSnapshot.docs) {
+      const data = doc.data();
+
+      const targetUserDoc = await db.collection('users').doc(data.targetUserId).get();
+
+      if (!targetUserDoc.exists) {
+        continue;
+      }
+
+      const targetUser = targetUserDoc.data();
+      const lastCheckIn = targetUser?.lastCheckIn?.toDate();
+
+      const checkInFrequency = targetUser?.checkInFrequency || 1;
+      const intervalMs = getCheckInIntervalMs(checkInFrequency);
+
+      let status = 'alive';
+      let missedSince = null;
+      let timeSinceCheckIn = 0;
+
+      if (lastCheckIn) {
+        timeSinceCheckIn = now - lastCheckIn;
+
+        if (timeSinceCheckIn > intervalMs) {
+          status = 'missed';
+          missedSince = lastCheckIn.toISOString();
+        }
+      } else {
+        status = 'missed';
+      }
+
+      watching.push({
+        id: doc.id,
+        code: data.targetCode,
+        name: data.customName,
+        addedAt: data.addedAt?.toDate()?.toISOString() || new Date().toISOString(),
+        status,
+        lastCheckIn: lastCheckIn?.toISOString() || null,
+        missedSince,
+        timeSinceCheckIn,
+        checkInFrequency,
+        targetUser: {
+          uid: data.targetUserId,
+          displayName: targetUser?.displayName || 'Unknown User',
+          photoURL: targetUser?.photoURL || '',
+          streak: targetUser?.streak || 0,
+          totalCheckIns: targetUser?.totalCheckIns || 0, // ✅ NEW
+        },
+      });
+    }
+
+    console.log(`✅ Watching list fetched (${deviceId}): ${watching.length} people`);
+
+    res.json({
+      success: true,
+      watching,
+    });
+  } catch (error) {
+    console.error('❌ Get watching list error:', error);
+    res.status(500).json({ success: false, error: 'Failed to get watching list' });
+  }
 });
 
 app.delete('/api/watching/:id', async (req, res) => {
-    try {
-        const { id } = req.params;
-        const { deviceId } = req.query;
+  try {
+    const { id } = req.params;
+    const { deviceId } = req.query;
 
-        if (!deviceId) {
-            return res.status(400).json({ success: false, error: 'Device ID required' });
-        }
-
-        const watchRef = db.collection('watching').doc(id);
-        const watchDoc = await watchRef.get();
-
-        if (!watchDoc.exists) {
-            return res.status(404).json({
-                success: false,
-                error: 'Watch entry not found'
-            });
-        }
-
-        if (watchDoc.data().watcherId !== deviceId) {
-            return res.status(403).json({
-                success: false,
-                error: 'Unauthorized. This entry belongs to a different device.'
-            });
-        }
-
-        await watchRef.delete();
-
-        console.log('✅ Stopped watching:', watchDoc.data().targetCode);
-
-        res.json({
-            success: true,
-            message: 'Stopped watching',
-        });
-    } catch (error) {
-        console.error('❌ Delete watching error:', error);
-        res.status(500).json({ success: false, error: 'Failed to stop watching' });
+    if (!deviceId) {
+      return res.status(400).json({ success: false, error: 'Device ID required' });
     }
+
+    const watchRef = db.collection('watching').doc(id);
+
+    // ✅ FIXED TRANSACTION: ALL READS FIRST, THEN ALL WRITES
+    await db.runTransaction(async (t) => {
+      // ✅ READS FIRST
+      const watchDoc = await t.get(watchRef);
+
+      if (!watchDoc.exists) {
+        const err = new Error('Watch entry not found');
+        err.statusCode = 404;
+        throw err;
+      }
+
+      const watchData = watchDoc.data();
+
+      if (watchData.watcherId !== deviceId) {
+        const err = new Error('Unauthorized. This entry belongs to a different device.');
+        err.statusCode = 403;
+        throw err;
+      }
+
+      const targetUserRef = db.collection('users').doc(watchData.targetUserId);
+      const targetSnap = await t.get(targetUserRef);
+
+      // ✅ WRITES AFTER (no more reads after this point)
+      t.delete(watchRef);
+
+      if (targetSnap.exists) {
+        const current = safeWatchersCount(targetSnap.data()?.watchersCount);
+        const next = Math.max(0, current - 1);
+
+        t.update(targetUserRef, {
+          watchersCount: next,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      }
+    });
+
+    console.log('✅ Stopped watching:', id);
+
+    res.json({
+      success: true,
+      message: 'Stopped watching',
+    });
+  } catch (error) {
+    const code = error?.statusCode || 500;
+    if (code !== 500) {
+      return res.status(code).json({ success: false, error: error.message });
+    }
+
+    console.error('❌ Delete watching error:', error);
+    res.status(500).json({ success: false, error: 'Failed to stop watching' });
+  }
 });
 
 // ============================================
@@ -1341,52 +1399,85 @@ app.delete('/api/watching/:id', async (req, res) => {
 // ============================================
 
 app.post('/api/account/delete', getDeviceId, async (req, res) => {
-    try {
-        const deviceId = req.deviceId;
-        console.log('🗑️ Deleting account for device:', deviceId);
+  try {
+    const deviceId = req.deviceId;
+    console.log('🗑️ Deleting account for device:', deviceId);
 
-        // Delete user
-        await db.collection('users').doc(deviceId).delete();
+    // ✅ NEW: If this user is WATCHING others, remove those watch docs
+    // and decrement watchersCount on the targets.
+    const watchingAsWatcherSnap = await db
+      .collection('watching')
+      .where('watcherId', '==', deviceId)
+      .get();
 
-        // Delete watching entries where this user is being watched
-        const targetSnapshot = await db
-            .collection('watching')
-            .where('targetUserId', '==', deviceId)
-            .get();
-        const targetDeletes = targetSnapshot.docs.map(doc => doc.ref.delete());
-        await Promise.all(targetDeletes);
+    const cleanupWatcherPromises = watchingAsWatcherSnap.docs.map((doc) => {
+      const watchRef = doc.ref;
+      return db.runTransaction(async (t) => {
+        const watchDoc = await t.get(watchRef);
+        if (!watchDoc.exists) return;
 
-        // Delete checkins
-        const checkinsSnapshot = await db
-            .collection('checkins')
-            .where('userId', '==', deviceId)
-            .get();
-        const checkinDeletes = checkinsSnapshot.docs.map(doc => doc.ref.delete());
-        await Promise.all(checkinDeletes);
+        const watchData = watchDoc.data();
+        const targetUserRef = db.collection('users').doc(watchData.targetUserId);
+        const targetSnap = await t.get(targetUserRef);
 
-        // Delete alerts
-        const alertsSnapshot = await db
-            .collection('missedCheckInAlerts')
-            .where('userId', '==', deviceId)
-            .get();
-        const alertDeletes = alertsSnapshot.docs.map(doc => doc.ref.delete());
-        await Promise.all(alertDeletes);
+        t.delete(watchRef);
 
-        console.log('✅ Account deleted for device:', deviceId);
+        if (targetSnap.exists) {
+          const current = safeWatchersCount(targetSnap.data()?.watchersCount);
+          const next = Math.max(0, current - 1);
+          t.update(targetUserRef, {
+            watchersCount: next,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+        }
+      });
+    });
 
-        res.json({
-            success: true,
-            deleted: {
-                user: true,
-                watchingEntries: targetSnapshot.size,
-                checkins: checkinsSnapshot.size,
-                alerts: alertsSnapshot.size,
-            },
-        });
-    } catch (error) {
-        console.error('❌ Delete account error:', error);
-        res.status(500).json({ success: false, error: 'Failed to delete account' });
-    }
+    await Promise.all(cleanupWatcherPromises);
+
+    // Delete user
+    await db.collection('users').doc(deviceId).delete();
+
+    // Delete watching entries where this user is being watched
+    const targetSnapshot = await db
+      .collection('watching')
+      .where('targetUserId', '==', deviceId)
+      .get();
+    const targetDeletes = targetSnapshot.docs.map(doc => doc.ref.delete());
+    await Promise.all(targetDeletes);
+
+    // Delete checkins
+    const checkinsSnapshot = await db
+      .collection('checkins')
+      .where('userId', '==', deviceId)
+      .get();
+    const checkinDeletes = checkinsSnapshot.docs.map(doc => doc.ref.delete());
+    await Promise.all(checkinDeletes);
+
+    // Delete alerts
+    const alertsSnapshot = await db
+      .collection('missedCheckInAlerts')
+      .where('userId', '==', deviceId)
+      .get();
+    const alertDeletes = alertsSnapshot.docs.map(doc => doc.ref.delete());
+    await Promise.all(alertDeletes);
+
+    console.log('✅ Account deleted for device:', deviceId);
+
+    res.json({
+      success: true,
+      deleted: {
+        user: true,
+        watchingEntriesTarget: targetSnapshot.size,
+        watchingEntriesWatcher: watchingAsWatcherSnap.size,
+        checkins: checkinsSnapshot.size,
+        alerts: alertsSnapshot.size,
+      },
+    });
+  } catch (error) {
+    console.error('❌ Delete account error:', error);
+    res.status(500).json({ success: false, error: 'Failed to delete account' });
+  }
 });
 
 // ============================================
@@ -1394,45 +1485,47 @@ app.post('/api/account/delete', getDeviceId, async (req, res) => {
 // ============================================
 
 app.use((req, res) => {
-    res.status(404).json({
-        success: false,
-        error: 'Route not found',
-        path: req.path
-    });
+  res.status(404).json({
+    success: false,
+    error: 'Route not found',
+    path: req.path
+  });
 });
 
 app.use((err, req, res, next) => {
-    console.error('💥 Unhandled error:', err);
-    res.status(500).json({
-        success: false,
-        error: 'Internal server error',
-        message: process.env.NODE_ENV === 'development' ? err.message : undefined
-    });
+  console.error('💥 Unhandled error:', err);
+  res.status(500).json({
+    success: false,
+    error: 'Internal server error',
+    message: process.env.NODE_ENV === 'development' ? err.message : undefined
+  });
 });
 
 // ============================================
 // START SERVER
 // ============================================
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`\n${'='.repeat(60)}`);
-    console.log(`🚀 STILL ALIVE SERVER - DEVICE ID ONLY`);
-    console.log(`${'='.repeat(60)}\n`);
-    console.log(`📡 Server:          http://localhost:${PORT}`);
-    console.log(`📝 Environment:     ${process.env.NODE_ENV || 'development'}`);
-    console.log(`📧 Email alerts:    ✅ ENABLED`);
-    console.log(`⏰ Cron job:        ✅ Every 5 minutes`);
-    console.log(`💰 Cost optimized:  ✅ Batch queries`);
-    console.log(`🎨 Email design:    ✅ Ultra personalized`);
-    console.log(`⚡ Check-in:        ✅ Optimized (batched)`);
-    console.log(`🔐 Auth:            ✅ Device ID only (NO LOGIN)`);
-    console.log(`🔧 Fixes:           ✅ No duplicate users`);
-    console.log(`🔧 Fixes:           ✅ Return existing data`);
-    console.log(`🔥 Firebase:        ✅ Loaded from .env`);
-    console.log(`\n📋 API Routes:`);
-    console.log(`   👤 User:     POST /api/users/* (requires deviceId in body)`);
-    console.log(`   👥 Squad:    POST /api/squad/* (requires deviceId in body)`);
-    console.log(`   👁️  Watch:    GET/POST/DELETE /api/watching/*`);
-    console.log(`\n${'='.repeat(60)}`);
+  console.log(`\n${'='.repeat(60)}`);
+  console.log(`🚀 STILL ALIVE SERVER - DEVICE ID ONLY`);
+  console.log(`${'='.repeat(60)}\n`);
+  console.log(`📡 Server:          http://localhost:${PORT}`);
+  console.log(`📝 Environment:     ${process.env.NODE_ENV || 'development'}`);
+  console.log(`📧 Email alerts:    ✅ ENABLED`);
+  console.log(`⏰ Cron job:        ✅ Every 5 minutes`);
+  console.log(`💰 Cost optimized:  ✅ Batch queries`);
+  console.log(`🎨 Email design:    ✅ Ultra personalized`);
+  console.log(`⚡ Check-in:        ✅ Optimized (batched)`);
+  console.log(`🔐 Auth:            ✅ Device ID only (NO LOGIN)`);
+  console.log(`🔧 Fixes:           ✅ No duplicate users`);
+  console.log(`🔧 Fixes:           ✅ Return existing data`);
+  console.log(`🔥 Firebase:        ✅ Loaded from .env`);
+  console.log(`👁️  Watching:       ✅ UNLIMITED (no cap)`);
+  console.log(`📊 Tracking:        ✅ Streak + Total Check-ins`); // ✅ NEW
+  console.log(`\n📋 API Routes:`);
+  console.log(`   👤 User:     POST /api/users/* (requires deviceId in body)`);
+  console.log(`   👥 Squad:    POST /api/squad/* (requires deviceId in body)`);
+  console.log(`   👁️  Watch:    GET/POST/DELETE /api/watching/*`);
+  console.log(`\n${'='.repeat(60)}`);
 });
 
 module.exports = app;
