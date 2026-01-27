@@ -4,6 +4,7 @@ const cors = require('cors');
 const admin = require('firebase-admin');
 const { Resend } = require('resend');
 const cron = require('node-cron');
+const aliveCheckRoutes = require('./aliveCheck');
 
 // ============================================
 // FIREBASE INITIALIZATION FROM ENV
@@ -43,6 +44,9 @@ const PORT = process.env.PORT || 5001;
 
 app.use(cors());
 app.use(express.json());
+
+app.use('/api/alive-check', aliveCheckRoutes);
+
 
 // ============================================
 // CONSTANTS
@@ -1322,6 +1326,7 @@ app.use((err, req, res, next) => {
     message: process.env.NODE_ENV === 'development' ? err.message : undefined
   });
 });
+
 
 // ============================================
 // START SERVER
