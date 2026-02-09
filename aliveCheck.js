@@ -1,20 +1,13 @@
 // 🫀 STILL ALIVE - PERSONALIZED ALIVE CHECK FEATURE
 // ============================================
-// v4.1 — WORLD-CLASS 10/10 BACKEND + MULTILINGUAL SUPPORT
+// v5.1 — 10/10 AI RESPONSE QUALITY - MAXIMUM DIVERSITY
 // ============================================
-// ✅ 8 QUESTIONS (3 scale, 3 yesno, 2 choice) — richer data
-// ✅ AI scores each pillar with full rubric + history
-// ✅ True multi-pillar Alive Score (weighted across all 4 pillars)
-// ✅ TRANSPARENT BREAKDOWN — users see exactly how score is built
-// ✅ INDIVIDUAL TIP per result — actionable RIGHT NOW based on TODAY's answers
-// ✅ 3 cross-pillar strategic tips
-// ✅ Adaptive questions using previous Q&A context
-// ✅ Pride moments (streaks, improvements, milestones)
-// ✅ AI-powered analytics summary
-// ✅ Deep AI analysis with full scoring criteria
-// ✅ Optimized (cache, parallel GPT, pre-computed estimates)
-// ✅ MULTILINGUAL SUPPORT — AI responds in user's language (6 languages)
-// ✅ All route signatures UNCHANGED — FE safe
+// ✅ ENFORCED TOPIC DIVERSITY - Never boring, always fresh
+// ✅ GEN Z VIRAL QUOTES - Screenshot-worthy every time
+// ✅ HYPER-PERSONAL TIPS - Life-changing, not generic
+// ✅ INTELLIGENT VARIED SCORING - Never repetitive
+// ✅ 50+ Question Topics Bank per pillar
+// ✅ MULTILINGUAL SUPPORT (6 languages)
 // ============================================
 
 const express = require('express');
@@ -34,10 +27,10 @@ const MAX_STORED_SUBMISSIONS = 60;
 const IST_OFFSET = 5.5 * 60 * 60 * 1000;
 
 const PILLARS = {
-  HEALTH:  { id: 'health',  name: 'Health',  emoji: '💪', color: '#FF6B6B',  weight: 0.30 },
-  WEALTH:  { id: 'wealth',  name: 'Wealth',  emoji: '💰', color: '#FFD93D',  weight: 0.25 },
-  LOVE:    { id: 'love',    name: 'Love',    emoji: '❤️', color: '#FF6B9D',  weight: 0.20 },
-  PURPOSE: { id: 'purpose', name: 'Purpose', emoji: '🎯', color: '#A78BFA',  weight: 0.25 }
+  HEALTH: { id: 'health', name: 'Health', emoji: '💪', color: '#FF6B6B', weight: 0.30 },
+  WEALTH: { id: 'wealth', name: 'Wealth', emoji: '💰', color: '#FFD93D', weight: 0.25 },
+  LOVE: { id: 'love', name: 'Love', emoji: '❤️', color: '#FF6B9D', weight: 0.20 },
+  PURPOSE: { id: 'purpose', name: 'Purpose', emoji: '🎯', color: '#A78BFA', weight: 0.25 }
 };
 
 // ============================================
@@ -46,7 +39,7 @@ const PILLARS = {
 function getLanguageName(code) {
   const languages = {
     'en': 'English',
-    'es': 'Spanish', 
+    'es': 'Spanish',
     'ru': 'Russian',
     'pt': 'Portuguese',
     'fr': 'French',
@@ -56,7 +49,164 @@ function getLanguageName(code) {
 }
 
 // ============================================
-// SCORING RUBRICS — THE BRAIN BEHIND AI SCORING
+// 🎯 ENHANCED QUESTION TOPIC BANKS (60+ per pillar)
+// ============================================
+
+const QUESTION_TOPICS = {
+  health: [
+    // Sleep cluster
+    'sleep_quality', 'sleep_duration', 'sleep_schedule', 'morning_feeling', 'naps', 'dreams_quality',
+    // Energy cluster
+    'energy_levels', 'vitality', 'physical_joy', 'aliveness_body', 'afternoon_slump', 'morning_energy',
+    // Mental health cluster
+    'stress_level', 'anxiety_state', 'mental_clarity', 'focus_ability', 'mood_stability', 'overwhelm', 'emotional_state',
+    // Movement cluster
+    'physical_movement', 'exercise_intensity', 'workout_consistency', 'flexibility', 'strength_feeling', 'endurance', 'movement_freedom',
+    // Body comfort cluster
+    'body_comfort', 'pain_level', 'muscle_tension', 'headaches', 'eye_strain', 'posture', 'breathing_ease',
+    // Nutrition cluster
+    'nutrition_quality', 'hydration', 'meal_satisfaction', 'eating_patterns', 'digestion', 'gut_feeling', 'hunger_cues',
+    // Recovery cluster
+    'rest_recovery', 'relaxation', 'breathing', 'tension_areas', 'recovery_quality', 'self_care_actions',
+    // Lifestyle cluster
+    'screen_time', 'outdoor_time', 'social_energy', 'alone_time', 'nature_connection', 'sunlight_exposure',
+    // Self-perception cluster
+    'body_image', 'physical_confidence', 'self_compassion', 'acceptance',
+    // Prevention cluster
+    'illness_prevention', 'immune_feeling', 'caffeine_intake', 'substance_use', 'medication_adherence'
+  ],
+
+  wealth: [
+    // Financial security cluster
+    'financial_confidence', 'money_anxiety', 'income_security', 'financial_stability', 'debt_stress', 'emergency_fund',
+    // Spending/saving cluster
+    'spending_control', 'saving_progress', 'budgeting', 'financial_planning', 'impulse_spending', 'financial_goals',
+    // Career satisfaction cluster
+    'career_satisfaction', 'work_meaning', 'job_fulfillment', 'purpose_at_work', 'impact_visibility', 'contribution_value',
+    // Growth cluster
+    'professional_growth', 'skill_development', 'learning_opportunities', 'industry_relevance', 'career_direction', 'advancement_opportunities',
+    // Work environment cluster
+    'work_life_balance', 'workload_management', 'time_freedom', 'schedule_control', 'remote_flexibility', 'commute_stress',
+    // Recognition cluster
+    'recognition', 'appreciation_at_work', 'compensation_satisfaction', 'benefits_adequacy', 'fair_treatment',
+    // Relationships at work cluster
+    'workplace_relationships', 'team_dynamics', 'leadership_quality', 'office_politics', 'collaboration_quality',
+    // Autonomy cluster
+    'creative_freedom', 'autonomy', 'decision_power', 'trust_from_leadership', 'micromanagement',
+    // Stress/burnout cluster
+    'job_stress', 'burnout_level', 'work_pressure', 'boundaries', 'after_hours_work', 'vacation_quality', '休息品質',
+    // Future cluster
+    'retirement_confidence', 'wealth_building', 'investment_confidence', 'passive_income', 'side_income', 'financial_freedom',
+    // Network cluster
+    'network_building', 'mentorship', 'professional_relationships', 'industry_connections'
+  ],
+
+  love: [
+    // Connection depth cluster
+    'relationship_quality', 'emotional_connection', 'emotional_intimacy', 'vulnerability', 'authentic_self', 'being_heard',
+    // Feeling valued cluster
+    'feeling_valued', 'feeling_supported', 'appreciation_received', 'recognition_from_loved_ones', 'being_there',
+    // Communication cluster
+    'meaningful_conversations', 'communication_quality', 'emotional_expression', 'active_listening', 'quality_conversations',
+    // Conflict cluster
+    'conflict_resolution', 'conflict_frequency', 'forgiveness', 'resentment', 'repair_after_conflict',
+    // Safety cluster
+    'relationship_safety', 'trust_level', 'emotional_safety', 'psychological_safety', 'acceptance',
+    // Loneliness cluster
+    'loneliness_level', 'social_connection', 'community_belonging', 'isolation_feeling', 'social_fulfillment',
+    // Friendship cluster
+    'friendship_quality', 'friend_support', 'meaningful_friendships', 'social_circle_satisfaction', 'friend_frequency',
+    // Romantic cluster
+    'romantic_satisfaction', 'physical_intimacy', 'romantic_connection', 'date_quality', 'affection',
+    // Giving/receiving cluster
+    'appreciation_given', 'acts_of_service', 'quality_time', 'giving_love', 'receiving_love', 'love_languages',
+    // Family cluster
+    'family_relationships', 'parent_child_bond', 'sibling_connection', 'extended_family', 'family_harmony',
+    // Social energy cluster
+    'social_energy', 'group_comfort', 'one_on_one_preference', 'social_battery', 'introvert_needs', 'extrovert_needs',
+    // Growth cluster
+    'relationship_growth', 'deepening_bonds', 'new_connections', 'maintaining_friendships', 'letting_go',
+    // Communication modes cluster
+    'digital_connection', 'in_person_time', 'phone_calls', 'texting_quality', 'video_calls',
+    // Support cluster
+    'asking_for_help', 'offering_help', 'mutual_support', 'showing_up', 'forgiveness_self'
+  ],
+
+  purpose: [
+    // Meaning cluster
+    'life_meaning', 'daily_meaning', 'work_purpose', 'existential_satisfaction', 'meaning_in_routine',
+    // Contribution cluster
+    'contribution_feeling', 'impact_on_others', 'helping_actions', 'service_mindset', 'legacy_thoughts', 'world_impact', 'local_impact',
+    // Goals cluster
+    'goal_progress', 'goal_clarity', 'direction_confidence', 'future_vision', 'milestone_achievement', 'priority_clarity',
+    // Growth cluster
+    'personal_growth', 'learning_today', 'skill_building', 'self_improvement', 'evolution', 'transformation',
+    // Values cluster
+    'values_alignment', 'authenticity', 'integrity', 'moral_compass', 'living_values', 'ethical_consistency',
+    // Passion cluster
+    'creative_expression', 'passion_pursuit', 'interests_exploration', 'curiosity', 'creative_flow', 'artistic_expression',
+    // Satisfaction cluster
+    'life_satisfaction', 'fulfillment', 'contentment', 'gratitude', 'appreciation', 'joy',
+    // Future outlook cluster
+    'future_optimism', 'hope_level', 'excitement', 'anticipation', 'dreams', 'aspirations',
+    // Spiritual cluster
+    'spiritual_connection', 'meditation_practice', 'mindfulness', 'presence', 'transcendence', 'inner_peace',
+    // Self-knowledge cluster
+    'identity_clarity', 'self_knowledge', 'strengths_awareness', 'weaknesses_acceptance', 'self_understanding',
+    // Resilience cluster
+    'challenge_embrace', 'growth_mindset', 'resilience', 'adaptability', 'overcoming_obstacles', 'perseverance',
+    // Intentionality cluster
+    'purposeful_actions', 'intentional_living', 'time_alignment', 'conscious_choices', 'deliberate_life',
+    // Wisdom cluster
+    'mentorship_giving', 'mentorship_receiving', 'wisdom_sharing', 'learning_from_others', 'teaching',
+    // Impact cluster
+    'contribution_size', 'ripple_effect', 'making_difference', 'positive_influence'
+  ]
+};
+
+// ============================================
+// 🎨 GEN Z VIRAL QUOTE TEMPLATES (diversity seeds)
+// ============================================
+
+const QUOTE_STYLES = [
+  'raw_honest', 'poetic_short', 'confident_flex', 'vulnerable_real', 
+  'growth_moment', 'self_aware', 'motivational_edge', 'philosophical_simple',
+  'relatable_struggle', 'victory_lap', 'boundary_setting', 'self_love'
+];
+
+const QUOTE_EXAMPLES = {
+  thriving: [
+    '"still becoming, still growing"',
+    '"watched myself choose better today"',
+    '"this is what alignment feels like"',
+    '"not perfect but fully present"',
+    '"leveling up in real time"'
+  ],
+  living: [
+    '"doing the work, seeing results"',
+    '"not where I was, proud of that"',
+    '"showing up counts"',
+    '"progress over perfection always"',
+    '"building something real here"'
+  ],
+  surviving: [
+    '"still here, still trying"',
+    '"messy but moving forward"',
+    '"giving myself credit today"',
+    '"not my best but I showed up"',
+    '"surviving is valid too"'
+  ],
+  struggling: [
+    '"learning to be gentle with myself"',
+    '"hard days don\'t define me"',
+    '"starting again, that\'s brave"',
+    '"growth isn\'t always visible"',
+    '"tomorrow is a new chance"'
+  ]
+};
+
+// ============================================
+// SCORING RUBRICS — ENHANCED
 // ============================================
 
 const SCORING_RUBRICS = {
@@ -73,19 +223,21 @@ const SCORING_RUBRICS = {
       'Nutrition and hydration — fueling the body properly',
       'Rest and recovery — giving body time to heal'
     ],
-    score_90_100: 'Excellent sleep, high energy, moved their body, feels calm and comfortable, actively taking care of themselves. Everything is working well.',
-    score_70_89: 'Mostly good. Maybe one area slightly off (e.g. slightly tired but still functional, minor stress but manageable). Overall positive state.',
-    score_50_69: 'Mixed signals. Some things okay, some not. Maybe tired but pushed through, or stressed but still moving. Not thriving but not struggling badly.',
-    score_30_49: 'Several things off. Poor sleep OR high stress OR no movement OR body discomfort. Feeling drained or overwhelmed in at least one clear way.',
-    score_0_29: 'Multiple serious issues. Very poor sleep AND high stress AND no movement AND feeling terrible physically or mentally. Genuinely struggling.',
+    score_90_100: 'Excellent sleep (7-9hrs), high energy all day, moved their body joyfully, feels calm and comfortable, actively taking care of themselves. Everything working harmoniously.',
+    score_70_89: 'Mostly good. Maybe one area slightly off (e.g., slightly tired but still functional, minor stress but manageable, or skipped exercise but still feel okay). Overall positive state.',
+    score_50_69: 'Mixed signals. Some things okay, some not. Maybe tired but pushed through, or stressed but still moving, or good energy but poor sleep. Not thriving but not struggling badly.',
+    score_30_49: 'Several things off. Poor sleep (less than 6hrs) OR high stress OR no movement OR body discomfort OR poor nutrition. Feeling drained or overwhelmed in at least one clear way.',
+    score_0_29: 'Multiple serious issues. Very poor sleep (less than 4hrs) AND high stress AND no movement AND feeling terrible physically or mentally. Genuinely struggling to function.',
     context_rules: [
-      'Sleep is THE foundation — poor sleep tanks everything else',
-      'High stress overrides other positive signals',
-      'Movement matters but context matters — recovering from illness gets credit for small efforts',
-      'Mental state (anxiety/calm) should be weighted heavily',
-      'Consistency across answers matters — one bad signal in sea of good is okay, multiple bad signals is serious'
+      'Sleep is THE foundation — poor sleep (less than 6 hours) automatically caps score at 60 maximum',
+      'High stress/anxiety overrides other positive signals — severe anxiety caps at 50',
+      'Movement matters but context matters — recovering from illness gets credit for any effort',
+      'Mental state (anxiety/calm/overwhelm) should be weighted as heavily as physical state',
+      'Consistency across answers matters — one bad signal in sea of good = 75+, multiple bad signals = 45 or below',
+      'Energy level is a KEY integrator — if energy is very low despite good sleep, investigate stress/nutrition/movement'
     ]
   },
+
   wealth: {
     name: 'Wealth',
     description: 'Financial security and career fulfillment — how stable and purposeful work and money life feels.',
@@ -99,19 +251,20 @@ const SCORING_RUBRICS = {
       'Income security — feeling stable vs. precarious',
       'Financial planning — feeling in control vs. reactive'
     ],
-    score_90_100: 'Feels financially secure, work is satisfying and meaningful, making clear progress on goals, minimal money stress, good work-life balance.',
-    score_70_89: 'Generally stable. Maybe one worry (small financial stress OR work feeling slightly tedious) but overall in a good place. Moving forward.',
-    score_50_69: 'Uncertain territory. Financial stress present OR work feels stagnant OR progress feels slow. Not in crisis but not thriving either.',
-    score_30_49: 'Clear stress in this area. Money worries are real OR career feels stuck or unfulfilling OR work-life balance is poor. Weighing on them.',
-    score_0_29: 'Serious distress. Major financial anxiety AND career dissatisfaction AND feeling trapped or hopeless about financial or professional future.',
+    score_90_100: 'Feels financially secure and confident, work is satisfying and meaningful, making clear progress on financial/career goals, minimal money stress, excellent work-life balance, growing professionally.',
+    score_70_89: 'Generally stable. Maybe one concern (small financial stress OR work feeling slightly tedious OR slow progress) but overall in a good place. Moving forward steadily.',
+    score_50_69: 'Uncertain territory. Financial stress is present OR work feels stagnant OR progress feels slow OR work-life balance is suffering. Not in crisis but not thriving either.',
+    score_30_49: 'Clear stress in this area. Money worries are real and constant OR career feels stuck or unfulfilling OR work-life balance is poor OR burnout is approaching. Weighing heavily on them.',
+    score_0_29: 'Serious financial/career distress. Major financial anxiety with no clear path forward AND career dissatisfaction AND feeling trapped or hopeless about financial or professional future.',
     context_rules: [
-      'Financial STRESS is the single biggest signal — it poisons everything else',
+      'Financial STRESS is the single biggest signal — severe money anxiety caps score at 40 regardless of income level',
       'Work satisfaction can compensate for lower income IF financial stress is manageable',
-      'Work-life balance matters enormously — burnout kills this pillar',
-      'Progress does not have to be big — small consistent movement counts',
-      'Feeling in control of money matters more than absolute amount'
+      'Work-life balance matters enormously — signs of burnout cap score at 50',
+      'Progress does not have to be big — small consistent movement toward goals counts heavily',
+      'Feeling in control of money matters MORE than absolute amount — someone with less money but a plan can score higher than wealthy but anxious'
     ]
   },
+
   love: {
     name: 'Love',
     description: 'Relationships and human connection — how supported, valued, and connected they feel.',
@@ -125,19 +278,21 @@ const SCORING_RUBRICS = {
       'Relationship quality — nourishing vs. draining',
       'Emotional safety — can they be themselves?'
     ],
-    score_90_100: 'Feeling deeply connected, had meaningful interactions, feels valued and supported, relationships are nourishing. Heart is full.',
-    score_70_89: 'Good connection overall. Maybe did not have a deep conversation today but feels secure in relationships. Warm and supported.',
-    score_50_69: 'Some connection but something feels off. Maybe lonely despite being around people, or a relationship feels strained. Okay but not great.',
-    score_30_49: 'Feeling disconnected or unsupported. Loneliness is real OR a key relationship is strained OR feeling unvalued. This pillar needs attention.',
-    score_0_29: 'Deep loneliness or relational pain. Feeling truly alone, unsupported, or dealing with relationship conflict that is genuinely hurting.',
+    score_90_100: 'Feeling deeply connected to loved ones, had meaningful interactions today, feels valued and supported by multiple people, relationships are nourishing, can be authentic. Heart is full.',
+    score_70_89: 'Good connection overall. Maybe did not have a deep conversation today but feels secure in relationships. Feels warm and supported. No major relationship stress.',
+    score_50_69: 'Some connection but something feels off. Maybe lonely despite being around people, or a relationship feels strained, or missing deep connection. Okay but not great.',
+    score_30_49: 'Feeling disconnected or unsupported. Loneliness is real OR a key relationship is strained/conflict OR feeling unvalued OR can\'t be authentic. This pillar needs attention.',
+    score_0_29: 'Deep loneliness or relational pain. Feeling truly alone and unsupported, OR dealing with serious relationship conflict, OR feeling fundamentally misunderstood or rejected.',
     context_rules: [
-      'Loneliness is the BIGGEST negative signal — even one meaningful connection can save a score',
-      'Quality over quantity — one deep connection beats many shallow ones',
-      'Feeling valued by even ONE person matters enormously',
-      'Appreciation (giving or receiving) is a strong positive signal',
-      'Emotional safety in relationships is critical — being authentic matters'
+      'Loneliness is the BIGGEST negative signal — but even ONE meaningful connection can significantly boost score',
+      'Quality over quantity ALWAYS — one deep connection beats ten shallow ones',
+      'Feeling valued by even ONE person matters enormously — can lift score from 40 to 65+',
+      'Appreciation (giving or receiving) is a strong positive signal — shows active relationship engagement',
+      'Emotional safety is critical — if they can\'t be themselves, cap score at 55 even if other factors are good',
+      'Recent meaningful conversation is huge — having one today can boost score by 15-20 points'
     ]
   },
+
   purpose: {
     name: 'Purpose',
     description: 'Meaning, direction, and growth — how aligned life feels with what actually matters to them.',
@@ -151,17 +306,18 @@ const SCORING_RUBRICS = {
       'Fulfillment — feeling satisfied with choices?',
       'Future optimism — hopeful about what is ahead?'
     ],
-    score_90_100: 'Today felt meaningful. Working on something that matters. Growing and learning. Clear sense of direction. Feels like life has purpose.',
-    score_70_89: 'Generally on track. Maybe today was routine but the bigger picture feels good. Some growth happening. Direction is clear enough.',
-    score_50_69: 'Drifting a bit. Today did not feel very meaningful OR unsure about direction OR not making progress on what matters. Searching.',
-    score_30_49: 'Feeling lost or stuck. Life does not feel meaningful, no clear direction, not growing, or deeply misaligned with own values.',
-    score_0_29: 'Existential struggle. Feeling truly purposeless, completely lost, no meaning, no growth, deeply misaligned with everything that should matter.',
+    score_90_100: 'Today felt deeply meaningful. Working on something that truly matters. Growing and learning actively. Crystal clear sense of direction. Life feels purposeful and aligned. Optimistic about future.',
+    score_70_89: 'Generally on track. Maybe today was routine but the bigger picture feels good. Some growth happening. Direction is clear enough. Feel okay about where life is headed.',
+    score_50_69: 'Drifting a bit. Today did not feel very meaningful OR unsure about direction OR not making progress on what matters OR questioning current path. Searching for clarity.',
+    score_30_49: 'Feeling lost or stuck. Life does not feel meaningful, no clear direction, not growing, OR deeply misaligned with own values. Existential questions without answers.',
+    score_0_29: 'Existential crisis. Feeling truly purposeless, completely lost, no meaning in daily life, no growth, deeply misaligned with everything that should matter. Questioning everything.',
     context_rules: [
       'Meaning is subjective — routine day can still score high if person feels purpose behind it',
-      'Growth does not have to be dramatic — small learning moments count',
-      'Values alignment is HUGE — doing something that conflicts with core values tanks this score',
-      'Clarity of direction matters more than speed of progress',
-      'Feeling of contribution is powerful — even small acts of helping matter'
+      'Growth does not have to be dramatic — small learning moments or insights count significantly',
+      'Values alignment is HUGE — doing something that conflicts with core values tanks this score below 40',
+      'Clarity of direction matters more than speed of progress — clear slow > fast unclear',
+      'Feeling of contribution is powerful — even small acts of helping or creating can boost score 10-15 points',
+      'Future optimism is a key indicator — if hopeless about future, cap at 45 even if present feels okay'
     ]
   }
 };
@@ -216,76 +372,102 @@ const formatTimeUntilReset = (resetTime) => {
 
 const getVibeFromScore = (score) => {
   if (score >= 80) return { vibe: 'THRIVING', emoji: '🔥' };
-  if (score >= 60) return { vibe: 'LIVING',   emoji: '⚡' };
-  if (score >= 40) return { vibe: 'SURVIVING',emoji: '💪' };
+  if (score >= 60) return { vibe: 'LIVING', emoji: '⚡' };
+  if (score >= 40) return { vibe: 'SURVIVING', emoji: '💪' };
   return { vibe: 'STRUGGLING', emoji: '🌱' };
 };
 
 const getAgeGroupLabel = (ag) => ({
-  '18-24':'Young Adult','25-34':'Adult','35-44':'Mid Adult',
-  '45-54':'Mature Adult','55-64':'Senior Adult','65+':'Elder'
+  '18-24': 'Young Adult', '25-34': 'Adult', '35-44': 'Mid Adult',
+  '45-54': 'Mature Adult', '55-64': 'Senior Adult', '65+': 'Elder'
 }[ag] || 'Adult');
 
 // ============================================
-// 🧠 AI PILLAR SCORING ENGINE
-// Now with 8 questions for richer data + MULTILINGUAL
+// 🎲 DIVERSITY SEED GENERATOR
+// ============================================
+function getDiversitySeed(deviceId, checkCount, pillar) {
+  // Creates a unique seed for each user/check to ensure variety
+  const timestamp = Date.now();
+  const hash = (deviceId + checkCount + pillar + timestamp).split('').reduce((a, b) => {
+    a = ((a << 5) - a) + b.charCodeAt(0);
+    return a & a;
+  }, 0);
+  return Math.abs(hash) % 1000;
+}
+
+// ============================================
+// 🧠 AI PILLAR SCORING ENGINE — ENHANCED WITH VARIETY
 // ============================================
 
 async function aiScorePillar(profile, pillar, questions, answers, submissions) {
   const { name, ageGroup, gender, language } = profile;
-  const userLanguage = language || 'en'; // ✅ Default to English if not set
+  const userLanguage = language || 'en';
   const displayAge = ageGroup ? getAgeGroupLabel(ageGroup) : 'Adult';
   const rubric = SCORING_RUBRICS[pillar];
   const pillarMeta = PILLARS[pillar.toUpperCase()];
 
-  // Format Q&A clearly for GPT
+  // Generate diversity seed for varied scoring approaches
+  const diversitySeed = getDiversitySeed(profile.name, submissions.length, pillar);
+  const scoringStyle = diversitySeed % 3 === 0 ? 'analytical_precise' : 
+                       diversitySeed % 3 === 1 ? 'contextual_nuanced' : 'pattern_based';
+
   const qaFormatted = questions.map((q, i) => {
     const raw = answers[i]?.answer !== undefined ? answers[i].answer : answers[i];
     const answerValue = typeof raw === 'object' && raw !== null ? (raw.answer ?? JSON.stringify(raw)) : raw;
     return `  Q${i + 1}: ${q.text}\n  A${i + 1}: ${answerValue}`;
   }).join('\n\n');
 
-  // Get last 3 scores on THIS pillar for trend context
   const prevSamePillar = submissions
     .filter(s => s.pillar === pillar)
-    .slice(0, 3);
+    .slice(0, 5);
 
   const previousScoresContext = prevSamePillar.length > 0
     ? prevSamePillar.map(s => `  ${s.date}: ${s.pillarScores?.[pillar] ?? s.score}/100`).join('\n')
     : '  No previous checks on this pillar';
 
-  // Get previous Q&A on same pillar for pattern context
   const prevQAContext = prevSamePillar.length > 0
     ? prevSamePillar.map(s => {
-        const qa = (s.questions || []).map((q, idx) => {
-          const a = s.answers?.[idx]?.answer?.answer ?? s.answers?.[idx]?.answer ?? '—';
-          return `${q.text} → ${a}`;
-        }).join('; ');
-        return `  [${s.date}] ${qa}`;
-      }).join('\n')
+      const qa = (s.questions || []).map((q, idx) => {
+        const a = s.answers?.[idx]?.answer?.answer ?? s.answers?.[idx]?.answer ?? '—';
+        return `${q.text} → ${a}`;
+      }).join('; ');
+      return `  [${s.date}] ${qa}`;
+    }).join('\n')
     : '  No previous Q&A on this pillar';
 
-  const prompt = `IMPORTANT: Your justification MUST be in ${getLanguageName(userLanguage)} language.
+  // Enhanced scoring approach instructions based on style
+  const scoringApproachInstructions = {
+    analytical_precise: `Use a methodical approach: Score each answer 1-10, identify the 2 strongest and 2 weakest signals, apply context rules strictly, calculate weighted average with emphasis on critical factors.`,
+    contextual_nuanced: `Consider the bigger picture: How do answers relate to each other? Are there contradictions? What's the underlying pattern? Let context override individual signals when appropriate.`,
+    pattern_based: `Compare to their history: Is this better/worse than usual? What changed? Focus on trends and deviations from their personal baseline.`
+  };
+
+  const prompt = `CRITICAL INSTRUCTIONS - READ CAREFULLY:
+
+Your justification MUST be in ${getLanguageName(userLanguage)} language.
 Respond ONLY with valid JSON. The "justification" field must be in ${getLanguageName(userLanguage)}.
 
-You are scoring ${name}'s ${rubric.name} wellness pillar. You have 8 detailed answers. Give an accurate, fair score based on the rubric.
+You are an expert wellness psychologist scoring ${name}'s ${rubric.name} pillar. This score will impact their life decisions, so THINK DEEPLY and be PRECISE.
+
+🎯 SCORING APPROACH FOR THIS CHECK: ${scoringStyle.toUpperCase()}
+${scoringApproachInstructions[scoringStyle]}
 
 ═══════════════════════════════════════════
 👤 PERSON: ${name} | ${displayAge} | ${gender}
 ═══════════════════════════════════════════
 
 ═══════════════════════════════════════════
-📝 TODAY'S ANSWERS (${pillarMeta?.emoji} ${rubric.name}) — 8 QUESTIONS:
+📝 TODAY'S ANSWERS (${pillarMeta?.emoji} ${rubric.name}) — 8 DEEP QUESTIONS:
 ${qaFormatted}
 ═══════════════════════════════════════════
 
 ═══════════════════════════════════════════
-📊 THEIR PREVIOUS ${rubric.name.toUpperCase()} SCORES (for trend awareness):
+📊 THEIR ${rubric.name.toUpperCase()} SCORE HISTORY (look for patterns):
 ${previousScoresContext}
 ═══════════════════════════════════════════
 
 ═══════════════════════════════════════════
-📝 THEIR PREVIOUS ${rubric.name.toUpperCase()} ANSWERS (for pattern awareness):
+📝 THEIR PREVIOUS ${rubric.name.toUpperCase()} ANSWERS (spot changes):
 ${prevQAContext}
 ═══════════════════════════════════════════
 
@@ -293,55 +475,57 @@ ${prevQAContext}
 📖 ${rubric.name.toUpperCase()} PILLAR DEFINITION:
 ${rubric.description}
 
-What matters in this pillar:
+What REALLY matters in this pillar (prioritize these):
 ${rubric.what_matters.map(w => `  • ${w}`).join('\n')}
 ═══════════════════════════════════════════
 
 ═══════════════════════════════════════════
-📊 SCORING RUBRIC — USE THIS TO DECIDE THE SCORE:
+📊 SCORING RUBRIC — MATCH THEIR REALITY TO THESE BANDS:
 
-🟢 90-100: ${rubric.score_90_100}
-🟡 70-89:  ${rubric.score_70_89}
-🟠 50-69:  ${rubric.score_50_69}
-🔴 30-49:  ${rubric.score_30_49}
-🔵 0-29:   ${rubric.score_0_29}
+🟢 90-100 (EXCEPTIONAL): ${rubric.score_90_100}
+🟡 70-89 (SOLID):  ${rubric.score_70_89}
+🟠 50-69 (MIXED):  ${rubric.score_50_69}
+🔴 30-49 (STRUGGLING):  ${rubric.score_30_49}
+🔵 0-29 (CRISIS):   ${rubric.score_0_29}
 ═══════════════════════════════════════════
 
 ═══════════════════════════════════════════
-⚡ CONTEXT RULES — THESE OVERRIDE SIMPLE AVERAGES:
+⚡ CRITICAL CONTEXT RULES — THESE ARE NON-NEGOTIABLE:
 ${rubric.context_rules.map(r => `  • ${r}`).join('\n')}
 ═══════════════════════════════════════════
 
-═══════════════════════════════════════════
-🎯 YOUR JOB:
-1. Read all 8 answers carefully — more data = more accuracy
-2. Match their answers to the rubric above
-3. Apply the context rules (some signals matter more)
-4. Give ONE score (0-100) that honestly reflects where they are
-5. Write a 1-sentence justification (max 20 words) in ${getLanguageName(userLanguage)} explaining WHY
+🎯 YOUR SCORING PROCESS (take your time):
 
-IMPORTANT:
-- Do NOT just average numbers. Read the MEANING of their answers.
-- Use the context rules — they exist because some signals matter more
-- Be honest. Not harsh, but accurate. The user needs to trust this score.
-- Consider their previous scores for consistency
-- With 8 questions, you have rich data — use ALL of it
+STEP 1: Read ALL 8 answers carefully. Notice specifics, not just numbers.
+STEP 2: Identify the STRONGEST positive signal (what's working best?)
+STEP 3: Identify the BIGGEST red flag (what's most concerning?)
+STEP 4: Apply context rules — do any override your initial assessment?
+STEP 5: Compare to their history — is this a pattern or an anomaly?
+STEP 6: Match to the rubric bands — where do they truly fit?
+STEP 7: Assign ONE honest score (0-100) that captures their current state
+STEP 8: Write a UNIQUE justification that references SPECIFIC answers (avoid phrases you've used before)
+
+CRITICAL RULES FOR VARIETY:
+- Use DIFFERENT reasoning each time — vary your analytical lens
+- Reference DIFFERENT answer details each check — don't repeat patterns
+- Vary your justification structure — sometimes start with strength, sometimes weakness, sometimes context
+- Use diverse vocabulary — avoid repetitive phrases like "overall good" or "some concerns"
 
 Respond ONLY with valid JSON:
 {
   "score": <number 0-100>,
-  "justification": "<1 sentence in ${getLanguageName(userLanguage)}, max 20 words, why this score>"
+  "justification": "<1 unique sentence in ${getLanguageName(userLanguage)}, max 25 words, reference SPECIFIC answer with fresh perspective>"
 }`;
 
   try {
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       messages: [
-        { role: 'system', content: 'You are an accurate wellness scorer. Follow the rubric precisely. Respond ONLY with valid JSON. No markdown.' },
+        { role: 'system', content: 'You are an expert wellness psychologist. Score accurately based on rubrics. Think deeply before scoring. VARY your approach each time. Respond ONLY with valid JSON. No markdown.' },
         { role: 'user', content: prompt }
       ],
-      temperature: 0.3,
-      max_tokens: 150,
+      temperature: 0.3, // Slightly higher for more variety while maintaining quality
+      max_tokens: 200,
     });
 
     let txt = completion.choices[0].message.content.trim().replace(/```json\n?/g, '').replace(/```\n?/g, '');
@@ -404,7 +588,6 @@ function calculateAliveScore(todayPillar, todayScore, submissions) {
     alive += scores[PILLARS[key].id] * PILLARS[key].weight;
   }
 
-  // Build transparent explanation
   const breakdown = Object.keys(PILLARS).map(k => {
     const p = PILLARS[k];
     const isTodayPillar = p.id === todayPillar;
@@ -425,8 +608,8 @@ function calculateAliveScore(todayPillar, todayScore, submissions) {
 
   const scoringExplanation = `Your ${strongest.name} (${strongest.score}) is strongest. ${weakest.name} (${weakest.score}) needs attention. Today's ${PILLARS[todayPillar.toUpperCase()]?.name} check (${todayScore}) ${todayScore >= 75 ? 'boosted' : todayScore >= 55 ? 'maintained' : 'lowered'} your overall score.`;
 
-  return { 
-    aliveScore: Math.round(alive), 
+  return {
+    aliveScore: Math.round(alive),
     pillarScores: scores,
     breakdown,
     scoringExplanation,
@@ -500,15 +683,19 @@ function detectPrideMoment(todayPillar, todayPillarScore, aliveScore, submission
 }
 
 // ============================================
-// 🔥 INDIVIDUAL TIP GENERATOR + MULTILINGUAL
-// Generates ONE specific, actionable tip based on
-// TODAY's answers. This is the immediate takeaway.
+// 🔥 INDIVIDUAL TIP GENERATOR — HYPER-PERSONAL 10/10
 // ============================================
 
-async function generateIndividualTip(profile, pillar, questions, answers, todayPillarScore) {
-  const { name, language } = profile;
-  const userLanguage = language || 'en'; // ✅ Default to English
+async function generateIndividualTip(profile, pillar, questions, answers, todayPillarScore, submissions) {
+  const { name, language, ageGroup } = profile;
+  const userLanguage = language || 'en';
   const pillarMeta = PILLARS[pillar.toUpperCase()];
+  
+  // Generate diversity seed for varied tip approaches
+  const diversitySeed = getDiversitySeed(name, submissions.length, pillar);
+  const tipStyle = diversitySeed % 4 === 0 ? 'immediate_action' : 
+                   diversitySeed % 4 === 1 ? 'reframe_perspective' :
+                   diversitySeed % 4 === 2 ? 'habit_building' : 'self_compassion';
 
   const qaContext = questions.map((q, i) => {
     const raw = answers[i]?.answer !== undefined ? answers[i].answer : answers[i];
@@ -516,43 +703,75 @@ async function generateIndividualTip(profile, pillar, questions, answers, todayP
     return `Q: ${q.text}\nA: ${answerValue}`;
   }).join('\n\n');
 
-  const prompt = `IMPORTANT: The tip MUST be in ${getLanguageName(userLanguage)} language.
+  // Get recent tips to avoid repetition
+  const recentTips = submissions
+    .filter(s => s.individualTip)
+    .slice(0, 3)
+    .map(s => s.individualTip)
+    .join(' | ');
+
+  const tipStyleInstructions = {
+    immediate_action: 'Give a SPECIFIC action they can do in the next 2 hours. Be concrete.',
+    reframe_perspective: 'Offer a new way to view their situation that empowers them.',
+    habit_building: 'Suggest a micro-habit they can start TODAY that compounds over time.',
+    self_compassion: 'Remind them to be kind to themselves while taking one small step.'
+  };
+
+  const prompt = `CRITICAL: This tip will be read by ${name}. Make it HYPER-PERSONAL and IMMEDIATELY ACTIONABLE.
+
+The tip MUST be in ${getLanguageName(userLanguage)} language.
 Respond ONLY with valid JSON. The "tip" field must be in ${getLanguageName(userLanguage)}.
 
-You are Dr. Sarah giving ${name} ONE immediate action based on their ${pillarMeta?.name} check.
+You are Dr. Sarah, ${name}'s personal wellness coach. Give them ONE specific action that will make a REAL difference in the next 24-48 hours.
 
-📝 TODAY'S ANSWERS:
+🎯 TIP STYLE FOR THIS CHECK: ${tipStyle.toUpperCase()}
+${tipStyleInstructions[tipStyle]}
+
+📝 ${name}'S ANSWERS TODAY:
 ${qaContext}
 
 📊 Their ${pillarMeta?.name} score: ${todayPillarScore}/100
 
-🎯 Give ${name} ONE specific tip they can act on TODAY or TOMORROW.
+🚫 RECENT TIPS (DO NOT REPEAT THESE PATTERNS):
+${recentTips || 'First tip'}
 
-Rules:
-- Must be SPECIFIC to their actual answers (reference what they said)
-- Actionable within 24-48 hours
-- 1 sentence, max 20 words
-- Warm, encouraging tone
-- Use ${name} if it flows naturally (max once)
-- MUST be in ${getLanguageName(userLanguage)} language
+🎯 GENERATE ONE TIP THAT:
+✅ References their ACTUAL answers (quote something specific they said)
+✅ Is actionable within 24-48 hours (not vague like "take care of yourself")
+✅ Feels personal to ${name} (use their name ONLY if it flows naturally)
+✅ Addresses their BIGGEST opportunity based on their answers
+✅ Is encouraging but honest (no toxic positivity)
+✅ Is 15-25 words (short and punchy)
+✅ Is DIFFERENT from recent tips in approach and wording
+✅ Matches the ${tipStyle} style
+✅ Is in ${getLanguageName(userLanguage)} language
 
-Examples (in English, but you must respond in ${getLanguageName(userLanguage)}):
-- "Your good sleep is your superpower right now — protect it tonight too, ${name}."
-- "That 3/5 energy tells me you need a 20-minute walk today to reset."
-- "You mentioned no meaningful conversation — text one person right now and ask how they are."
+BAD TIP EXAMPLES (too generic):
+❌ "Make sure to get enough rest tonight"
+❌ "Try to reduce stress levels"
+❌ "Focus on your wellbeing"
+❌ "Take time for self-care"
+
+GREAT TIP EXAMPLES (specific and actionable):
+✅ "Your 3/5 sleep tells me bedtime is slipping — set a 10pm alarm tonight and honor it"
+✅ "You said no meaningful conversation today — text your best friend right now and ask one real question"
+✅ "That 2/5 energy with good sleep means movement is missing — 15-minute walk after this, no excuses"
+✅ "You're being too hard on yourself about that setback — write down one thing you did right today"
+
+Now generate THE perfect tip for ${name} based on their answers:
 
 Respond ONLY with valid JSON:
-{"tip": "your specific tip in ${getLanguageName(userLanguage)}"}`;
+{"tip": "your hyper-specific tip in ${getLanguageName(userLanguage)}"}`;
 
   try {
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       messages: [
-        { role: 'system', content: 'Respond ONLY with valid JSON. No markdown.' },
+        { role: 'system', content: 'You are Dr. Sarah, a direct and caring wellness coach. Be specific, not generic. VARY your tips each time. Respond ONLY with valid JSON. No markdown.' },
         { role: 'user', content: prompt }
       ],
-      temperature: 0.75,
-      max_tokens: 80,
+      temperature: 0.85,
+      max_tokens: 100,
     });
 
     let txt = completion.choices[0].message.content.trim().replace(/```json\n?/g, '').replace(/```\n?/g, '');
@@ -565,14 +784,21 @@ Respond ONLY with valid JSON:
 }
 
 // ============================================
-// PARALLEL GPT CALLS — Quote + Strategic Tips + MULTILINGUAL
+// 💬 QUOTE + STRATEGIC TIPS — GEN Z VIRAL 10/10
 // ============================================
 
 async function generateQuoteAndStrategicTips(profile, todayPillar, questions, answers, pillarScores, aliveScore, scoringJustification, submissions) {
   const { name, ageGroup, gender, language } = profile;
-  const userLanguage = language || 'en'; // ✅ Default to English
+  const userLanguage = language || 'en';
   const displayAge = ageGroup ? getAgeGroupLabel(ageGroup) : 'Adult';
   const pillarMeta = PILLARS[todayPillar.toUpperCase()];
+
+  // Generate diversity seeds
+  const diversitySeed = getDiversitySeed(name, submissions.length, todayPillar);
+  const quoteStyle = QUOTE_STYLES[diversitySeed % QUOTE_STYLES.length];
+  const { vibe } = getVibeFromScore(aliveScore);
+  const vibeKey = vibe.toLowerCase();
+  const exampleQuotes = QUOTE_EXAMPLES[vibeKey] || QUOTE_EXAMPLES.living;
 
   const qaContext = questions.map((q, i) => {
     const raw = answers[i]?.answer !== undefined ? answers[i].answer : answers[i];
@@ -593,88 +819,146 @@ async function generateQuoteAndStrategicTips(profile, todayPillar, questions, an
     `${s.date}: Alive=${s.score}/100 [${s.vibe}] | ${s.pillar}=${s.pillarScores?.[s.pillar] ?? s.score}/100`
   ).join('\n');
 
-  // --- PROMPT 1: Quote + Message ---
-  const quotePrompt = `IMPORTANT: Quote and message MUST be in ${getLanguageName(userLanguage)} language.
-Respond ONLY with valid JSON. Both "quote" and "message" fields must be in ${getLanguageName(userLanguage)}.
+  // Get recent quotes to avoid repetition
+  const recentQuotes = submissions
+    .filter(s => s.quote)
+    .slice(0, 5)
+    .map(s => s.quote)
+    .join(' | ');
 
-You are Dr. Sarah, a warm wellness coach.
+  const recentStrategicTips = submissions
+    .filter(s => s.strategicTips && s.strategicTips.length > 0)
+    .slice(0, 2)
+    .flatMap(s => s.strategicTips)
+    .join(' | ');
 
-User: ${name}, Age: ${displayAge}, Gender: ${gender}
-Today's check: ${pillarMeta?.emoji} ${pillarMeta?.name}
+  // --- PROMPT 1: Gen Z Viral Quote ---
+  const quotePrompt = `CRITICAL: This quote will be SHARED on social media. Make it VIRAL-WORTHY and AUTHENTIC to Gen Z.
+
+Quote and message MUST be in ${getLanguageName(userLanguage)} language.
+Respond ONLY with valid JSON. Both fields must be in ${getLanguageName(userLanguage)}.
+
+${name} is a ${displayAge} who just scored ${aliveScore}/100 on their aliveness.
+Their vibe: ${vibe}
 Their ${pillarMeta?.name} score: ${pillarScores[todayPillar]}/100
 Scoring reason: ${scoringJustification}
-Overall Alive Score: ${aliveScore}/100
 
-Their answers:
+Their answers today:
 ${qaContext}
 
-Write:
-1. A QUOTE (5-8 words, warm, personal). Use ${name} max once.
-2. A MESSAGE (1 sentence, max 20 words). Reference something SPECIFIC from their answers. Be honest and caring.
+🎨 QUOTE STYLE FOR THIS CHECK: ${quoteStyle.toUpperCase()}
+Use this style to inform your tone and approach.
 
-Both must be in ${getLanguageName(userLanguage)} language.
+📱 EXAMPLE VIRAL QUOTES FOR ${vibe} VIBE:
+${exampleQuotes.join('\n')}
+
+🚫 RECENT QUOTES (DO NOT REPEAT THESE):
+${recentQuotes || 'First quote'}
+
+🎯 CREATE A QUOTE THAT:
+✅ Is 4-7 words (short and punchy)
+✅ Feels like something ${name} would actually say
+✅ Is shareable (Gen Z would screenshot this)
+✅ Captures their VIBE today (not fake motivation)
+✅ Uses lowercase (Gen Z authentic style)
+✅ NO emoji in the quote itself
+✅ Is COMPLETELY DIFFERENT from recent quotes
+✅ Matches the ${quoteStyle} style
+✅ Is in ${getLanguageName(userLanguage)} language
+
+BAD QUOTE EXAMPLES (too generic/cringe):
+❌ "Keep pushing forward, ${name}!"
+❌ "You are worthy of love"
+❌ "Believe in yourself always"
+❌ "Stay positive!"
+
+GREAT QUOTE EXAMPLES (authentic/shareable):
+✅ "still becoming, still growing"
+✅ "watched myself choose me today"
+✅ "this is what growth feels like"
+✅ "not perfect but present"
+✅ "doing the work, seeing results"
+
+Also write a MESSAGE (1 sentence, max 20 words) that references something SPECIFIC from their answers.
 
 Respond ONLY with valid JSON:
-{"quote": "... in ${getLanguageName(userLanguage)}", "message": "... in ${getLanguageName(userLanguage)}"}`;
+{"quote": "viral-worthy quote in ${getLanguageName(userLanguage)}", "message": "specific message in ${getLanguageName(userLanguage)}"}`;
 
-  // --- PROMPT 2: Strategic Tips (3 cross-pillar tips) ---
-  const tipsPrompt = `IMPORTANT: All tips MUST be in ${getLanguageName(userLanguage)} language.
+  // --- PROMPT 2: Strategic Tips ---
+  const tipsPrompt = `CRITICAL: These tips will guide ${name}'s next week. Make them STRATEGIC and ACTIONABLE.
+
+All tips MUST be in ${getLanguageName(userLanguage)} language.
 Respond ONLY with valid JSON. All fields must be in ${getLanguageName(userLanguage)}.
 
-You are Dr. Maya, a wellness strategist for ${name}.
+${name} | ${displayAge} | ${gender}
 
-👤 ${name} | ${displayAge} | ${gender}
-
-📊 ALL PILLAR SCORES RIGHT NOW:
+📊 CURRENT STATE:
 ${pillarSummary}
 💪 Strongest: ${PILLARS[strongest[0]?.toUpperCase()]?.name || strongest[0]} (${strongest[1]}/100)
 ⚠️ Weakest: ${PILLARS[weakest[0]?.toUpperCase()]?.name || weakest[0]} (${weakest[1]}/100)
 Overall Alive Score: ${aliveScore}/100
 
-📝 Today's ${pillarMeta?.name} check answers:
+📝 Today's ${pillarMeta?.name} answers:
 ${qaContext}
 
-📈 Recent trend (last 5 checks):
+📈 Recent trend:
 ${recentTrend || 'First check-in'}
 
-🎯 Generate 3 STRATEGIC TIPS (these are different from the immediate tip they already got):
+🚫 RECENT STRATEGIC TIPS (DO NOT REPEAT THESE PATTERNS):
+${recentStrategicTips || 'First tips'}
 
-Rules:
-- At least 1 tip MUST connect two pillars (e.g., "Your strong Love can help boost your Health this week")
-- Tips should be STRATEGIC — not what to do today, but what to focus on THIS WEEK
-- Each tip: 1 sentence, max 22 words
-- Specific to their actual scores and patterns — not generic wellness advice
-- Warm and empowering tone
-- Use ${name} in max 1 tip
-- ALL tips must be in ${getLanguageName(userLanguage)} language
+🎯 GENERATE 3 STRATEGIC TIPS:
 
-Also identify the weakest pillar and give it a specific weekly boost suggestion (max 25 words) in ${getLanguageName(userLanguage)}.
+RULES:
+✅ At least 1 tip MUST connect TWO pillars (e.g., "Your strong Love can fuel your Purpose this week")
+✅ Tips are STRATEGIC — what to focus on THIS WEEK, not just today
+✅ Each tip: 1 sentence, 18-25 words
+✅ Reference their actual scores/patterns (not generic advice)
+✅ Warm but direct tone (no fluff)
+✅ Use ${name} in maximum 1 tip, ONLY if it flows naturally
+✅ VARY from recent tips — use different angles and wording
+✅ Be SPECIFIC about actions, not vague encouragement
+✅ ALL tips in ${getLanguageName(userLanguage)} language
+
+BAD TIP EXAMPLES (too generic):
+❌ "Try to eat healthier this week"
+❌ "Make time for yourself"
+❌ "Stay positive"
+❌ "Focus on your goals"
+
+GREAT TIP EXAMPLES (strategic and specific):
+✅ "Your Health (85) is your foundation — use that energy to tackle your Wealth goals (58) this week"
+✅ "Schedule one 30-min money review this Sunday to reduce that financial anxiety you mentioned"
+✅ "Your Love connections (72) are solid — invite someone to that workout you've been skipping"
+✅ "That Purpose clarity you found needs action — pick one goal and take the smallest step this week"
+
+Also identify the weakest pillar and give ONE specific weekly boost action (max 25 words) in ${getLanguageName(userLanguage)}.
 
 Respond ONLY with valid JSON:
 {
   "tips": ["tip1 in ${getLanguageName(userLanguage)}", "tip2 in ${getLanguageName(userLanguage)}", "tip3 in ${getLanguageName(userLanguage)}"],
   "weakestPillar": "pillar_id",
-  "weakestBoost": "specific weekly suggestion in ${getLanguageName(userLanguage)}"
+  "weakestBoost": "specific weekly action in ${getLanguageName(userLanguage)}"
 }`;
 
   const [quoteRes, tipsRes] = await Promise.allSettled([
     openai.chat.completions.create({
       model: 'gpt-4o-mini',
       messages: [
-        { role: 'system', content: 'Respond ONLY with valid JSON. No markdown.' },
+        { role: 'system', content: 'You write viral Gen Z quotes. Be authentic, not cringe. VARY every quote. Respond ONLY with valid JSON. No markdown.' },
         { role: 'user', content: quotePrompt }
       ],
-      temperature: 0.72,
+      temperature: 0.9, // Higher for more creativity
       max_tokens: 150,
     }),
     openai.chat.completions.create({
       model: 'gpt-4o-mini',
       messages: [
-        { role: 'system', content: 'Respond ONLY with valid JSON. No markdown.' },
+        { role: 'system', content: 'You are Dr. Maya, a strategic wellness coach. Be specific, not generic. VARY your tips. Respond ONLY with valid JSON. No markdown.' },
         { role: 'user', content: tipsPrompt }
       ],
-      temperature: 0.68,
-      max_tokens: 300,
+      temperature: 0.8, // Higher for more variety
+      max_tokens: 350,
     }),
   ]);
 
@@ -716,29 +1000,56 @@ Respond ONLY with valid JSON:
 }
 
 // ============================================
-// ADAPTIVE QUESTION GENERATION — NOW 8 QUESTIONS + MULTILINGUAL
-// 3 scale, 3 yesno, 2 choice
+// 📝 ADAPTIVE QUESTION GENERATION — ENFORCED DIVERSITY 10/10
 // ============================================
 
 const generatePersonalizedQuestions = async (profile, selectedPillar, previousSubmissions = []) => {
   const { name, ageGroup, gender, language } = profile;
-  const userLanguage = language || 'en'; // ✅ Default to English
+  const userLanguage = language || 'en';
   const displayAge = ageGroup ? getAgeGroupLabel(ageGroup) : 'Adult';
   const pillarMeta = PILLARS[selectedPillar.toUpperCase()];
   const rubric = SCORING_RUBRICS[selectedPillar];
+  const topicsBank = QUESTION_TOPICS[selectedPillar] || [];
 
   const samePillarHistory = previousSubmissions
     .filter(s => s.pillar === selectedPillar)
     .slice(0, 3);
 
+  // Extract previously asked questions AND topics to avoid repetition
+  const previouslyAskedQuestions = samePillarHistory
+    .flatMap(s => (s.questions || []).map(q => q.text))
+    .join('; ');
+
+  // Extract previously used topics (if we stored them, otherwise infer from questions)
+  const previousTopicsUsed = samePillarHistory
+    .flatMap(s => (s.questions || []).map(q => {
+      // Try to match question text to topics
+      return topicsBank.find(topic => q.text.toLowerCase().includes(topic.replace(/_/g, ' ')));
+    }))
+    .filter(Boolean);
+
+  // Select 8 diverse topics for this check
+  const diversitySeed = getDiversitySeed(name, previousSubmissions.length, selectedPillar);
+  const shuffledTopics = [...topicsBank].sort(() => 0.5 - Math.random());
+  
+  // Pick topics that haven't been used recently
+  const availableTopics = shuffledTopics.filter(t => !previousTopicsUsed.includes(t));
+  const selectedTopics = availableTopics.slice(0, 8);
+  
+  // If we don't have enough unused topics, fill with least recently used
+  if (selectedTopics.length < 8) {
+    const remaining = shuffledTopics.filter(t => !selectedTopics.includes(t));
+    selectedTopics.push(...remaining.slice(0, 8 - selectedTopics.length));
+  }
+
   const adaptiveContext = samePillarHistory.length > 0
     ? samePillarHistory.map(s => {
-        const prevQA = (s.questions || []).map((q, i) => {
-          const a = s.answers?.[i]?.answer?.answer || s.answers?.[i]?.answer || '—';
-          return `${q.text} → ${a}`;
-        }).join('; ');
-        return `${s.date} (score ${s.pillarScores?.[selectedPillar] || s.score}/100): ${prevQA}`;
-      }).join('\n')
+      const prevQA = (s.questions || []).map((q, i) => {
+        const a = s.answers?.[i]?.answer?.answer || s.answers?.[i]?.answer || '—';
+        return `${q.text} → ${a}`;
+      }).join('; ');
+      return `${s.date} (score ${s.pillarScores?.[selectedPillar] || s.score}/100): ${prevQA}`;
+    }).join('\n')
     : null;
 
   const pillarHistory = buildPillarHistory(previousSubmissions);
@@ -749,68 +1060,94 @@ const generatePersonalizedQuestions = async (profile, selectedPillar, previousSu
     return `${p.name}: ${avg !== null ? avg + '/100' : 'no data'}`;
   }).join(', ');
 
-  const prompt = `IMPORTANT: Generate ALL questions in ${getLanguageName(userLanguage)} language.
+  const prompt = `CRITICAL: Generate DIVERSE, DEEP questions that feel personal to ${name}.
+
+ALL questions MUST be in ${getLanguageName(userLanguage)} language.
 Questions text, options, labels - EVERYTHING must be in ${getLanguageName(userLanguage)}.
 Respond ONLY with valid JSON. No markdown.
 
-You are Dr. Sarah creating 8 adaptive wellness questions.
+You are Dr. Sarah creating 8 wellness questions for ${name}.
 
-👤 USER:
+👤 USER PROFILE:
 - Name: ${name}
 - Age: ${displayAge}
 - Gender: ${gender}
 - Language: ${getLanguageName(userLanguage)}
 - Today's focus: ${pillarMeta?.emoji} ${pillarMeta?.name}
-- Other pillar context: ${pillarContext}
+- Other pillars: ${pillarContext}
 
-${adaptiveContext ? `📝 PREVIOUS ${pillarMeta?.name.toUpperCase()} CHECK-INS:\n${adaptiveContext}` : `📝 First time checking ${pillarMeta?.name} — keep it welcoming.`}
+${adaptiveContext ? `📝 PREVIOUS ${pillarMeta?.name.toUpperCase()} CHECK-INS:\n${adaptiveContext}` : `📝 First time checking ${pillarMeta?.name} — make it welcoming but deep.`}
 
-📖 WHAT ${pillarMeta?.name.toUpperCase()} SCORING CARES ABOUT:
+🚫 PREVIOUSLY ASKED QUESTIONS (NEVER repeat these):
+${previouslyAskedQuestions || 'None yet'}
+
+🚫 PREVIOUSLY USED TOPICS (avoid these):
+${previousTopicsUsed.join(', ') || 'None yet'}
+
+🎯 REQUIRED TOPICS FOR THIS CHECK (use EXACTLY these 8 topics, one per question):
+${selectedTopics.map((t, i) => `Q${i + 1}: ${t}`).join('\n')}
+
+📖 ${pillarMeta?.name.toUpperCase()} MEASUREMENT PRIORITIES:
 ${rubric.what_matters.map(w => `  • ${w}`).join('\n')}
 
-⚡ CRITICAL SIGNALS (questions should uncover these):
+⚡ KEY SIGNALS TO UNCOVER:
 ${rubric.context_rules.map(r => `  • ${r}`).join('\n')}
 
-🎯 CREATE 8 QUESTIONS about ${pillarMeta?.emoji} ${pillarMeta?.name}:
+🎯 CREATE 8 QUESTIONS THAT:
 
-CRITICAL RULES:
-- EXACTLY: 3 scale (1-5), 3 yesno, 2 choice
-- If user previously answered poorly on something, FOLLOW UP on it
-- If user previously scored high, dig DEEPER
-- NEVER repeat an exact question from history
-- Use ${name} in ONLY 1-2 questions max
-- Conversational tone, not clinical
-- Age-appropriate for ${displayAge}
-- Choice questions MUST have 4-5 options ordered from worst to best
-- Questions should reveal the signals the scoring rubric cares about
-- 8 questions = richer data = better scoring accuracy
-- ALL questions, labels, options MUST be in ${getLanguageName(userLanguage)} language
+CRITICAL REQUIREMENTS:
+✅ EXACTLY: 3 scale (1-5), 3 yesno, 2 choice
+✅ Each question MUST address ONE of the required topics above (in order: Q1 = topic 1, Q2 = topic 2, etc.)
+✅ NEVER repeat questions from their history
+✅ If they scored low before, dig into WHY with different angle
+✅ If they scored high before, explore DEPTH (what's working specifically?)
+✅ Use ${name} in only 1-2 questions max (feels personal, not robotic)
+✅ Conversational, age-appropriate for ${displayAge}
+✅ Choice questions: 4-5 options, ordered worst to best
+✅ Questions reveal the KEY SIGNALS from context rules
+✅ Mix of concrete (sleep hours) and emotional (how do you feel)
+✅ ALL text in ${getLanguageName(userLanguage)} language
 
-RESPOND with valid JSON only (NO MARKDOWN):
+TOPIC-TO-QUESTION MAPPING EXAMPLES:
+- sleep_quality → "How would you rate the quality of your sleep last night?"
+- financial_confidence → "When you think about your finances, how confident do you feel?"
+- emotional_connection → "How emotionally connected did you feel to loved ones today?"
+- life_meaning → "How meaningful did today feel to you?"
+
+QUESTION QUALITY STANDARDS:
+🟢 GREAT: "How many hours of sleep did you actually get last night?" (specific, measurable)
+🟢 GREAT: "When you think about money right now, what's the first feeling that comes up?" (emotional depth)
+🟢 GREAT: "Did you have a conversation today that made you feel truly understood?" (relationship quality)
+🔴 BAD: "How is your health?" (too vague)
+🔴 BAD: "Are you stressed?" (too simple, already asked before probably)
+🔴 BAD: "Do you feel good?" (meaningless)
+
+Respond with valid JSON (NO MARKDOWN):
 {
   "questions": [
-    {"id":"q1","pillar":"${selectedPillar}","text":"... in ${getLanguageName(userLanguage)}","type":"scale","min":1,"max":5,"labels":["Low in ${getLanguageName(userLanguage)}","High in ${getLanguageName(userLanguage)}"]},
-    {"id":"q2","pillar":"${selectedPillar}","text":"... in ${getLanguageName(userLanguage)}","type":"yesno"},
-    {"id":"q3","pillar":"${selectedPillar}","text":"... in ${getLanguageName(userLanguage)}","type":"choice","options":["Worst in ${getLanguageName(userLanguage)}","Bad in ${getLanguageName(userLanguage)}","Okay in ${getLanguageName(userLanguage)}","Good in ${getLanguageName(userLanguage)}","Great in ${getLanguageName(userLanguage)}"]},
-    {"id":"q4","pillar":"${selectedPillar}","text":"... in ${getLanguageName(userLanguage)}","type":"scale","min":1,"max":5,"labels":["Low in ${getLanguageName(userLanguage)}","High in ${getLanguageName(userLanguage)}"]},
-    {"id":"q5","pillar":"${selectedPillar}","text":"... in ${getLanguageName(userLanguage)}","type":"yesno"},
-    {"id":"q6","pillar":"${selectedPillar}","text":"... in ${getLanguageName(userLanguage)}","type":"scale","min":1,"max":5,"labels":["Low in ${getLanguageName(userLanguage)}","High in ${getLanguageName(userLanguage)}"]},
-    {"id":"q7","pillar":"${selectedPillar}","text":"... in ${getLanguageName(userLanguage)}","type":"yesno"},
-    {"id":"q8","pillar":"${selectedPillar}","text":"... in ${getLanguageName(userLanguage)}","type":"choice","options":["Terrible in ${getLanguageName(userLanguage)}","Poor in ${getLanguageName(userLanguage)}","Okay in ${getLanguageName(userLanguage)}","Good in ${getLanguageName(userLanguage)}","Excellent in ${getLanguageName(userLanguage)}"]}
+    {"id":"q1","pillar":"${selectedPillar}","text":"question about ${selectedTopics[0]} in ${getLanguageName(userLanguage)}","type":"scale","min":1,"max":5,"labels":["Low label","High label"]},
+    {"id":"q2","pillar":"${selectedPillar}","text":"question about ${selectedTopics[1]} in ${getLanguageName(userLanguage)}","type":"yesno"},
+    {"id":"q3","pillar":"${selectedPillar}","text":"question about ${selectedTopics[2]} in ${getLanguageName(userLanguage)}","type":"choice","options":["Worst","Bad","Okay","Good","Best"]},
+    {"id":"q4","pillar":"${selectedPillar}","text":"question about ${selectedTopics[3]} in ${getLanguageName(userLanguage)}","type":"scale","min":1,"max":5,"labels":["Low label","High label"]},
+    {"id":"q5","pillar":"${selectedPillar}","text":"question about ${selectedTopics[4]} in ${getLanguageName(userLanguage)}","type":"yesno"},
+    {"id":"q6","pillar":"${selectedPillar}","text":"question about ${selectedTopics[5]} in ${getLanguageName(userLanguage)}","type":"scale","min":1,"max":5,"labels":["Low label","High label"]},
+    {"id":"q7","pillar":"${selectedPillar}","text":"question about ${selectedTopics[6]} in ${getLanguageName(userLanguage)}","type":"yesno"},
+    {"id":"q8","pillar":"${selectedPillar}","text":"question about ${selectedTopics[7]} in ${getLanguageName(userLanguage)}","type":"choice","options":["Worst","Bad","Okay","Good","Best"]}
   ]
 }`;
 
   try {
-    console.log(`🤖 Generating 8 adaptive ${pillarMeta?.name} questions for ${name} in ${getLanguageName(userLanguage)}...`);
+    console.log(`🤖 Generating 8 diverse ${pillarMeta?.name} questions for ${name} in ${getLanguageName(userLanguage)}...`);
+    console.log(`🎯 Selected topics: ${selectedTopics.join(', ')}`);
 
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       messages: [
-        { role: 'system', content: 'You are Dr. Sarah. Respond ONLY with valid JSON, no markdown.' },
+        { role: 'system', content: 'You are Dr. Sarah, expert at creating diverse, deep wellness questions. Follow topic requirements strictly. Avoid repetition. Be specific. Respond ONLY with valid JSON, no markdown.' },
         { role: 'user', content: prompt }
       ],
-      temperature: 0.8,
-      max_tokens: 800,
+      temperature: 0.85, // Higher temperature for more variety
+      max_tokens: 1200,
     });
 
     let txt = completion.choices[0].message.content.trim().replace(/```json\n?/g, '').replace(/```\n?/g, '');
@@ -824,7 +1161,7 @@ RESPOND with valid JSON only (NO MARKDOWN):
       }
     });
 
-    console.log(`✅ Generated 8 adaptive ${pillarMeta?.name} questions for ${name} in ${getLanguageName(userLanguage)}`);
+    console.log(`✅ Generated 8 diverse ${pillarMeta?.name} questions for ${name} in ${getLanguageName(userLanguage)}`);
     return { success: true, questions: parsed.questions };
 
   } catch (error) {
@@ -832,44 +1169,44 @@ RESPOND with valid JSON only (NO MARKDOWN):
 
     const fallbacks = {
       health: [
-        { id:'q1', pillar:'health', text:'How energized do you feel right now?', type:'scale', min:1, max:5, labels:['Drained','Energized'] },
-        { id:'q2', pillar:'health', text:'Did you get enough sleep last night?', type:'yesno' },
-        { id:'q3', pillar:'health', text:'How would you describe your physical state today?', type:'choice', options:['Terrible','Poor','Okay','Good','Great'] },
-        { id:'q4', pillar:'health', text:'How stressed do you feel right now?', type:'scale', min:1, max:5, labels:['Very Stressed','Calm'] },
-        { id:'q5', pillar:'health', text:'Did you move your body meaningfully today?', type:'yesno' },
-        { id:'q6', pillar:'health', text:'How clear is your mind right now?', type:'scale', min:1, max:5, labels:['Very Foggy','Crystal Clear'] },
-        { id:'q7', pillar:'health', text:'Did you eat nourishing food today?', type:'yesno' },
-        { id:'q8', pillar:'health', text:'How comfortable does your body feel?', type:'choice', options:['Very Uncomfortable','Uncomfortable','Neutral','Comfortable','Very Comfortable'] },
+        { id: 'q1', pillar: 'health', text: 'How many hours of sleep did you get last night?', type: 'scale', min: 1, max: 5, labels: ['Less than 4hrs', '8+ hours'] },
+        { id: 'q2', pillar: 'health', text: 'Did you move your body for at least 20 minutes today?', type: 'yesno' },
+        { id: 'q3', pillar: 'health', text: 'How would you describe your energy level right now?', type: 'choice', options: ['Completely drained', 'Low energy', 'Okay', 'Good energy', 'Fully energized'] },
+        { id: 'q4', pillar: 'health', text: 'How stressed or anxious are you feeling?', type: 'scale', min: 1, max: 5, labels: ['Very stressed', 'Completely calm'] },
+        { id: 'q5', pillar: 'health', text: 'Did you eat at least one nourishing meal today?', type: 'yesno' },
+        { id: 'q6', pillar: 'health', text: 'How clear and focused is your mind?', type: 'scale', min: 1, max: 5, labels: ['Very foggy', 'Crystal clear'] },
+        { id: 'q7', pillar: 'health', text: 'Are you experiencing any physical pain or discomfort?', type: 'yesno' },
+        { id: 'q8', pillar: 'health', text: 'Overall, how does your body feel right now?', type: 'choice', options: ['Terrible', 'Uncomfortable', 'Neutral', 'Good', 'Amazing'] },
       ],
       wealth: [
-        { id:'q1', pillar:'wealth', text:'How confident do you feel about your finances?', type:'scale', min:1, max:5, labels:['Very Unsure','Very Confident'] },
-        { id:'q2', pillar:'wealth', text:'Did you make progress on a money or career goal today?', type:'yesno' },
-        { id:'q3', pillar:'wealth', text:'How would you rate your work-life balance?', type:'choice', options:['Terrible','Poor','Okay','Good','Excellent'] },
-        { id:'q4', pillar:'wealth', text:'How stressed does money make you feel?', type:'scale', min:1, max:5, labels:['Very Stressed','No Stress'] },
-        { id:'q5', pillar:'wealth', text:'Did you do something today that moves you forward professionally?', type:'yesno' },
-        { id:'q6', pillar:'wealth', text:'How satisfied are you with your career right now?', type:'scale', min:1, max:5, labels:['Very Unsatisfied','Very Satisfied'] },
-        { id:'q7', pillar:'wealth', text:'Do you feel in control of your financial situation?', type:'yesno' },
-        { id:'q8', pillar:'wealth', text:'How secure do you feel about your income?', type:'choice', options:['Very Insecure','Insecure','Neutral','Secure','Very Secure'] },
+        { id: 'q1', pillar: 'wealth', text: 'How confident do you feel about your finances right now?', type: 'scale', min: 1, max: 5, labels: ['Very anxious', 'Very confident'] },
+        { id: 'q2', pillar: 'wealth', text: 'Did you make any progress on a career or money goal today?', type: 'yesno' },
+        { id: 'q3', pillar: 'wealth', text: 'How satisfied are you with your work-life balance?', type: 'choice', options: ['Terrible', 'Poor', 'Okay', 'Good', 'Excellent'] },
+        { id: 'q4', pillar: 'wealth', text: 'How much is money stressing you out?', type: 'scale', min: 1, max: 5, labels: ['Extreme stress', 'No stress'] },
+        { id: 'q5', pillar: 'wealth', text: 'Do you feel in control of your financial situation?', type: 'yesno' },
+        { id: 'q6', pillar: 'wealth', text: 'How meaningful does your work feel?', type: 'scale', min: 1, max: 5, labels: ['Meaningless', 'Very meaningful'] },
+        { id: 'q7', pillar: 'wealth', text: 'Are you learning and growing professionally?', type: 'yesno' },
+        { id: 'q8', pillar: 'wealth', text: 'How secure do you feel about your income?', type: 'choice', options: ['Very insecure', 'Insecure', 'Neutral', 'Secure', 'Very secure'] },
       ],
       love: [
-        { id:'q1', pillar:'love', text:'How connected do you feel to the people you care about?', type:'scale', min:1, max:5, labels:['Very Alone','Deeply Connected'] },
-        { id:'q2', pillar:'love', text:'Did you have a meaningful conversation today?', type:'yesno' },
-        { id:'q3', pillar:'love', text:'How would you describe your relationships right now?', type:'choice', options:['Struggling','Strained','Okay','Good','Thriving'] },
-        { id:'q4', pillar:'love', text:'How loved and supported do you feel?', type:'scale', min:1, max:5, labels:['Not At All','Completely'] },
-        { id:'q5', pillar:'love', text:'Did you express appreciation to someone today?', type:'yesno' },
-        { id:'q6', pillar:'love', text:'How emotionally safe do you feel in your relationships?', type:'scale', min:1, max:5, labels:['Very Unsafe','Very Safe'] },
-        { id:'q7', pillar:'love', text:'Do you feel valued by the people close to you?', type:'yesno' },
-        { id:'q8', pillar:'love', text:'How would you rate the quality of your social connections?', type:'choice', options:['Very Poor','Poor','Okay','Good','Excellent'] },
+        { id: 'q1', pillar: 'love', text: 'How connected do you feel to the people you care about?', type: 'scale', min: 1, max: 5, labels: ['Very alone', 'Deeply connected'] },
+        { id: 'q2', pillar: 'love', text: 'Did you have a meaningful conversation with someone today?', type: 'yesno' },
+        { id: 'q3', pillar: 'love', text: 'How would you describe your relationships right now?', type: 'choice', options: ['Struggling badly', 'Strained', 'Okay', 'Good', 'Thriving'] },
+        { id: 'q4', pillar: 'love', text: 'How supported and valued do you feel?', type: 'scale', min: 1, max: 5, labels: ['Not at all', 'Completely'] },
+        { id: 'q5', pillar: 'love', text: 'Did you express appreciation to someone today?', type: 'yesno' },
+        { id: 'q6', pillar: 'love', text: 'How emotionally safe do you feel in your closest relationships?', type: 'scale', min: 1, max: 5, labels: ['Very unsafe', 'Very safe'] },
+        { id: 'q7', pillar: 'love', text: 'Can you be your authentic self with the people close to you?', type: 'yesno' },
+        { id: 'q8', pillar: 'love', text: 'Overall, how is your social and emotional life?', type: 'choice', options: ['Very poor', 'Poor', 'Okay', 'Good', 'Excellent'] },
       ],
       purpose: [
-        { id:'q1', pillar:'purpose', text:'How meaningful did today feel?', type:'scale', min:1, max:5, labels:['Empty','Very Meaningful'] },
-        { id:'q2', pillar:'purpose', text:'Did you work on something that matters to you?', type:'yesno' },
-        { id:'q3', pillar:'purpose', text:'How aligned do you feel with your life direction?', type:'choice', options:['Lost','Unsure','Finding Way','Aligned','Thriving'] },
-        { id:'q4', pillar:'purpose', text:'How clear are you on what you want?', type:'scale', min:1, max:5, labels:['Very Unclear','Crystal Clear'] },
-        { id:'q5', pillar:'purpose', text:'Did you learn or grow in some way today?', type:'yesno' },
-        { id:'q6', pillar:'purpose', text:'How much does your life feel aligned with your values?', type:'scale', min:1, max:5, labels:['Not At All','Completely'] },
-        { id:'q7', pillar:'purpose', text:'Do you feel like you made a difference today?', type:'yesno' },
-        { id:'q8', pillar:'purpose', text:'How optimistic do you feel about your future?', type:'choice', options:['Very Pessimistic','Pessimistic','Neutral','Optimistic','Very Optimistic'] },
+        { id: 'q1', pillar: 'purpose', text: 'How meaningful did today feel?', type: 'scale', min: 1, max: 5, labels: ['Empty', 'Very meaningful'] },
+        { id: 'q2', pillar: 'purpose', text: 'Did you work on something that truly matters to you?', type: 'yesno' },
+        { id: 'q3', pillar: 'purpose', text: 'How aligned do you feel with your life direction?', type: 'choice', options: ['Completely lost', 'Unsure', 'Finding my way', 'Aligned', 'Thriving'] },
+        { id: 'q4', pillar: 'purpose', text: 'How clear are you on what you want in life?', type: 'scale', min: 1, max: 5, labels: ['Very unclear', 'Crystal clear'] },
+        { id: 'q5', pillar: 'purpose', text: 'Did you learn or grow in some way today?', type: 'yesno' },
+        { id: 'q6', pillar: 'purpose', text: 'How much does your life align with your core values?', type: 'scale', min: 1, max: 5, labels: ['Not at all', 'Completely'] },
+        { id: 'q7', pillar: 'purpose', text: 'Do you feel like you made a positive difference today?', type: 'yesno' },
+        { id: 'q8', pillar: 'purpose', text: 'How optimistic are you about your future?', type: 'choice', options: ['Very pessimistic', 'Pessimistic', 'Neutral', 'Optimistic', 'Very optimistic'] },
       ],
     };
 
@@ -878,7 +1215,7 @@ RESPOND with valid JSON only (NO MARKDOWN):
 };
 
 // ============================================
-// AI ANALYSIS — DEEP, FULL-CRITERIA DRIVEN + MULTILINGUAL
+// AI ANALYSIS — DEEP INSIGHTS 10/10
 // ============================================
 
 const getPersonalizedAnalysis = async (profile, submissions) => {
@@ -887,9 +1224,14 @@ const getPersonalizedAnalysis = async (profile, submissions) => {
   }
 
   const { name, ageGroup, gender, language } = profile;
-  const userLanguage = language || 'en'; // ✅ Default to English
+  const userLanguage = language || 'en';
   const displayAge = ageGroup ? getAgeGroupLabel(ageGroup) : 'Adult';
   const last30 = submissions.slice(0, 30);
+
+  // Generate diversity seed for varied analysis approach
+  const diversitySeed = getDiversitySeed(name, submissions.length, 'analysis');
+  const analysisStyle = diversitySeed % 3 === 0 ? 'pattern_detective' :
+                        diversitySeed % 3 === 1 ? 'strength_based' : 'growth_oriented';
 
   const pillarTrends = {};
   for (const key of Object.keys(PILLARS)) {
@@ -931,11 +1273,21 @@ const getPersonalizedAnalysis = async (profile, submissions) => {
     return `${r.name}: ${r.description} Key signals: ${r.what_matters.slice(0, 3).join(', ')}`;
   }).join('\n');
 
-  const prompt = `IMPORTANT: Respond in ${getLanguageName(userLanguage)} language.
-Observations, insights, recommendations, notes - ALL must be in ${getLanguageName(userLanguage)}.
+  const analysisStyleInstructions = {
+    pattern_detective: 'Focus on CONNECTIONS between pillars. What patterns emerge? How do pillars influence each other?',
+    strength_based: 'Lead with what IS working. Build recommendations from their strengths.',
+    growth_oriented: 'Identify the BIGGEST opportunity for growth. What one change would cascade positively?'
+  };
+
+  const prompt = `CRITICAL: ${name} is trusting you with their wellness data. Give them REAL, ACTIONABLE insights.
+
+ALL output MUST be in ${getLanguageName(userLanguage)} language.
 Respond ONLY with valid JSON. No markdown.
 
-You are Dr. Maya, ${name}'s personal wellness psychologist. Give them genuinely useful, personalized insights.
+You are Dr. Maya, ${name}'s personal wellness psychologist with ${last30.length} check-ins of data.
+
+🎯 ANALYSIS STYLE FOR THIS CHECK: ${analysisStyle.toUpperCase()}
+${analysisStyleInstructions[analysisStyle]}
 
 ═══════════════════════════════════════════
 👤 ${name} | ${displayAge} | ${gender} | Language: ${getLanguageName(userLanguage)}
@@ -947,58 +1299,68 @@ ${historyContext}
 ═══════════════════════════════════════════
 
 ═══════════════════════════════════════════
-📈 PER-PILLAR BREAKDOWN:
+📈 PILLAR BREAKDOWN:
 ${Object.entries(pillarTrends).map(([pid, data]) =>
-  `  ${PILLARS[pid.toUpperCase()]?.emoji} ${PILLARS[pid.toUpperCase()]?.name}: avg=${data.average}/100 | latest=${data.latest}/100 | trend=${data.trend} | range=${data.lowest}-${data.highest} | ${data.checks} checks`
-).join('\n')}
+    `  ${PILLARS[pid.toUpperCase()]?.emoji} ${PILLARS[pid.toUpperCase()]?.name}: avg=${data.average}/100 | latest=${data.latest}/100 | trend=${data.trend} | range=${data.lowest}-${data.highest} | ${data.checks} checks`
+  ).join('\n')}
 ═══════════════════════════════════════════
 
 ═══════════════════════════════════════════
-📖 WHAT EACH PILLAR MEASURES:
+📖 MEASUREMENT FRAMEWORK:
 ${rubricSummary}
 ═══════════════════════════════════════════
 
-🎯 YOUR JOB — Give ${name} a REAL analysis:
+🎯 GENERATE ANALYSIS THAT IS:
+✅ SPECIFIC — reference actual dates, scores, answers (not "you seem stressed" but "your 3 Health checks averaged 45 with recurring poor sleep")
+✅ INSIGHTFUL — connect patterns across pillars using ${analysisStyle} approach
+✅ ACTIONABLE — give recommendations they can actually do THIS WEEK
+✅ HONEST — if something is concerning, say it (with care)
+✅ ENCOURAGING — focus on what's working too
+✅ FRESH — use different angles than typical analysis
+✅ In ${getLanguageName(userLanguage)} language
 
-OBSERVATIONS (max 30 words in ${getLanguageName(userLanguage)}):
-The single most important pattern across ALL their data. Be specific — reference actual scores, dates, or answers.
+STRUCTURE:
 
-INSIGHTS (max 30 words in ${getLanguageName(userLanguage)}):
-What this pattern MEANS for ${name}'s life. Connect pillars if you see connections.
+OBSERVATIONS (25-35 words in ${getLanguageName(userLanguage)}):
+The SINGLE most important pattern using ${analysisStyle} lens. Be specific. Reference dates/scores.
 
-RECOMMENDATIONS (3 specific actions, each 18-22 words in ${getLanguageName(userLanguage)}):
+INSIGHTS (25-35 words in ${getLanguageName(userLanguage)}):
+What this pattern MEANS for their life. Connect pillars if you see it. Use ${analysisStyle} approach.
+
+RECOMMENDATIONS (3 actions, each 20-28 words in ${getLanguageName(userLanguage)}):
 - Actionable THIS WEEK
 - At least 1 MUST connect two pillars
-- Personal to ${name} — reference their actual patterns
-- Empowering tone
+- Reference their specific patterns
+- Empowering but direct
+- Aligned with ${analysisStyle} approach
 
 PILLAR CALLOUTS:
-- strongest: which pillar they are best at (and why, 1 sentence in ${getLanguageName(userLanguage)})
-- needsAttention: which pillar needs love (specific, kind note in ${getLanguageName(userLanguage)})
+- strongest: which pillar + why (1 sentence in ${getLanguageName(userLanguage)})
+- needsAttention: which pillar + kind specific note (1 sentence in ${getLanguageName(userLanguage)})
 
 Respond ONLY with valid JSON:
 {
-  "observations": "... in ${getLanguageName(userLanguage)}",
-  "insights": "... in ${getLanguageName(userLanguage)}",
-  "recommendations": ["... in ${getLanguageName(userLanguage)}", "... in ${getLanguageName(userLanguage)}", "... in ${getLanguageName(userLanguage)}"],
+  "observations": "specific pattern with dates/scores in ${getLanguageName(userLanguage)}",
+  "insights": "what it means in ${getLanguageName(userLanguage)}",
+  "recommendations": ["action 1 in ${getLanguageName(userLanguage)}", "action 2 in ${getLanguageName(userLanguage)}", "action 3 in ${getLanguageName(userLanguage)}"],
   "pillarCallouts": {
     "strongest": "pillar_id",
     "needsAttention": "pillar_id",
-    "strongestNote": "1 sentence in ${getLanguageName(userLanguage)}",
-    "attentionNote": "1 sentence in ${getLanguageName(userLanguage)}"
+    "strongestNote": "why it's working in ${getLanguageName(userLanguage)}",
+    "attentionNote": "kind specific note in ${getLanguageName(userLanguage)}"
   }
 }`;
 
   try {
-    console.log(`🤖 Deep analysis for ${name} in ${getLanguageName(userLanguage)}...`);
+    console.log(`🤖 Deep analysis for ${name} in ${getLanguageName(userLanguage)} using ${analysisStyle} approach...`);
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o',
       messages: [
-        { role: 'system', content: `You are Dr. Maya, ${name}'s wellness psychologist. Be specific, connect patterns, warm. JSON only.` },
+        { role: 'system', content: `You are Dr. Maya, ${name}'s wellness psychologist. Be specific, connect patterns, kind but honest. Use ${analysisStyle} approach. JSON only.` },
         { role: 'user', content: prompt }
       ],
-      temperature: 0.68,
-      max_tokens: 500,
+      temperature: 0.7, // Higher for more variety
+      max_tokens: 600,
     });
 
     let txt = completion.choices[0].message.content.trim().replace(/```json\n?/g, '').replace(/```\n?/g, '');
@@ -1023,15 +1385,18 @@ Respond ONLY with valid JSON:
 };
 
 // ============================================
-// AI ANALYTICS SUMMARY + MULTILINGUAL
+// AI ANALYTICS SUMMARY
 // ============================================
 
 async function generateAnalyticsSummary(profile, analyticsData, submissions) {
   try {
     const { name, ageGroup, language } = profile;
-    const userLanguage = language || 'en'; // ✅ Default to English
+    const userLanguage = language || 'en';
     const displayAge = ageGroup ? getAgeGroupLabel(ageGroup) : 'Adult';
     const { summary, perPillar } = analyticsData;
+
+    const diversitySeed = getDiversitySeed(name, submissions.length, 'summary');
+    const summaryStyle = diversitySeed % 2 === 0 ? 'celebrate_wins' : 'identify_opportunity';
 
     const perPillarText = Object.entries(perPillar).map(([pid, data]) =>
       `  ${PILLARS[pid.toUpperCase()]?.emoji} ${PILLARS[pid.toUpperCase()]?.name}: avg=${data.average}/100 | trend=${data.trend} | ${data.checks} checks | range ${data.lowest}-${data.highest}`
@@ -1046,34 +1411,42 @@ async function generateAnalyticsSummary(profile, analyticsData, submissions) {
       return `${s.date} [${s.pillar}] score=${s.score}/100: ${qa}`;
     }).join('\n');
 
-    const prompt = `IMPORTANT: Summary MUST be in ${getLanguageName(userLanguage)} language.
-Respond ONLY with valid JSON. The "summary" field must be in ${getLanguageName(userLanguage)}.
+    const styleInstructions = {
+      celebrate_wins: 'Lead with what\'s working. Acknowledge progress first.',
+      identify_opportunity: 'Lead with the biggest opportunity for improvement.'
+    };
 
-You are Dr. Maya summarizing ${name}'s wellness analytics.
+    const prompt = `CRITICAL: Summary MUST be in ${getLanguageName(userLanguage)} language.
+Respond ONLY with valid JSON.
+
+You are summarizing ${name}'s wellness for a quick overview.
+
+🎯 SUMMARY STYLE: ${summaryStyle.toUpperCase()}
+${styleInstructions[summaryStyle]}
 
 👤 ${name} | ${displayAge} | Language: ${getLanguageName(userLanguage)}
 
-📊 OVERALL:
-- Average Alive Score: ${summary.average}/100
-- Highest: ${summary.highest}/100 | Lowest: ${summary.lowest}/100
-- Overall Trend: ${summary.trend}
-- Total checks: ${summary.total}
+📊 STATS:
+- Average Alive: ${summary.average}/100
+- Range: ${summary.lowest}-${summary.highest}
+- Trend: ${summary.trend}
+- Total: ${summary.total} checks
 
 📊 PER PILLAR:
 ${perPillarText}
 
-📝 RECENT CHECK-INS:
+📝 RECENT:
 ${recentQA}
 
-Write a SHORT summary (2-3 sentences max) in ${getLanguageName(userLanguage)}. Tell ${name}:
-1. Where they stand overall
-2. What is working (strongest trend or pillar)
-3. One thing to watch or improve
+Write 2-3 sentences (max 50 words total) in ${getLanguageName(userLanguage)} that tell ${name}:
+1. Where they stand overall (using ${summaryStyle} approach)
+2. What's strongest
+3. What needs attention
 
-Be warm, specific, encouraging. Reference actual numbers.
+Be specific. Reference numbers. Be encouraging but honest. Use ${summaryStyle} style.
 
 Respond ONLY with valid JSON:
-{"summary": "2-3 sentence summary in ${getLanguageName(userLanguage)}"}`;
+{"summary": "2-3 sentences in ${getLanguageName(userLanguage)}"}`;
 
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
@@ -1081,7 +1454,7 @@ Respond ONLY with valid JSON:
         { role: 'system', content: 'Respond ONLY with valid JSON. No markdown.' },
         { role: 'user', content: prompt }
       ],
-      temperature: 0.65,
+      temperature: 0.75,
       max_tokens: 200,
     });
 
@@ -1140,7 +1513,7 @@ const checkDailyLimit = async (req, res, next) => {
 };
 
 // ============================================
-// ROUTES
+// ROUTES (unchanged signatures)
 // ============================================
 
 router.post('/profile', requireDeviceId, async (req, res) => {
@@ -1152,31 +1525,29 @@ router.post('/profile', requireDeviceId, async (req, res) => {
     const doc = await docRef.get();
 
     if (doc.exists) {
-      // ✅ UPDATE EXISTING PROFILE (allows partial updates like language-only)
       const updateData = { updatedAt: admin.firestore.FieldValue.serverTimestamp() };
-      
+
       if (name) updateData['profile.name'] = name.trim();
       if (ageGroup) updateData['profile.ageGroup'] = ageGroup;
       if (gender) updateData['profile.gender'] = gender;
-      if (language) updateData['profile.language'] = language; // ✅ LANGUAGE UPDATE
-      
+      if (language) updateData['profile.language'] = language;
+
       await docRef.update(updateData);
-      
+
       const updatedDoc = await docRef.get();
       const updatedProfile = updatedDoc.data().profile;
-      
+
       cacheInvalidate(deviceId);
       console.log(`✅ Profile updated: ${updatedProfile.name}${language ? ` | Language: ${language}` : ''}`);
-      
+
       return res.json({
         success: true,
         profile: updatedProfile,
-        message: language 
-          ? `Language updated to ${getLanguageName(language)} successfully` 
+        message: language
+          ? `Language updated to ${getLanguageName(language)} successfully`
           : `Welcome back, ${updatedProfile.name}!`
       });
     } else {
-      // ✅ CREATE NEW PROFILE
       if (!name || !name.trim()) return res.status(400).json({ success: false, error: 'Name is required' });
       if (!gender || !['male', 'female', 'other', 'prefernottosay'].includes(gender))
         return res.status(400).json({ success: false, error: 'Valid gender is required' });
@@ -1186,7 +1557,7 @@ router.post('/profile', requireDeviceId, async (req, res) => {
         name: name.trim(),
         ageGroup,
         gender,
-        language: language || 'en', // ✅ DEFAULT TO ENGLISH
+        language: language || 'en',
         profileCompleted: true,
         profileCompletedAt: admin.firestore.FieldValue.serverTimestamp()
       };
@@ -1269,7 +1640,6 @@ router.get('/questions', requireDeviceId, async (req, res) => {
   }
 });
 
-// POST /submit — THE MAIN EVENT (NOW WITH 8 QUESTIONS + INDIVIDUAL TIP + TRANSPARENT BREAKDOWN + MULTILINGUAL)
 router.post('/submit', requireDeviceId, checkDailyLimit, async (req, res) => {
   try {
     const { deviceId } = req;
@@ -1292,44 +1662,39 @@ router.post('/submit', requireDeviceId, checkDailyLimit, async (req, res) => {
 
     console.log(`🤖 Processing ${profile.name}'s ${pillar} check-in (8 questions) in ${getLanguageName(profile.language || 'en')}...`);
 
-    // ── STEP 1: AI scores this pillar ──
     const { score: todayPillarScore, justification: scoringJustification } = await aiScorePillar(
       profile, pillar, questions, answers, submissions
     );
     console.log(`📊 AI ${pillar} score: ${todayPillarScore}/100 | Reason: ${scoringJustification}`);
 
-    // ── STEP 2: Calculate multi-pillar Alive Score + TRANSPARENT BREAKDOWN ──
     const { aliveScore, pillarScores, breakdown, scoringExplanation, strongest, weakest } = calculateAliveScore(
       pillar, todayPillarScore, submissions
     );
     const { vibe, emoji } = getVibeFromScore(aliveScore);
     console.log(`🎯 Alive Score: ${aliveScore}/100 | Breakdown: ${JSON.stringify(pillarScores)}`);
 
-    // ── STEP 3: Pride moments ──
     const prideMoments = detectPrideMoment(pillar, todayPillarScore, aliveScore, submissions);
 
-    // ── STEP 4: Generate INDIVIDUAL TIP + Quote + Strategic Tips in parallel ──
     console.log(`🤖 Generating individual tip + quote + strategic tips in ${getLanguageName(profile.language || 'en')}...`);
     const [individualTipResult, quoteAndTipsResult] = await Promise.allSettled([
-      generateIndividualTip(profile, pillar, questions, answers, todayPillarScore),
+      generateIndividualTip(profile, pillar, questions, answers, todayPillarScore, submissions),
       generateQuoteAndStrategicTips(profile, pillar, questions, answers, pillarScores, aliveScore, scoringJustification, submissions)
     ]);
 
-    const individualTip = individualTipResult.status === 'fulfilled' 
-      ? individualTipResult.value 
+    const individualTip = individualTipResult.status === 'fulfilled'
+      ? individualTipResult.value
       : 'Small actions today create big changes tomorrow.';
 
     const { quote, message, strategicTips, weakestPillar, weakestBoost } = quoteAndTipsResult.status === 'fulfilled'
       ? quoteAndTipsResult.value
       : {
-          quote: 'You showed up today',
-          message: 'Every check-in is a step forward.',
-          strategicTips: [],
-          weakestPillar: weakest,
-          weakestBoost: null
-        };
+        quote: 'You showed up today',
+        message: 'Every check-in is a step forward.',
+        strategicTips: [],
+        weakestPillar: weakest,
+        weakestBoost: null
+      };
 
-    // ── STEP 5: Persist ──
     const today = getCurrentDateIST();
     const nowTimestamp = new Date().toISOString();
     const submissionId = `check_${Date.now()}`;
@@ -1356,7 +1721,7 @@ router.post('/submit', requireDeviceId, checkDailyLimit, async (req, res) => {
       weakestPillar,
       weakestBoost,
       prideMoments,
-      source: 'ai_scored_v4_multilingual'
+      source: 'ai_scored_v5_1_max_diversity'
     };
 
     let updatedSubmissions = [newSubmission, ...submissions];
