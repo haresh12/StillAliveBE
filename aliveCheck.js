@@ -169,7 +169,7 @@ const QUESTION_TOPICS = {
 // ============================================
 
 const QUOTE_STYLES = [
-  'raw_honest', 'poetic_short', 'confident_flex', 'vulnerable_real', 
+  'raw_honest', 'poetic_short', 'confident_flex', 'vulnerable_real',
   'growth_moment', 'self_aware', 'motivational_edge', 'philosophical_simple',
   'relatable_struggle', 'victory_lap', 'boundary_setting', 'self_love'
 ];
@@ -322,27 +322,7 @@ const SCORING_RUBRICS = {
   }
 };
 
-// ============================================
-// IN-MEMORY CACHE (TTL-based, per deviceId)
-// ============================================
 
-const cache = new Map();
-const CACHE_TTL = 5 * 60 * 1000; // 5 min
-
-function cacheGet(key) {
-  const entry = cache.get(key);
-  if (!entry) return null;
-  if (Date.now() - entry.ts > CACHE_TTL) { cache.delete(key); return null; }
-  return entry.data;
-}
-function cacheSet(key, data) {
-  cache.set(key, { data, ts: Date.now() });
-}
-function cacheInvalidate(deviceId) {
-  for (const key of cache.keys()) {
-    if (key.startsWith(deviceId)) cache.delete(key);
-  }
-}
 
 // ============================================
 // HELPERS
@@ -408,8 +388,8 @@ async function aiScorePillar(profile, pillar, questions, answers, submissions) {
 
   // Generate diversity seed for varied scoring approaches
   const diversitySeed = getDiversitySeed(profile.name, submissions.length, pillar);
-  const scoringStyle = diversitySeed % 3 === 0 ? 'analytical_precise' : 
-                       diversitySeed % 3 === 1 ? 'contextual_nuanced' : 'pattern_based';
+  const scoringStyle = diversitySeed % 3 === 0 ? 'analytical_precise' :
+    diversitySeed % 3 === 1 ? 'contextual_nuanced' : 'pattern_based';
 
   const qaFormatted = questions.map((q, i) => {
     const raw = answers[i]?.answer !== undefined ? answers[i].answer : answers[i];
@@ -690,12 +670,12 @@ async function generateIndividualTip(profile, pillar, questions, answers, todayP
   const { name, language, ageGroup } = profile;
   const userLanguage = language || 'en';
   const pillarMeta = PILLARS[pillar.toUpperCase()];
-  
+
   // Generate diversity seed for varied tip approaches
   const diversitySeed = getDiversitySeed(name, submissions.length, pillar);
-  const tipStyle = diversitySeed % 4 === 0 ? 'immediate_action' : 
-                   diversitySeed % 4 === 1 ? 'reframe_perspective' :
-                   diversitySeed % 4 === 2 ? 'habit_building' : 'self_compassion';
+  const tipStyle = diversitySeed % 4 === 0 ? 'immediate_action' :
+    diversitySeed % 4 === 1 ? 'reframe_perspective' :
+      diversitySeed % 4 === 2 ? 'habit_building' : 'self_compassion';
 
   const qaContext = questions.map((q, i) => {
     const raw = answers[i]?.answer !== undefined ? answers[i].answer : answers[i];
@@ -1031,11 +1011,11 @@ const generatePersonalizedQuestions = async (profile, selectedPillar, previousSu
   // Select 8 diverse topics for this check
   const diversitySeed = getDiversitySeed(name, previousSubmissions.length, selectedPillar);
   const shuffledTopics = [...topicsBank].sort(() => 0.5 - Math.random());
-  
+
   // Pick topics that haven't been used recently
   const availableTopics = shuffledTopics.filter(t => !previousTopicsUsed.includes(t));
   const selectedTopics = availableTopics.slice(0, 8);
-  
+
   // If we don't have enough unused topics, fill with least recently used
   if (selectedTopics.length < 8) {
     const remaining = shuffledTopics.filter(t => !selectedTopics.includes(t));
@@ -1231,7 +1211,7 @@ const getPersonalizedAnalysis = async (profile, submissions) => {
   // Generate diversity seed for varied analysis approach
   const diversitySeed = getDiversitySeed(name, submissions.length, 'analysis');
   const analysisStyle = diversitySeed % 3 === 0 ? 'pattern_detective' :
-                        diversitySeed % 3 === 1 ? 'strength_based' : 'growth_oriented';
+    diversitySeed % 3 === 1 ? 'strength_based' : 'growth_oriented';
 
   const pillarTrends = {};
   for (const key of Object.keys(PILLARS)) {
@@ -1537,7 +1517,7 @@ router.post('/profile', requireDeviceId, async (req, res) => {
       const updatedDoc = await docRef.get();
       const updatedProfile = updatedDoc.data().profile;
 
-      cacheInvalidate(deviceId);
+      // ❌ REMOVE: cacheInvalidate(deviceId);
       console.log(`✅ Profile updated: ${updatedProfile.name}${language ? ` | Language: ${language}` : ''}`);
 
       return res.json({
@@ -1570,13 +1550,25 @@ router.post('/profile', requireDeviceId, async (req, res) => {
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       });
 
-      cacheInvalidate(deviceId);
-      console.log(`✅ Profile created: ${profile.name} | Language: ${profile.language}`);
+      // ❌ REMOVE: cacheInvalidate(deviceId);
+
+      // ✅ ADD: Wait for Firestore write to complete
+      await new Promise(resolve => setTimeout(resolve, 1000));
+
+      // ✅ ADD: Verify the profile was actually saved
+      const savedDoc = await docRef.get();
+      if (!savedDoc.exists) {
+        console.error('❌ Profile save failed - document not found after write');
+        throw new Error('Profile save failed - please try again');
+      }
+
+      const savedProfile = savedDoc.data().profile;
+      console.log(`✅ Profile created: ${savedProfile.name} | Language: ${savedProfile.language}`);
 
       return res.json({
         success: true,
-        profile,
-        message: `Welcome, ${profile.name}! Your personalized wellness journey starts now. 🚀`
+        profile: savedProfile,  // ✅ CHANGE: was 'profile', now 'savedProfile' (verified from DB)
+        message: `Welcome, ${savedProfile.name}! Your personalized wellness journey starts now. 🚀`
       });
     }
   } catch (error) {
@@ -1589,22 +1581,29 @@ router.get('/profile', requireDeviceId, async (req, res) => {
   try {
     const { deviceId } = req;
 
-    const cached = cacheGet(`${deviceId}:profile`);
-    if (cached) return res.json(cached);
-
+    // ✅ FIX: Always fetch fresh from Firestore (no cache)
     const doc = await getDb().collection('aliveChecks').doc(deviceId).get();
+
     if (!doc.exists) {
-      const resp = { success: true, profile: null, hasProfile: false };
-      cacheSet(`${deviceId}:profile`, resp);
-      return res.json(resp);
+      return res.json({
+        success: true,
+        profile: null,
+        hasProfile: false
+      });
     }
+
     const data = doc.data();
-    const resp = { success: true, profile: data.profile || null, hasProfile: !!data.profile?.profileCompleted };
-    cacheSet(`${deviceId}:profile`, resp);
-    res.json(resp);
+    return res.json({
+      success: true,
+      profile: data.profile || null,
+      hasProfile: !!data.profile?.profileCompleted
+    });
   } catch (error) {
     console.error('Get profile error:', error);
-    res.status(500).json({ success: false, error: 'Failed to get profile' });
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get profile'
+    });
   }
 });
 
