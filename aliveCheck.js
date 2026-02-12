@@ -1493,7 +1493,7 @@ const checkDailyLimit = async (req, res, next) => {
 };
 
 // ============================================
-// ROUTES (unchanged signatures)
+// ROUTES
 // ============================================
 
 router.post('/profile', requireDeviceId, async (req, res) => {
@@ -1516,8 +1516,6 @@ router.post('/profile', requireDeviceId, async (req, res) => {
 
       const updatedDoc = await docRef.get();
       const updatedProfile = updatedDoc.data().profile;
-
-      // ❌ REMOVE: cacheInvalidate(deviceId);
       console.log(`✅ Profile updated: ${updatedProfile.name}${language ? ` | Language: ${language}` : ''}`);
 
       return res.json({
@@ -1550,12 +1548,10 @@ router.post('/profile', requireDeviceId, async (req, res) => {
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       });
 
-      // ❌ REMOVE: cacheInvalidate(deviceId);
-
-      // ✅ ADD: Wait for Firestore write to complete
+      // Wait for Firestore write to complete
       await new Promise(resolve => setTimeout(resolve, 1000));
 
-      // ✅ ADD: Verify the profile was actually saved
+      // Verify the profile was actually saved
       const savedDoc = await docRef.get();
       if (!savedDoc.exists) {
         console.error('❌ Profile save failed - document not found after write');
@@ -1567,7 +1563,7 @@ router.post('/profile', requireDeviceId, async (req, res) => {
 
       return res.json({
         success: true,
-        profile: savedProfile,  // ✅ CHANGE: was 'profile', now 'savedProfile' (verified from DB)
+        profile: savedProfile,
         message: `Welcome, ${savedProfile.name}! Your personalized wellness journey starts now. 🚀`
       });
     }
@@ -1581,7 +1577,7 @@ router.get('/profile', requireDeviceId, async (req, res) => {
   try {
     const { deviceId } = req;
 
-    // ✅ FIX: Always fetch fresh from Firestore (no cache)
+    // Always fetch fresh from Firestore
     const doc = await getDb().collection('aliveChecks').doc(deviceId).get();
 
     if (!doc.exists) {
@@ -1739,7 +1735,6 @@ router.post('/submit', requireDeviceId, checkDailyLimit, async (req, res) => {
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
-    cacheInvalidate(deviceId);
     console.log(`✅ ${profile.name} → Alive=${aliveScore} | ${pillar}=${todayPillarScore} | ${vibe} | Lang=${getLanguageName(profile.language || 'en')}`);
 
     res.json({
@@ -1780,9 +1775,6 @@ router.get('/history', requireDeviceId, async (req, res) => {
     const { deviceId } = req;
     const { limit } = req.query;
 
-    const cached = cacheGet(`${deviceId}:history`);
-    if (cached && !limit) return res.json(cached);
-
     const doc = await getDb().collection('aliveChecks').doc(deviceId).get();
     if (!doc.exists) {
       return res.json({ success: true, history: [], total: 0, profile: null });
@@ -1795,16 +1787,13 @@ router.get('/history', requireDeviceId, async (req, res) => {
       if (!isNaN(n) && n > 0) submissions = submissions.slice(0, n);
     }
 
-    const resp = {
+    res.json({
       success: true,
       history: submissions,
       total: data.totalLifetimeChecks || submissions.length,
       storedCount: submissions.length,
       profile: data.profile || null
-    };
-
-    if (!limit) cacheSet(`${deviceId}:history`, resp);
-    res.json(resp);
+    });
   } catch (error) {
     console.error('Get history error:', error);
     res.status(500).json({ success: false, error: 'Failed to get history' });
@@ -1815,10 +1804,6 @@ router.get('/analytics', requireDeviceId, async (req, res) => {
   try {
     const { deviceId } = req;
     const { range } = req.query;
-
-    const cacheKey = `${deviceId}:analytics:${range || 'all'}`;
-    const cached = cacheGet(cacheKey);
-    if (cached) return res.json(cached);
 
     const doc = await getDb().collection('aliveChecks').doc(deviceId).get();
     if (!doc.exists) {
@@ -1908,17 +1893,14 @@ router.get('/analytics', requireDeviceId, async (req, res) => {
       aiSummary = await generateAnalyticsSummary(profile, analyticsData, submissions);
     }
 
-    const resp = {
+    res.json({
       success: true,
       analytics: {
         ...analyticsData,
         aiSummary
       },
       profile
-    };
-
-    cacheSet(cacheKey, resp);
-    res.json(resp);
+    });
   } catch (error) {
     console.error('Get analytics error:', error);
     res.status(500).json({ success: false, error: 'Failed to get analytics' });
@@ -1956,14 +1938,17 @@ router.get('/today-count', requireDeviceId, async (req, res) => {
     const { deviceId } = req;
     const today = getCurrentDateIST();
 
-    const cached = cacheGet(`${deviceId}:todayCount`);
-    if (cached && cached.date === today) return res.json(cached);
-
     const doc = await getDb().collection('aliveChecks').doc(deviceId).get();
     if (!doc.exists) {
-      const resp = { success: true, count: 0, remaining: MAX_DAILY_CHECKS, limit: MAX_DAILY_CHECKS, canCheck: true, profile: null, date: today };
-      cacheSet(`${deviceId}:todayCount`, resp);
-      return res.json(resp);
+      return res.json({
+        success: true,
+        count: 0,
+        remaining: MAX_DAILY_CHECKS,
+        limit: MAX_DAILY_CHECKS,
+        canCheck: true,
+        profile: null,
+        date: today
+      });
     }
 
     const data = doc.data();
@@ -1971,7 +1956,7 @@ router.get('/today-count', requireDeviceId, async (req, res) => {
     const remaining = Math.max(0, MAX_DAILY_CHECKS - todayCount);
     const resetTime = getNextMidnightIST();
 
-    const resp = {
+    res.json({
       success: true,
       count: todayCount,
       remaining,
@@ -1981,10 +1966,7 @@ router.get('/today-count', requireDeviceId, async (req, res) => {
       resetTime: new Date(resetTime).toISOString(),
       profile: data.profile || null,
       date: today
-    };
-
-    cacheSet(`${deviceId}:todayCount`, resp);
-    res.json(resp);
+    });
   } catch (error) {
     console.error('Get today count error:', error);
     res.status(500).json({ success: false, error: 'Failed to get count' });
@@ -1995,7 +1977,6 @@ router.delete('/history', requireDeviceId, async (req, res) => {
   try {
     const { deviceId } = req;
     await getDb().collection('aliveChecks').doc(deviceId).delete();
-    cacheInvalidate(deviceId);
     console.log(`🗑️ All data deleted for ${deviceId}`);
     res.json({ success: true, message: 'All data deleted successfully' });
   } catch (error) {
