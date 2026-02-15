@@ -608,6 +608,45 @@ app.post('/api/users/me', getDeviceId, async (req, res) => {
   }
 });
 
+app.get('/api/version-check', async (req, res) => {
+  try {
+    console.log('🔍 Version check API called');
+
+    // ✅ Fetch from Firestore appConfig/versionControl
+    const versionDoc = await db.collection('appConfig').doc('versionControl').get();
+
+    if (!versionDoc.exists) {
+      console.log('⚠️ No version config found in Firestore');
+      return res.json({
+        success: true,
+        versionControl: null
+      });
+    }
+
+    const versionData = versionDoc.data();
+    console.log('✅ Version config found:', versionData.minimumVersion);
+
+    res.json({
+      success: true,
+      versionControl: {
+        minimumVersion: versionData.minimumVersion,
+        latestVersion: versionData.latestVersion,
+        forceUpdate: versionData.forceUpdate,
+        updateMessages: versionData.updateMessages,
+        appStoreUrl: versionData.appStoreUrl
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Version check error:', error);
+    res.json({
+      success: false,
+      versionControl: null,
+      error: error.message
+    });
+  }
+});
+
 app.post('/api/users/update-name', getDeviceId, async (req, res) => {
   try {
     const { displayName } = req.body;
