@@ -1,6 +1,6 @@
 // 🫀 STILL ALIVE - PERSONALIZED ALIVE CHECK FEATURE
 // ============================================
-// v5.1 — 10/10 AI RESPONSE QUALITY - MAXIMUM DIVERSITY
+// v6.0 — LEADERBOARD + PRIVATE CIRCLES + CODE SYSTEM
 // ============================================
 // ✅ ENFORCED TOPIC DIVERSITY - Never boring, always fresh
 // ✅ GEN Z VIRAL QUOTES - Screenshot-worthy every time
@@ -8,6 +8,9 @@
 // ✅ INTELLIGENT VARIED SCORING - Never repetitive
 // ✅ 50+ Question Topics Bank per pillar
 // ✅ MULTILINGUAL SUPPORT (6 languages)
+// ✅ GLOBAL LEADERBOARD - Top 10 worldwide
+// ✅ PRIVATE CIRCLES - Add family/friends (one-way)
+// ✅ UNIFIED CODE SYSTEM - One code for everything
 // ============================================
 
 const express = require('express');
@@ -25,12 +28,24 @@ const getDb = () => admin.firestore();
 const MAX_DAILY_CHECKS = 50;
 const MAX_STORED_SUBMISSIONS = 60;
 const IST_OFFSET = 5.5 * 60 * 60 * 1000;
+const MAX_CIRCLE_SIZE = 15; // ✅ NEW
+const PILLAR_DECAY_START_DAYS = 7;   // decay kicks in after 7 days no check
+const MAX_DECAY_PENALTY = 25;         // max 25pt deducted from stale pillar
+const REQUIRED_PILLARS_FOR_COMPLETE_ALIVE = 4;
 
 const PILLARS = {
   HEALTH: { id: 'health', name: 'Health', emoji: '💪', color: '#FF6B6B', weight: 0.30 },
   WEALTH: { id: 'wealth', name: 'Wealth', emoji: '💰', color: '#FFD93D', weight: 0.25 },
   LOVE: { id: 'love', name: 'Love', emoji: '❤️', color: '#FF6B9D', weight: 0.20 },
   PURPOSE: { id: 'purpose', name: 'Purpose', emoji: '🎯', color: '#A78BFA', weight: 0.25 }
+};
+
+// ✅ NEW - Relationship Types for Circles
+const RELATIONSHIP_TYPES = {
+  FAMILY: { id: 'family', emoji: '👨‍👩‍👧‍👦', label: 'Family' },
+  FRIEND: { id: 'friend', emoji: '👥', label: 'Friend' },
+  PARTNER: { id: 'partner', emoji: '❤️', label: 'Partner' },
+  OTHER: { id: 'other', emoji: '🤝', label: 'Other' }
 };
 
 // ============================================
@@ -46,6 +61,59 @@ function getLanguageName(code) {
     'de': 'German'
   };
   return languages[code] || 'English';
+}
+
+// ============================================
+// 🔑 CODE GENERATION HELPER
+// ============================================
+function generateUniqueCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // No confusing chars
+  let code = '';
+  for (let i = 0; i < 6; i++) {
+    code += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return code;
+}
+
+async function ensureCodeExists(deviceId) {
+  try {
+    const db = getDb();
+
+    // Check Still Alive users collection first
+    const userDoc = await db.collection('users').doc(deviceId).get();
+    if (userDoc.exists && userDoc.data().code) {
+      return userDoc.data().code;
+    }
+
+    // Generate new code
+    let code = generateUniqueCode();
+    let attempts = 0;
+
+    // Ensure uniqueness across both collections
+    while (attempts < 10) {
+      const [aliveCheckQuery, userQuery] = await Promise.all([
+        db.collection('aliveChecks').where('profile.code', '==', code).limit(1).get(),
+        db.collection('users').where('code', '==', code).limit(1).get()
+      ]);
+
+      if (aliveCheckQuery.empty && userQuery.empty) {
+        break;
+      }
+
+      code = generateUniqueCode();
+      attempts++;
+    }
+
+    // Save to users collection for consistency
+    if (userDoc.exists) {
+      await db.collection('users').doc(deviceId).update({ code });
+    }
+
+    return code;
+  } catch (error) {
+    console.error('Code generation error:', error);
+    return generateUniqueCode(); // Fallback
+  }
 }
 
 // ============================================
@@ -94,7 +162,7 @@ const QUESTION_TOPICS = {
     // Autonomy cluster
     'creative_freedom', 'autonomy', 'decision_power', 'trust_from_leadership', 'micromanagement',
     // Stress/burnout cluster
-    'job_stress', 'burnout_level', 'work_pressure', 'boundaries', 'after_hours_work', 'vacation_quality', '休息品質',
+    'job_stress', 'burnout_level', 'work_pressure', 'boundaries', 'after_hours_work', 'vacation_quality',
     // Future cluster
     'retirement_confidence', 'wealth_building', 'investment_confidence', 'passive_income', 'side_income', 'financial_freedom',
     // Network cluster
@@ -322,8 +390,6 @@ const SCORING_RUBRICS = {
   }
 };
 
-
-
 // ============================================
 // HELPERS
 // ============================================
@@ -351,10 +417,9 @@ const formatTimeUntilReset = (resetTime) => {
 };
 
 const getVibeFromScore = (score) => {
-  if (score >= 80) return { vibe: 'THRIVING', emoji: '🔥' };
-  if (score >= 60) return { vibe: 'LIVING', emoji: '⚡' };
-  if (score >= 40) return { vibe: 'SURVIVING', emoji: '💪' };
-  return { vibe: 'STRUGGLING', emoji: '🌱' };
+  if (score >= 71) return { vibe: 'THRIVING', emoji: '🔥' };
+  if (score >= 51) return { vibe: 'LIVING', emoji: '⚡' };
+  return { vibe: 'SURVIVING', emoji: '🌱' };
 };
 
 const getAgeGroupLabel = (ag) => ({
@@ -366,7 +431,6 @@ const getAgeGroupLabel = (ag) => ({
 // 🎲 DIVERSITY SEED GENERATOR
 // ============================================
 function getDiversitySeed(deviceId, checkCount, pillar) {
-  // Creates a unique seed for each user/check to ensure variety
   const timestamp = Date.now();
   const hash = (deviceId + checkCount + pillar + timestamp).split('').reduce((a, b) => {
     a = ((a << 5) - a) + b.charCodeAt(0);
@@ -386,7 +450,6 @@ async function aiScorePillar(profile, pillar, questions, answers, submissions) {
   const rubric = SCORING_RUBRICS[pillar];
   const pillarMeta = PILLARS[pillar.toUpperCase()];
 
-  // Generate diversity seed for varied scoring approaches
   const diversitySeed = getDiversitySeed(profile.name, submissions.length, pillar);
   const scoringStyle = diversitySeed % 3 === 0 ? 'analytical_precise' :
     diversitySeed % 3 === 1 ? 'contextual_nuanced' : 'pattern_based';
@@ -415,7 +478,6 @@ async function aiScorePillar(profile, pillar, questions, answers, submissions) {
     }).join('\n')
     : '  No previous Q&A on this pillar';
 
-  // Enhanced scoring approach instructions based on style
   const scoringApproachInstructions = {
     analytical_precise: `Use a methodical approach: Score each answer 1-10, identify the 2 strongest and 2 weakest signals, apply context rules strictly, calculate weighted average with emphasis on critical factors.`,
     contextual_nuanced: `Consider the bigger picture: How do answers relate to each other? Are there contradictions? What's the underlying pattern? Let context override individual signals when appropriate.`,
@@ -504,7 +566,7 @@ Respond ONLY with valid JSON:
         { role: 'system', content: 'You are an expert wellness psychologist. Score accurately based on rubrics. Think deeply before scoring. VARY your approach each time. Respond ONLY with valid JSON. No markdown.' },
         { role: 'user', content: prompt }
       ],
-      temperature: 0.3, // Slightly higher for more variety while maintaining quality
+      temperature: 0.3,
       max_tokens: 200,
     });
 
@@ -553,51 +615,136 @@ function getEstimatedPillarScore(pillarHistory, pillarId) {
   }
   return 55;
 }
+// ============================================
+// V7 ALIVE SCORE — REAL DATA ONLY + DECAY
+// ============================================
 
-function calculateAliveScore(todayPillar, todayScore, submissions) {
-  const pillarHistory = buildPillarHistory(submissions);
+function getDaysSince(isoTimestamp) {
+  if (!isoTimestamp) return 999;
+  const diff = Date.now() - new Date(isoTimestamp).getTime();
+  return Math.floor(diff / 86400000);
+}
 
-  const scores = {};
+function applyDecayPenalty(score, daysSinceLastCheck) {
+  if (daysSinceLastCheck <= 7) return score; // No decay within 7 days
+  const extraDays = daysSinceLastCheck - 7;
+  const penalty = Math.min(25, Math.floor(extraDays * 1.5)); // Max 25pt penalty
+  return Math.max(0, score - penalty);
+}
+
+function calculateAliveScore(todayPillar, todayPillarScore, submissions) {
+  // Build real pillar data from history — NO DEFAULTS
+  const pillarData = {};
+
   for (const key of Object.keys(PILLARS)) {
     const pid = PILLARS[key].id;
-    scores[pid] = pid === todayPillar ? todayScore : getEstimatedPillarScore(pillarHistory, pid);
+    const pillarSubs = submissions.filter(
+      s => s.pillar === pid && s.pillarScores && s.pillarScores[pid] !== undefined
+    );
+
+    if (pid === todayPillar) {
+      // Today's fresh score — no decay
+      pillarData[pid] = {
+        score: todayPillarScore,
+        hasRealData: true,
+        daysSinceLastCheck: 0,
+        source: 'scored_today'
+      };
+    } else if (pillarSubs.length > 0) {
+      // Real historical data exists — apply weighted avg + decay
+      const scores = pillarSubs.map(s => s.pillarScores[pid]);
+      const timestamps = pillarSubs.map(s => s.timestamp);
+
+      // Weighted average — most recent counts more
+      let weightSum = 0, valSum = 0;
+      scores.forEach((s, i) => {
+        const w = scores.length - i;
+        valSum += s * w;
+        weightSum += w;
+      });
+      const rawScore = Math.round(valSum / weightSum);
+      const daysSince = getDaysSince(timestamps[0]);
+      const decayedScore = applyDecayPenalty(rawScore, daysSince);
+
+      pillarData[pid] = {
+        score: decayedScore,
+        rawScore,
+        hasRealData: true,
+        daysSinceLastCheck: daysSince,
+        source: 'historical_with_decay'
+      };
+    } else {
+      // NO real data — exclude from alive score calculation
+      pillarData[pid] = {
+        score: null,
+        hasRealData: false,
+        daysSinceLastCheck: null,
+        source: 'no_data'
+      };
+    }
   }
 
-  let alive = 0;
+  // Only calculate alive score using pillars with real data
+  const pillarsWithData = Object.keys(PILLARS).filter(
+    k => pillarData[PILLARS[k].id].hasRealData
+  );
+
+  const aliveScoreComplete = pillarsWithData.length === REQUIRED_PILLARS_FOR_COMPLETE_ALIVE;
+
+  // Normalise weights for pillars we actually have data for
+  let totalWeight = pillarsWithData.reduce((sum, k) => sum + PILLARS[k].weight, 0);
+  let aliveScore = 0;
+  for (const key of pillarsWithData) {
+    const pid = PILLARS[key].id;
+    const normalisedWeight = PILLARS[key].weight / totalWeight;
+    aliveScore += pillarData[pid].score * normalisedWeight;
+  }
+  aliveScore = Math.round(aliveScore);
+
+  // Build pillarScores map — null for pillars with no data
+  const pillarScores = {};
   for (const key of Object.keys(PILLARS)) {
-    alive += scores[PILLARS[key].id] * PILLARS[key].weight;
+    const pid = PILLARS[key].id;
+    pillarScores[pid] = pillarData[pid].hasRealData ? pillarData[pid].score : null;
   }
 
   const breakdown = Object.keys(PILLARS).map(k => {
     const p = PILLARS[k];
-    const isTodayPillar = p.id === todayPillar;
+    const pd = pillarData[p.id];
     return {
       pillar: p.id,
       name: p.name,
       emoji: p.emoji,
-      score: scores[p.id],
+      score: pd.score,
+      rawScore: pd.rawScore || pd.score,
       weight: p.weight,
-      contribution: Math.round(scores[p.id] * p.weight),
-      isToday: isTodayPillar,
-      source: isTodayPillar ? 'scored_today' : 'estimated_from_history'
+      contribution: pd.hasRealData ? Math.round(pd.score * p.weight) : null,
+      isToday: p.id === todayPillar,
+      hasRealData: pd.hasRealData,
+      daysSinceLastCheck: pd.daysSinceLastCheck,
+      source: pd.source
     };
-  }).sort((a, b) => b.score - a.score);
+  }).sort((a, b) => (b.score || 0) - (a.score || 0));
 
-  const strongest = breakdown[0];
-  const weakest = breakdown[breakdown.length - 1];
-
-  const scoringExplanation = `Your ${strongest.name} (${strongest.score}) is strongest. ${weakest.name} (${weakest.score}) needs attention. Today's ${PILLARS[todayPillar.toUpperCase()]?.name} check (${todayScore}) ${todayScore >= 75 ? 'boosted' : todayScore >= 55 ? 'maintained' : 'lowered'} your overall score.`;
+  const pillarsWithRealData = breakdown.filter(b => b.hasRealData);
+  const strongest = pillarsWithRealData[0] || null;
+  const weakest = pillarsWithRealData[pillarsWithRealData.length - 1] || null;
+  const missingPillars = breakdown.filter(b => !b.hasRealData).map(b => b.name);
 
   return {
-    aliveScore: Math.round(alive),
-    pillarScores: scores,
+    aliveScore,
+    aliveScoreComplete,           // ← FE uses this to gate alive score display
+    pillarsCheckedCount: pillarsWithData.length,
+    missingPillars,               // ← FE shows "check X to unlock Alive Score"
+    pillarScores,
     breakdown,
-    scoringExplanation,
-    strongest: strongest.pillar,
-    weakest: weakest.pillar
+    strongest: strongest?.pillar || null,
+    weakest: weakest?.pillar || null,
+    scoringExplanation: aliveScoreComplete
+      ? `Your ${strongest?.name} (${strongest?.score}) is strongest. ${weakest?.name} (${weakest?.score}) needs attention.`
+      : `Complete ${missingPillars.join(', ')} checks to unlock your full Alive Score.`
   };
 }
-
 // ============================================
 // PRIDE MOMENT DETECTOR
 // ============================================
@@ -671,7 +818,6 @@ async function generateIndividualTip(profile, pillar, questions, answers, todayP
   const userLanguage = language || 'en';
   const pillarMeta = PILLARS[pillar.toUpperCase()];
 
-  // Generate diversity seed for varied tip approaches
   const diversitySeed = getDiversitySeed(name, submissions.length, pillar);
   const tipStyle = diversitySeed % 4 === 0 ? 'immediate_action' :
     diversitySeed % 4 === 1 ? 'reframe_perspective' :
@@ -683,7 +829,6 @@ async function generateIndividualTip(profile, pillar, questions, answers, todayP
     return `Q: ${q.text}\nA: ${answerValue}`;
   }).join('\n\n');
 
-  // Get recent tips to avoid repetition
   const recentTips = submissions
     .filter(s => s.individualTip)
     .slice(0, 3)
@@ -773,7 +918,6 @@ async function generateQuoteAndStrategicTips(profile, todayPillar, questions, an
   const displayAge = ageGroup ? getAgeGroupLabel(ageGroup) : 'Adult';
   const pillarMeta = PILLARS[todayPillar.toUpperCase()];
 
-  // Generate diversity seeds
   const diversitySeed = getDiversitySeed(name, submissions.length, todayPillar);
   const quoteStyle = QUOTE_STYLES[diversitySeed % QUOTE_STYLES.length];
   const { vibe } = getVibeFromScore(aliveScore);
@@ -799,7 +943,6 @@ async function generateQuoteAndStrategicTips(profile, todayPillar, questions, an
     `${s.date}: Alive=${s.score}/100 [${s.vibe}] | ${s.pillar}=${s.pillarScores?.[s.pillar] ?? s.score}/100`
   ).join('\n');
 
-  // Get recent quotes to avoid repetition
   const recentQuotes = submissions
     .filter(s => s.quote)
     .slice(0, 5)
@@ -812,7 +955,6 @@ async function generateQuoteAndStrategicTips(profile, todayPillar, questions, an
     .flatMap(s => s.strategicTips)
     .join(' | ');
 
-  // --- PROMPT 1: Gen Z Viral Quote ---
   const quotePrompt = `CRITICAL: This quote will be SHARED on social media. Make it VIRAL-WORTHY and AUTHENTIC to Gen Z.
 
 Quote and message MUST be in ${getLanguageName(userLanguage)} language.
@@ -864,7 +1006,6 @@ Also write a MESSAGE (1 sentence, max 20 words) that references something SPECIF
 Respond ONLY with valid JSON:
 {"quote": "viral-worthy quote in ${getLanguageName(userLanguage)}", "message": "specific message in ${getLanguageName(userLanguage)}"}`;
 
-  // --- PROMPT 2: Strategic Tips ---
   const tipsPrompt = `CRITICAL: These tips will guide ${name}'s next week. Make them STRATEGIC and ACTIONABLE.
 
 All tips MUST be in ${getLanguageName(userLanguage)} language.
@@ -928,7 +1069,7 @@ Respond ONLY with valid JSON:
         { role: 'system', content: 'You write viral Gen Z quotes. Be authentic, not cringe. VARY every quote. Respond ONLY with valid JSON. No markdown.' },
         { role: 'user', content: quotePrompt }
       ],
-      temperature: 0.9, // Higher for more creativity
+      temperature: 0.9,
       max_tokens: 150,
     }),
     openai.chat.completions.create({
@@ -937,7 +1078,7 @@ Respond ONLY with valid JSON:
         { role: 'system', content: 'You are Dr. Maya, a strategic wellness coach. Be specific, not generic. VARY your tips. Respond ONLY with valid JSON. No markdown.' },
         { role: 'user', content: tipsPrompt }
       ],
-      temperature: 0.8, // Higher for more variety
+      temperature: 0.8,
       max_tokens: 350,
     }),
   ]);
@@ -995,28 +1136,22 @@ const generatePersonalizedQuestions = async (profile, selectedPillar, previousSu
     .filter(s => s.pillar === selectedPillar)
     .slice(0, 3);
 
-  // Extract previously asked questions AND topics to avoid repetition
   const previouslyAskedQuestions = samePillarHistory
     .flatMap(s => (s.questions || []).map(q => q.text))
     .join('; ');
 
-  // Extract previously used topics (if we stored them, otherwise infer from questions)
   const previousTopicsUsed = samePillarHistory
     .flatMap(s => (s.questions || []).map(q => {
-      // Try to match question text to topics
       return topicsBank.find(topic => q.text.toLowerCase().includes(topic.replace(/_/g, ' ')));
     }))
     .filter(Boolean);
 
-  // Select 8 diverse topics for this check
   const diversitySeed = getDiversitySeed(name, previousSubmissions.length, selectedPillar);
   const shuffledTopics = [...topicsBank].sort(() => 0.5 - Math.random());
 
-  // Pick topics that haven't been used recently
   const availableTopics = shuffledTopics.filter(t => !previousTopicsUsed.includes(t));
   const selectedTopics = availableTopics.slice(0, 8);
 
-  // If we don't have enough unused topics, fill with least recently used
   if (selectedTopics.length < 8) {
     const remaining = shuffledTopics.filter(t => !selectedTopics.includes(t));
     selectedTopics.push(...remaining.slice(0, 8 - selectedTopics.length));
@@ -1126,7 +1261,7 @@ Respond with valid JSON (NO MARKDOWN):
         { role: 'system', content: 'You are Dr. Sarah, expert at creating diverse, deep wellness questions. Follow topic requirements strictly. Avoid repetition. Be specific. Respond ONLY with valid JSON, no markdown.' },
         { role: 'user', content: prompt }
       ],
-      temperature: 0.85, // Higher temperature for more variety
+      temperature: 0.85,
       max_tokens: 1200,
     });
 
@@ -1208,7 +1343,6 @@ const getPersonalizedAnalysis = async (profile, submissions) => {
   const displayAge = ageGroup ? getAgeGroupLabel(ageGroup) : 'Adult';
   const last30 = submissions.slice(0, 30);
 
-  // Generate diversity seed for varied analysis approach
   const diversitySeed = getDiversitySeed(name, submissions.length, 'analysis');
   const analysisStyle = diversitySeed % 3 === 0 ? 'pattern_detective' :
     diversitySeed % 3 === 1 ? 'strength_based' : 'growth_oriented';
@@ -1339,7 +1473,7 @@ Respond ONLY with valid JSON:
         { role: 'system', content: `You are Dr. Maya, ${name}'s wellness psychologist. Be specific, connect patterns, kind but honest. Use ${analysisStyle} approach. JSON only.` },
         { role: 'user', content: prompt }
       ],
-      temperature: 0.7, // Higher for more variety
+      temperature: 0.7,
       max_tokens: 600,
     });
 
@@ -1493,24 +1627,28 @@ const checkDailyLimit = async (req, res, next) => {
 };
 
 // ============================================
-// ROUTES
+// EXISTING ROUTES (UNCHANGED) ✅
 // ============================================
 
 router.post('/profile', requireDeviceId, async (req, res) => {
   try {
     const { deviceId } = req;
-    const { name, ageGroup, gender, language } = req.body;
+    const { name, ageGroup, gender, language, leaderboardConsent } = req.body;
 
     const docRef = getDb().collection('aliveChecks').doc(deviceId);
     const doc = await docRef.get();
 
     if (doc.exists) {
+      // ============================================
+      // EXISTING PROFILE - UPDATE
+      // ============================================
       const updateData = { updatedAt: admin.firestore.FieldValue.serverTimestamp() };
 
       if (name) updateData['profile.name'] = name.trim();
       if (ageGroup) updateData['profile.ageGroup'] = ageGroup;
       if (gender) updateData['profile.gender'] = gender;
       if (language) updateData['profile.language'] = language;
+      if (typeof leaderboardConsent === 'boolean') updateData['profile.leaderboardConsent'] = leaderboardConsent;
 
       await docRef.update(updateData);
 
@@ -1525,25 +1663,64 @@ router.post('/profile', requireDeviceId, async (req, res) => {
           ? `Language updated to ${getLanguageName(language)} successfully`
           : `Welcome back, ${updatedProfile.name}!`
       });
+
     } else {
+      // ============================================
+      // NEW PROFILE - CREATE WITH AUTO-CODE
+      // ============================================
       if (!name || !name.trim()) return res.status(400).json({ success: false, error: 'Name is required' });
       if (!gender || !['male', 'female', 'other', 'prefernottosay'].includes(gender))
         return res.status(400).json({ success: false, error: 'Valid gender is required' });
       if (!ageGroup) return res.status(400).json({ success: false, error: 'Age group is required' });
+
+      // ✅ AUTO-GENERATE: Code generation happens automatically
+      const code = await ensureCodeExists(deviceId);
+      console.log(`🔑 Code auto-generated for Alive Check profile: ${deviceId} → ${code}`);
+
+      // ✅ CROSS-SYNC: Sync code to users collection if it exists
+      try {
+        const userRef = getDb().collection('users').doc(deviceId);
+        const userDoc = await userRef.get();
+
+        if (userDoc.exists) {
+          const userData = userDoc.data();
+
+          if (!userData.code) {
+            // User exists but has no code - sync it
+            await userRef.update({
+              code,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+            console.log(`✅ Code synced to users collection: ${deviceId} → ${code}`);
+          } else if (userData.code !== code) {
+            // User has different code - use existing one (shouldn't happen, but safety check)
+            console.log(`⚠️ Code mismatch detected, using existing code: ${userData.code}`);
+          }
+        }
+      } catch (syncError) {
+        // Non-critical error - log but don't fail profile creation
+        console.error('⚠️ Code sync to users collection failed (non-critical):', syncError.message);
+      }
 
       const profile = {
         name: name.trim(),
         ageGroup,
         gender,
         language: language || 'en',
+        code, // ✅ AUTO-GENERATED CODE
+        leaderboardConsent: typeof leaderboardConsent === 'boolean' ? leaderboardConsent : true, // ✅ Default ON
         profileCompleted: true,
         profileCompletedAt: admin.firestore.FieldValue.serverTimestamp()
       };
 
       await docRef.set({
-        deviceId, profile,
-        totalLifetimeChecks: 0, todayCount: 0, lastCheckDate: null,
+        deviceId,
+        profile,
+        totalLifetimeChecks: 0,
+        todayCount: 0,
+        lastCheckDate: null,
         submissions: [],
+        circles: [], // ✅ For private circles
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       });
@@ -1559,7 +1736,7 @@ router.post('/profile', requireDeviceId, async (req, res) => {
       }
 
       const savedProfile = savedDoc.data().profile;
-      console.log(`✅ Profile created: ${savedProfile.name} | Language: ${savedProfile.language}`);
+      console.log(`✅ Profile created: ${savedProfile.name} | Code: ${savedProfile.code} | Language: ${savedProfile.language}`);
 
       return res.json({
         success: true,
@@ -1577,7 +1754,6 @@ router.get('/profile', requireDeviceId, async (req, res) => {
   try {
     const { deviceId } = req;
 
-    // Always fetch fresh from Firestore
     const doc = await getDb().collection('aliveChecks').doc(deviceId).get();
 
     if (!doc.exists) {
@@ -1589,10 +1765,26 @@ router.get('/profile', requireDeviceId, async (req, res) => {
     }
 
     const data = doc.data();
+    let profile = data.profile || null;
+
+    // ✅ NEW: Ensure code exists (migration for existing users)
+    if (profile && !profile.code) {
+      const code = await ensureCodeExists(deviceId);
+      await doc.ref.update({ 'profile.code': code });
+      profile.code = code;
+      console.log(`✅ Code migrated for existing user: ${deviceId} → ${code}`);
+    }
+
+    // ✅ NEW: Set leaderboardConsent default if missing
+    if (profile && profile.leaderboardConsent === undefined) {
+      await doc.ref.update({ 'profile.leaderboardConsent': true });
+      profile.leaderboardConsent = true;
+    }
+
     return res.json({
       success: true,
-      profile: data.profile || null,
-      hasProfile: !!data.profile?.profileCompleted
+      profile,
+      hasProfile: !!profile?.profileCompleted
     });
   } catch (error) {
     console.error('Get profile error:', error);
@@ -1655,22 +1847,37 @@ router.post('/submit', requireDeviceId, checkDailyLimit, async (req, res) => {
     const profile = data.profile;
     const submissions = data.submissions || [];
 
-    console.log(`🤖 Processing ${profile.name}'s ${pillar} check-in (8 questions) in ${getLanguageName(profile.language || 'en')}...`);
+    console.log(`🤖 Processing ${profile.name}'s ${pillar} check-in in ${getLanguageName(profile.language || 'en')}...`);
 
+    // STEP 1: AI scores the pillar
     const { score: todayPillarScore, justification: scoringJustification } = await aiScorePillar(
       profile, pillar, questions, answers, submissions
     );
-    console.log(`📊 AI ${pillar} score: ${todayPillarScore}/100 | Reason: ${scoringJustification}`);
+    console.log(`📊 AI ${pillar} score: ${todayPillarScore}/100`);
 
-    const { aliveScore, pillarScores, breakdown, scoringExplanation, strongest, weakest } = calculateAliveScore(
-      pillar, todayPillarScore, submissions
-    );
-    const { vibe, emoji } = getVibeFromScore(aliveScore);
-    console.log(`🎯 Alive Score: ${aliveScore}/100 | Breakdown: ${JSON.stringify(pillarScores)}`);
+    // STEP 2: Calculate Alive Score
+    const aliveResult = calculateAliveScore(pillar, todayPillarScore, submissions);
+    const {
+      aliveScore,
+      aliveScoreComplete,
+      pillarsCheckedCount,
+      missingPillars,
+      pillarScores,
+      breakdown,
+      scoringExplanation,
+      strongest,
+      weakest
+    } = aliveResult;
 
+    // STEP 3: Vibe based on todayPillarScore
+    const { vibe, emoji } = getVibeFromScore(todayPillarScore);
+
+    console.log(`🎯 Pillar: ${todayPillarScore} | Alive: ${aliveScore} (${aliveScoreComplete ? 'complete' : `${pillarsCheckedCount}/4`}) | ${vibe}`);
+
+    // STEP 4: Pride moments
     const prideMoments = detectPrideMoment(pillar, todayPillarScore, aliveScore, submissions);
 
-    console.log(`🤖 Generating individual tip + quote + strategic tips in ${getLanguageName(profile.language || 'en')}...`);
+    // STEP 5: Generate content
     const [individualTipResult, quoteAndTipsResult] = await Promise.allSettled([
       generateIndividualTip(profile, pillar, questions, answers, todayPillarScore, submissions),
       generateQuoteAndStrategicTips(profile, pillar, questions, answers, pillarScores, aliveScore, scoringJustification, submissions)
@@ -1682,18 +1889,17 @@ router.post('/submit', requireDeviceId, checkDailyLimit, async (req, res) => {
 
     const { quote, message, strategicTips, weakestPillar, weakestBoost } = quoteAndTipsResult.status === 'fulfilled'
       ? quoteAndTipsResult.value
-      : {
-        quote: 'You showed up today',
-        message: 'Every check-in is a step forward.',
-        strategicTips: [],
-        weakestPillar: weakest,
-        weakestBoost: null
-      };
+      : { quote: 'You showed up today', message: 'Every check-in is a step forward.', strategicTips: [], weakestPillar: weakest, weakestBoost: null };
 
     const today = getCurrentDateIST();
     const nowTimestamp = new Date().toISOString();
     const submissionId = `check_${Date.now()}`;
 
+    // ✅ SINGLE SOURCE OF TRUTH
+    // score = aliveScore (for backward compat with old FE reading .score)
+    // aliveScore = same value, explicit field
+    // todayPillarScore = this specific pillar check score
+    // community + leaderboard MUST read aliveScore, never todayPillarScore
     const newSubmission = {
       id: submissionId,
       timestamp: nowTimestamp,
@@ -1701,12 +1907,20 @@ router.post('/submit', requireDeviceId, checkDailyLimit, async (req, res) => {
       pillar: pillar.toLowerCase(),
       questions,
       answers,
-      score: aliveScore,
-      pillarScores,
+
+      todayPillarScore,           // this pillar's score today
+      scoringJustification,
+
+      score: aliveScore,          // backward compat — old FE reads this
+      aliveScore,                 // ✅ EXPLICIT — community + leaderboard read THIS
+      aliveScoreComplete,         // true = all 4 pillars checked at least once
+      pillarsCheckedCount,
+      missingPillars,
+
+      pillarScores,               // { health: 78, wealth: null, love: null, purpose: 65 }
       breakdown,
       scoringExplanation,
-      todayPillarScore,
-      scoringJustification,
+
       quote,
       message,
       emoji,
@@ -1716,7 +1930,7 @@ router.post('/submit', requireDeviceId, checkDailyLimit, async (req, res) => {
       weakestPillar,
       weakestBoost,
       prideMoments,
-      source: 'ai_scored_v5_1_max_diversity'
+      source: 'ai_scored_v7_1'    // bumped version
     };
 
     let updatedSubmissions = [newSubmission, ...submissions];
@@ -1735,18 +1949,25 @@ router.post('/submit', requireDeviceId, checkDailyLimit, async (req, res) => {
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
-    console.log(`✅ ${profile.name} → Alive=${aliveScore} | ${pillar}=${todayPillarScore} | ${vibe} | Lang=${getLanguageName(profile.language || 'en')}`);
+    console.log(`✅ ${profile.name} → Pillar=${todayPillarScore} | Alive=${aliveScore} (${aliveScoreComplete ? 'complete' : 'partial'}) | ${pillar} | ${vibe}`);
 
     res.json({
       success: true,
       submission: {
         id: submissionId,
+        todayPillarScore,
+        pillar: pillar.toLowerCase(),
+        scoringJustification,
+
         score: aliveScore,
+        aliveScore,
+        aliveScoreComplete,
+        pillarsCheckedCount,
+        missingPillars,
+
         pillarScores,
         breakdown,
         scoringExplanation,
-        todayPillarScore,
-        scoringJustification,
         quote,
         message,
         emoji,
@@ -1757,8 +1978,7 @@ router.post('/submit', requireDeviceId, checkDailyLimit, async (req, res) => {
         weakestBoost,
         prideMoments,
         date: today,
-        timestamp: nowTimestamp,
-        pillar: pillar.toLowerCase()
+        timestamp: nowTimestamp
       },
       remaining: MAX_DAILY_CHECKS - todayCount,
       profile: { name: profile.name }
@@ -1818,39 +2038,111 @@ router.get('/analytics', requireDeviceId, async (req, res) => {
       return res.json({ success: true, analytics: null, message: 'No submissions yet', profile });
     }
 
-    let submissions = allSubmissions;
+    // ✅ Check if user has ever completed all 4 pillars (across ALL time, ignore range)
+    const allCheckedPillars = new Set(allSubmissions.map(s => s.pillar).filter(Boolean));
+    const allPillarIds = Object.values(PILLARS).map(p => p.id);
+    const missingPillarIds = allPillarIds.filter(pid => !allCheckedPillars.has(pid));
+    const missingPillarNames = missingPillarIds.map(pid => PILLARS[pid.toUpperCase()]?.name || pid);
+    const pillarsCheckedCount = allPillarIds.length - missingPillarIds.length;
+    const aliveScoreComplete = pillarsCheckedCount === REQUIRED_PILLARS_FOR_COMPLETE_ALIVE;
+
+    // ✅ Apply range filter to submissions
+    let rangeSubmissions = allSubmissions;
     const now = new Date();
     if (range === 'week') {
       const cutoff = new Date(now.getTime() - 7 * 86400000);
-      submissions = allSubmissions.filter(s => new Date(s.date) >= cutoff);
+      rangeSubmissions = allSubmissions.filter(s => new Date(s.date) >= cutoff);
     } else if (range === 'month') {
       const cutoff = new Date(now.getTime() - 30 * 86400000);
-      submissions = allSubmissions.filter(s => new Date(s.date) >= cutoff);
+      rangeSubmissions = allSubmissions.filter(s => new Date(s.date) >= cutoff);
     }
 
-    if (submissions.length === 0) {
+    if (rangeSubmissions.length === 0) {
       return res.json({ success: true, analytics: null, message: 'No data in this range', profile });
     }
 
-    const scores = submissions.map(s => s.score);
-    const avgScore = Math.round(scores.reduce((a, b) => a + b, 0) / scores.length);
-    const maxScore = Math.max(...scores);
-    const minScore = Math.min(...scores);
+    // ✅ ALIVE SCORE HISTORY — only submissions where aliveScoreComplete = true
+    // Backward compat: old submissions without aliveScoreComplete field
+    // treat as complete if they have a score and pillarScores for all 4 pillars
+    const getAliveScore = (s) => {
+      // New submissions: use aliveScore field directly
+      if (s.aliveScore !== undefined) return s.aliveScore;
+      // Old submissions: fall back to score field
+      return s.score;
+    };
 
-    const mid = Math.max(1, Math.floor(submissions.length / 2));
-    const recentAvg = submissions.slice(0, mid).reduce((a, b) => a + b.score, 0) / mid;
-    const olderAvg = submissions.slice(mid).reduce((a, b) => a + b.score, 0) / (submissions.length - mid);
+    const isComplete = (s) => {
+      // New submissions: use aliveScoreComplete flag
+      if (s.aliveScoreComplete !== undefined) return s.aliveScoreComplete;
+      // Old submissions: assume complete if they have pillarScores for all 4
+      if (s.pillarScores) {
+        return allPillarIds.every(pid => s.pillarScores[pid] != null);
+      }
+      // Oldest submissions: assume complete (they were calculated that way)
+      return true;
+    };
 
-    let trend = 'stable';
-    if (recentAvg > olderAvg + 5) trend = 'improving';
-    if (recentAvg < olderAvg - 5) trend = 'declining';
+    // ✅ ALIVE SCORE SUBMISSIONS — for stats cards (avg/peak/low)
+    // Only count submissions where alive score is valid
+    const completeSubmissions = rangeSubmissions.filter(s => isComplete(s));
 
+    // ✅ CHART DATA — show todayPillarScore per check (individual check performance)
+    // This is what makes the chart interesting — shows each check's score
+    const chartData = [...rangeSubmissions].reverse().map(s => ({
+      date: s.date,
+      todayPillarScore: s.todayPillarScore ?? s.score,
+      aliveScore: getAliveScore(s),
+      aliveScoreComplete: isComplete(s),
+      vibe: s.vibe,
+      emoji: s.emoji,
+      pillar: s.pillar || 'health'
+    }));
+
+    // ✅ STATS — from alive score history only (when complete)
+    let summary;
+    if (aliveScoreComplete && completeSubmissions.length > 0) {
+      const aliveScores = completeSubmissions.map(s => getAliveScore(s));
+      const avgScore = Math.round(aliveScores.reduce((a, b) => a + b, 0) / aliveScores.length);
+      const maxScore = Math.max(...aliveScores);
+      const minScore = Math.min(...aliveScores);
+
+      // Trend: compare recent half vs older half
+      const mid = Math.max(1, Math.floor(aliveScores.length / 2));
+      const recentAvg = aliveScores.slice(0, mid).reduce((a, b) => a + b, 0) / mid;
+      const olderAvg = aliveScores.slice(mid).reduce((a, b) => a + b, 0) / (aliveScores.length - mid);
+      let trend = 'stable';
+      if (recentAvg > olderAvg + 5) trend = 'improving';
+      if (recentAvg < olderAvg - 5) trend = 'declining';
+
+      summary = {
+        average: avgScore,
+        highest: maxScore,
+        lowest: minScore,
+        total: rangeSubmissions.length,         // total checks in range (all pillars)
+        aliveChecksCount: completeSubmissions.length, // checks where alive score was valid
+        trend,
+        basedOn: 'alive_score'                  // FE knows these are alive scores not pillar scores
+      };
+    } else {
+      // Not complete yet — show placeholder stats, FE will gate display
+      summary = {
+        average: null,
+        highest: null,
+        lowest: null,
+        total: rangeSubmissions.length,
+        aliveChecksCount: 0,
+        trend: 'stable',
+        basedOn: 'incomplete'
+      };
+    }
+
+    // ✅ PER PILLAR — average of todayPillarScore for that pillar's submissions
     const perPillar = {};
     for (const key of Object.keys(PILLARS)) {
       const pid = PILLARS[key].id;
-      const pillarSubs = submissions.filter(s => s.pillar === pid);
+      const pillarSubs = rangeSubmissions.filter(s => s.pillar === pid);
       if (pillarSubs.length > 0) {
-        const pScores = pillarSubs.map(s => s.pillarScores?.[pid] || s.score);
+        const pScores = pillarSubs.map(s => s.todayPillarScore ?? s.score);
         perPillar[pid] = {
           average: Math.round(pScores.reduce((a, b) => a + b, 0) / pScores.length),
           highest: Math.max(...pScores),
@@ -1869,38 +2161,53 @@ router.get('/analytics', requireDeviceId, async (req, res) => {
       }
     }
 
-    const chartData = [...submissions].reverse().map(s => ({
-      date: s.date,
-      score: s.score,
-      vibe: s.vibe,
-      emoji: s.emoji,
-      pillar: s.pillar || 'health'
-    }));
+    // ✅ CURRENT ALIVE SCORE — recalculated fresh from latest real data + decay
+    const latestSub = allSubmissions[0];
+    const {
+      aliveScore: currentAliveScore,
+      pillarScores: currentPillarScores,
+      breakdown: currentBreakdown,
+    } = calculateAliveScore(
+      latestSub?.pillar || 'health',
+      latestSub?.todayPillarScore ?? latestSub?.score ?? 55,
+      allSubmissions.slice(1)
+    );
 
     const analyticsData = {
-      summary: { average: avgScore, highest: maxScore, lowest: minScore, total: submissions.length, trend },
+      summary,
       perPillar,
       chartData,
       range: range || 'all',
       dateRange: {
-        from: submissions[submissions.length - 1].date,
-        to: submissions[0].date
+        from: rangeSubmissions[rangeSubmissions.length - 1]?.date,
+        to: rangeSubmissions[0]?.date
       }
     };
 
+    const aliveScoreMeta = {
+      aliveScoreComplete,
+      pillarsCheckedCount,
+      missingPillars: missingPillarNames,
+      currentAliveScore: aliveScoreComplete ? currentAliveScore : null,
+      currentPillarScores,
+      currentBreakdown,
+    };
+
     let aiSummary = null;
-    if (profile?.profileCompleted && submissions.length >= 3) {
-      aiSummary = await generateAnalyticsSummary(profile, analyticsData, submissions);
+    if (profile?.profileCompleted && rangeSubmissions.length >= 3) {
+      aiSummary = await generateAnalyticsSummary(profile, analyticsData, rangeSubmissions);
     }
 
     res.json({
       success: true,
       analytics: {
         ...analyticsData,
+        ...aliveScoreMeta,
         aiSummary
       },
       profile
     });
+
   } catch (error) {
     console.error('Get analytics error:', error);
     res.status(500).json({ success: false, error: 'Failed to get analytics' });
@@ -1982,6 +2289,399 @@ router.delete('/history', requireDeviceId, async (req, res) => {
   } catch (error) {
     console.error('Delete history error:', error);
     res.status(500).json({ success: false, error: 'Failed to delete history' });
+  }
+});
+
+// ============================================
+// ✅ NEW ROUTES - LEADERBOARD + CIRCLES
+// ============================================
+router.get('/leaderboard', async (req, res) => {
+  try {
+    const db = getDb();
+    const snapshot = await db.collection('aliveChecks').get();
+
+    if (snapshot.empty) {
+      return res.json({ success: true, leaderboard: [], total: 0 });
+    }
+
+    const leaderboard = [];
+
+    snapshot.forEach(doc => {
+      const data = doc.data();
+      const allSubmissions = data.submissions || [];
+
+      if (allSubmissions.length === 0) return;
+      if (!data.profile?.leaderboardConsent) return; // respect opt-out
+
+      // ✅ Check if this user has completed all 4 pillars ever
+      const checkedPillars = new Set(allSubmissions.map(s => s.pillar).filter(Boolean));
+      const allPillarIds = Object.values(PILLARS).map(p => p.id);
+      const hasAllPillars = allPillarIds.every(pid => checkedPillars.has(pid));
+
+      // ✅ ONLY show on leaderboard if all 4 pillars completed
+      // No penalties, no partial scores — clean rule
+      if (!hasAllPillars) return;
+
+      // ✅ Get their current alive score from most recent complete submission
+      // Backward compat: check aliveScore field first, fall back to score
+      const latestComplete = allSubmissions.find(s =>
+        s.aliveScoreComplete === true ||
+        (s.aliveScoreComplete === undefined && allPillarIds.every(pid => s.pillarScores?.[pid] != null))
+      );
+
+      if (!latestComplete) return;
+
+      const displayAliveScore = latestComplete.aliveScore ?? latestComplete.score;
+      if (displayAliveScore == null) return;
+
+      // ✅ Per pillar most recent scores for display
+      const pillarBests = {};
+      for (const pid of allPillarIds) {
+        const pillarSubs = allSubmissions.filter(
+          s => s.pillar === pid && (s.todayPillarScore ?? s.score) != null
+        );
+        pillarBests[pid] = pillarSubs.length > 0
+          ? (pillarSubs[0].todayPillarScore ?? pillarSubs[0].score)
+          : null;
+      }
+
+      leaderboard.push({
+        name: data.profile?.name || 'Anonymous',
+        aliveScore: displayAliveScore,  // ✅ SINGLE FIELD — no score/aliveScore confusion
+        vibe: latestComplete.vibe,
+        emoji: latestComplete.emoji,
+        lastUpdated: latestComplete.timestamp,
+        pillarBests,
+        aliveScoreComplete: true,       // guaranteed by filter above
+        pillarsCheckedCount: 4,
+      });
+    });
+
+    // ✅ Sort by aliveScore — clean, no bullshit penalties
+    leaderboard.sort((a, b) => b.aliveScore - a.aliveScore);
+
+    const top10 = leaderboard.slice(0, 10).map((entry, index) => ({
+      ...entry,
+      rank: index + 1,
+    }));
+
+    console.log(`🏆 Leaderboard: ${top10.length} complete users from ${leaderboard.length} eligible`);
+
+    res.json({
+      success: true,
+      leaderboard: top10,
+      total: top10.length,
+      totalEligible: leaderboard.length,
+      lastUpdated: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('Leaderboard error:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch leaderboard' });
+  }
+});
+
+// 👥 ADD TO CIRCLE (One-Way) - FINAL VERSION
+// 👥 ADD TO CIRCLE (One-Way) - PRODUCTION VERSION
+// 👥 ADD TO CIRCLE (One-Way) - PRODUCTION VERSION - FIXED
+router.post('/circles/add', requireDeviceId, async (req, res) => {
+  try {
+    const { deviceId } = req;
+    const { code, customName, relationshipType } = req.body;
+
+    // ============================================
+    // VALIDATION
+    // ============================================
+
+    if (!code || typeof code !== 'string' || !code.trim()) {
+      return res.status(400).json({
+        success: false,
+        error: 'Code is required'
+      });
+    }
+
+    const trimmedCode = code.trim().toUpperCase();
+
+    if (trimmedCode.length !== 6) {
+      return res.status(400).json({
+        success: false,
+        error: 'Code must be exactly 6 characters'
+      });
+    }
+
+    // Validate relationship type
+    const validTypes = Object.keys(RELATIONSHIP_TYPES).map(k => RELATIONSHIP_TYPES[k].id);
+    const finalType = relationshipType && validTypes.includes(relationshipType)
+      ? relationshipType
+      : 'other';
+
+    // ============================================
+    // GET MY DATA
+    // ============================================
+
+    const db = getDb();
+    const myDocRef = db.collection('aliveChecks').doc(deviceId);
+    const myDoc = await myDocRef.get();
+
+    if (!myDoc.exists || !myDoc.data().profile?.profileCompleted) {
+      return res.status(400).json({
+        success: false,
+        error: 'Profile not completed. Please complete your profile first.',
+        needsProfile: true
+      });
+    }
+
+    const myData = myDoc.data();
+    const myCircles = myData.circles || [];
+
+    // ============================================
+    // CHECK: CIRCLE SIZE LIMIT
+    // ============================================
+
+    if (myCircles.length >= MAX_CIRCLE_SIZE) {
+      return res.status(400).json({
+        success: false,
+        error: `Circle is full. Maximum ${MAX_CIRCLE_SIZE} friends allowed.`,
+        limit: MAX_CIRCLE_SIZE,
+        current: myCircles.length
+      });
+    }
+
+    // ============================================
+    // CHECK: ALREADY IN CIRCLE (by code)
+    // ============================================
+
+    if (myCircles.find(c => c.targetCode === trimmedCode)) {
+      return res.status(400).json({
+        success: false,
+        error: 'This friend is already in your circle'
+      });
+    }
+
+    // ============================================
+    // FIND TARGET USER BY CODE
+    // ============================================
+
+    const targetQuery = await db.collection('aliveChecks')
+      .where('profile.code', '==', trimmedCode)
+      .limit(1)
+      .get();
+
+    if (targetQuery.empty) {
+      return res.status(404).json({
+        success: false,
+        error: 'Code not found. Please check the code and try again.'
+      });
+    }
+
+    // ============================================
+    // EXTRACT TARGET DATA
+    // ============================================
+
+    const targetDoc = targetQuery.docs[0];
+    const targetDeviceId = targetDoc.id;
+    const targetData = targetDoc.data();
+
+    // Validate target has profile
+    if (!targetData.profile || !targetData.profile.name) {
+      return res.status(400).json({
+        success: false,
+        error: 'This user has not completed their profile yet.'
+      });
+    }
+
+    // ============================================
+    // CHECK: ALREADY IN CIRCLE (by deviceId - double safety)
+    // ============================================
+
+    if (myCircles.find(c => c.targetDeviceId === targetDeviceId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'This friend is already in your circle'
+      });
+    }
+
+    // ============================================
+    // GET LATEST SUBMISSION DATA
+    // ============================================
+
+    const latestSubmission = targetData.submissions?.[0];
+
+    // ============================================
+    // CREATE CONNECTION OBJECT
+    // ✅ FIX: Use Date.now() instead of serverTimestamp()
+    // ============================================
+
+    const now = Date.now(); // ✅ FIXED
+
+    const newConnection = {
+      id: `circle_${now}_${Math.random().toString(36).substr(2, 9)}`,
+      targetDeviceId,
+      targetCode: trimmedCode,
+      targetName: customName && customName.trim()
+        ? customName.trim()
+        : targetData.profile.name,
+      relationshipType: finalType,
+      relationshipEmoji: RELATIONSHIP_TYPES[finalType.toUpperCase()]?.emoji || '🤝',
+      addedAt: now, // ✅ FIXED - Use timestamp number
+      latestScore: latestSubmission?.score || null,
+      latestVibe: latestSubmission?.vibe || null,
+      latestPillarScores: latestSubmission?.pillarScores || null,
+      lastUpdated: latestSubmission?.timestamp || null
+    };
+
+    // ============================================
+    // SAVE TO FIRESTORE
+    // ✅ FIX: Update updatedAt separately
+    // ============================================
+
+    await myDocRef.update({
+      circles: admin.firestore.FieldValue.arrayUnion(newConnection),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp() // ✅ This is fine outside array
+    });
+
+    // ============================================
+    // RETURN SUCCESS
+    // ============================================
+
+    res.json({
+      success: true,
+      connection: newConnection,
+      message: `${newConnection.targetName} added to your circle!`
+    });
+
+  } catch (error) {
+    console.error('Add to circle error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to add friend. Please try again.'
+    });
+  }
+});
+
+// 👁️ GET MY CIRCLE
+// 👁️ GET MY CIRCLE - BULLETPROOF VERSION
+router.get('/circles/list', requireDeviceId, async (req, res) => {
+  try {
+    const { deviceId } = req;
+    const db = getDb();
+
+    const doc = await db.collection('aliveChecks').doc(deviceId).get();
+
+    if (!doc.exists) {
+      return res.json({ success: true, circles: [], total: 0, limit: MAX_CIRCLE_SIZE, remaining: MAX_CIRCLE_SIZE });
+    }
+
+    const data = doc.data();
+    const circles = data.circles || [];
+
+    const validCircles = circles.filter(c => {
+      return c.targetDeviceId && typeof c.targetDeviceId === 'string' && c.targetDeviceId.trim().length > 0;
+    });
+
+    const updatedCircles = await Promise.all(
+      validCircles.map(async (connection) => {
+        try {
+          const targetDoc = await db.collection('aliveChecks').doc(connection.targetDeviceId).get();
+
+          if (!targetDoc.exists) {
+            return { ...connection, status: 'user_not_found', latestAliveScore: null, latestVibe: null, latestPillarScores: null, lastUpdated: null, aliveScoreComplete: false };
+          }
+
+          const targetData = targetDoc.data();
+          const allSubs = targetData.submissions || [];
+          const latestSub = allSubs[0];
+
+          if (!latestSub) {
+            return { ...connection, status: 'no_checks', latestAliveScore: null, latestVibe: null, latestPillarScores: null, lastUpdated: null, aliveScoreComplete: false };
+          }
+
+          // ✅ ALWAYS use aliveScore field — backward compat fallback to score
+          const latestAliveScore = latestSub.aliveScore ?? latestSub.score ?? null;
+
+          // ✅ Check if this user has all 4 pillars completed
+          const checkedPillars = new Set(allSubs.map(s => s.pillar).filter(Boolean));
+          const allPillarIds = Object.values(PILLARS).map(p => p.id);
+          const aliveScoreComplete = allPillarIds.every(pid => checkedPillars.has(pid));
+
+          // ✅ Per pillar latest scores
+          const latestPillarScores = {};
+          for (const pid of allPillarIds) {
+            const pillarSubs = allSubs.filter(s => s.pillar === pid);
+            latestPillarScores[pid] = pillarSubs.length > 0
+              ? (pillarSubs[0].todayPillarScore ?? pillarSubs[0].score)
+              : null;
+          }
+
+          return {
+            ...connection,
+            latestAliveScore,           // ✅ renamed from latestScore — explicit
+            latestVibe: latestSub.vibe || null,
+            latestPillarScores,
+            lastUpdated: latestSub.timestamp || null,
+            targetProfileName: targetData.profile?.name || connection.targetName,
+            aliveScoreComplete,
+            status: 'active'
+          };
+        } catch (error) {
+          console.error(`Error fetching circle member:`, error);
+          return { ...connection, status: 'error', latestAliveScore: null, aliveScoreComplete: false };
+        }
+      })
+    );
+
+    res.json({
+      success: true,
+      circles: updatedCircles,
+      total: updatedCircles.length,
+      limit: MAX_CIRCLE_SIZE,
+      remaining: Math.max(0, MAX_CIRCLE_SIZE - updatedCircles.length)
+    });
+
+  } catch (error) {
+    console.error('Get circle error:', error);
+    res.status(500).json({ success: false, error: 'Failed to get circle' });
+  }
+});
+
+// 🗑️ REMOVE FROM CIRCLE
+router.delete('/circles/:connectionId', requireDeviceId, async (req, res) => {
+  try {
+    const { deviceId } = req;
+    const { connectionId } = req.params;
+
+    const db = getDb();
+    const docRef = db.collection('aliveChecks').doc(deviceId);
+    const doc = await docRef.get();
+
+    if (!doc.exists) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    const data = doc.data();
+    const circles = data.circles || [];
+
+    const connectionToRemove = circles.find(c => c.id === connectionId);
+
+    if (!connectionToRemove) {
+      return res.status(404).json({ success: false, error: 'Connection not found' });
+    }
+
+    await docRef.update({
+      circles: admin.firestore.FieldValue.arrayRemove(connectionToRemove),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    console.log(`🗑️ ${data.profile.name} removed ${connectionToRemove.targetName} from circle`);
+
+    res.json({
+      success: true,
+      message: `${connectionToRemove.targetName} removed from your circle`
+    });
+
+  } catch (error) {
+    console.error('Remove from circle error:', error);
+    res.status(500).json({ success: false, error: 'Failed to remove from circle' });
   }
 });
 

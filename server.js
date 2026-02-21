@@ -47,7 +47,6 @@ app.use(express.json());
 
 app.use('/api/alive-check', aliveCheckRoutes);
 
-
 // ============================================
 // CONSTANTS
 // ============================================
@@ -59,14 +58,55 @@ const MAX_CHECK_IN_FREQUENCY = 30;
 // HELPER FUNCTIONS
 // ============================================
 
-// Generate 6-character code
+// ✅ UNIFIED: Generate 6-character code (same as aliveCheck)
 const generateCode = () => {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // No confusing chars
   let code = '';
   for (let i = 0; i < 6; i++) {
     code += chars[Math.floor(Math.random() * chars.length)];
   }
   return code;
+};
+
+// ✅ UNIFIED: Ensure code exists across BOTH collections
+const ensureCodeExists = async (deviceId) => {
+  try {
+    // Check users collection first
+    const userDoc = await db.collection('users').doc(deviceId).get();
+    if (userDoc.exists && userDoc.data().code) {
+      return userDoc.data().code;
+    }
+
+    // Check aliveChecks collection
+    const aliveCheckDoc = await db.collection('aliveChecks').doc(deviceId).get();
+    if (aliveCheckDoc.exists && aliveCheckDoc.data().profile?.code) {
+      return aliveCheckDoc.data().profile.code;
+    }
+
+    // Generate new code
+    let code = generateCode();
+    let attempts = 0;
+
+    // Ensure uniqueness across BOTH collections
+    while (attempts < 10) {
+      const [usersQuery, aliveQuery] = await Promise.all([
+        db.collection('users').where('code', '==', code).limit(1).get(),
+        db.collection('aliveChecks').where('profile.code', '==', code).limit(1).get()
+      ]);
+
+      if (usersQuery.empty && aliveQuery.empty) {
+        break;
+      }
+
+      code = generateCode();
+      attempts++;
+    }
+
+    return code;
+  } catch (error) {
+    console.error('Code generation error:', error);
+    return generateCode(); // Fallback
+  }
 };
 
 // Get existing user or create new one
@@ -87,10 +127,24 @@ const getUserByDeviceId = async (deviceId) => {
       };
     }
 
+    // ✅ NEW: Auto-generate code when creating user
+    const code = await ensureCodeExists(deviceId);
+
+    // ✅ ALSO sync to aliveChecks if profile exists
+    const aliveCheckRef = db.collection('aliveChecks').doc(deviceId);
+    const aliveCheckDoc = await aliveCheckRef.get();
+    if (aliveCheckDoc.exists && aliveCheckDoc.data().profile && !aliveCheckDoc.data().profile.code) {
+      await aliveCheckRef.update({
+        'profile.code': code,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+      console.log(`✅ Code synced to aliveChecks: ${deviceId} → ${code}`);
+    }
+
     const userData = {
       deviceId,
       displayName: 'User',
-      code: null,
+      code, // ✅ Auto-generated!
       squadMembers: [],
       checkInFrequency: 1,
       streak: 0,
@@ -102,7 +156,7 @@ const getUserByDeviceId = async (deviceId) => {
     };
 
     await userRef.set(userData);
-    console.log('New user created:', deviceId);
+    console.log('New user created with code:', deviceId, '→', code);
 
     return {
       success: true,
@@ -113,7 +167,7 @@ const getUserByDeviceId = async (deviceId) => {
     console.error('Error in getUserByDeviceId:', error);
     return { success: false, error: error.message };
   }
-};
+};;
 
 // ✅ PRODUCTION MODE - 1 day = 24 hours
 const getCheckInIntervalMs = (frequency) => {
@@ -525,7 +579,7 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
-    version: '2.1.0',
+    version: '3.0.0', // ✅ Bumped for unified code
     features: {
       emailAlerts: true,
       cronJob: true,
@@ -534,6 +588,8 @@ app.get('/health', (req, res) => {
       firebaseFromEnv: true,
       totalCheckIns: true,
       streakTracking: true,
+      unifiedCode: true, // ✅ NEW
+      aliveCheckIntegration: true, // ✅ NEW
     }
   });
 });
@@ -724,6 +780,7 @@ app.post('/api/users/checkin-frequency', getDeviceId, async (req, res) => {
   }
 });
 
+// ✅ UNIFIED: Generate code and sync to BOTH collections
 app.post('/api/users/generate-code', getDeviceId, async (req, res) => {
   try {
     const userRef = db.collection('users').doc(req.deviceId);
@@ -733,6 +790,7 @@ app.post('/api/users/generate-code', getDeviceId, async (req, res) => {
       return res.status(404).json({ success: false, error: 'User not found' });
     }
 
+    // Check if code already exists
     if (userDoc.data().code) {
       return res.json({
         success: true,
@@ -741,34 +799,26 @@ app.post('/api/users/generate-code', getDeviceId, async (req, res) => {
       });
     }
 
-    let code = generateCode();
-    let attempts = 0;
+    // ✅ Generate unified code
+    const code = await ensureCodeExists(req.deviceId);
 
-    while (attempts < 10) {
-      const existingCode = await db
-        .collection('users')
-        .where('code', '==', code)
-        .get();
-
-      if (existingCode.empty) {
-        break;
-      }
-
-      code = generateCode();
-      attempts++;
-    }
-
-    if (attempts >= 10) {
-      return res.status(500).json({
-        success: false,
-        error: 'Failed to generate unique code. Please try again.'
-      });
-    }
-
+    // ✅ Save to users collection
     await userRef.update({
       code,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
+
+    // ✅ Sync to aliveChecks collection if profile exists
+    const aliveCheckRef = db.collection('aliveChecks').doc(req.deviceId);
+    const aliveCheckDoc = await aliveCheckRef.get();
+
+    if (aliveCheckDoc.exists && aliveCheckDoc.data().profile) {
+      await aliveCheckRef.update({
+        'profile.code': code,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      console.log(`✅ Code synced to aliveChecks: ${req.deviceId} → ${code}`);
+    }
 
     console.log('Code generated:', req.deviceId, '→', code);
 
@@ -902,7 +952,7 @@ app.post('/api/users/checkin/status', getDeviceId, async (req, res) => {
 });
 
 // ============================================
-// SQUAD ROUTES
+// SQUAD ROUTES (UNCHANGED) ✅
 // ============================================
 
 app.post('/api/squad/add-member', getDeviceId, async (req, res) => {
@@ -1031,7 +1081,7 @@ app.post('/api/squad/members/:id/remove', getDeviceId, async (req, res) => {
 });
 
 // ============================================
-// WATCHING ROUTES
+// WATCHING ROUTES (UNCHANGED - Daily Check-ins Only) ✅
 // ============================================
 
 app.post('/api/watching/add', async (req, res) => {
@@ -1055,6 +1105,7 @@ app.post('/api/watching/add', async (req, res) => {
       });
     }
 
+    // ✅ Search ONLY in users collection (Still Alive daily check-ins)
     const targetSnapshot = await db
       .collection('users')
       .where('code', '==', codeUpper)
@@ -1110,7 +1161,7 @@ app.post('/api/watching/add', async (req, res) => {
       }
     });
 
-    console.log('Watching added:', deviceId, '→', codeUpper);
+    console.log('Watching added (Daily Check-in):', deviceId, '→', codeUpper);
 
     res.json({
       success: true,
@@ -1192,7 +1243,7 @@ app.get('/api/watching/list', async (req, res) => {
       });
     }
 
-    console.log(`Watching list fetched (${deviceId}): ${watching.length} people`);
+    console.log(`Watching list fetched (Daily Check-in) (${deviceId}): ${watching.length} people`);
 
     res.json({
       success: true,
@@ -1248,7 +1299,7 @@ app.delete('/api/watching/:id', async (req, res) => {
       }
     });
 
-    console.log('Stopped watching:', id);
+    console.log('Stopped watching (Daily Check-in):', id);
 
     res.json({
       success: true,
@@ -1266,7 +1317,7 @@ app.delete('/api/watching/:id', async (req, res) => {
 });
 
 // ============================================
-// ACCOUNT MANAGEMENT
+// ACCOUNT MANAGEMENT (UNCHANGED) ✅
 // ============================================
 
 app.post('/api/account/delete', getDeviceId, async (req, res) => {
@@ -1366,7 +1417,6 @@ app.use((err, req, res, next) => {
   });
 });
 
-
 // ============================================
 // START SERVER
 // ============================================
@@ -1380,7 +1430,9 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`⏰ Cron schedule:   ✅ Every 1 hour (at :00)`);
   console.log(`⚡ Check-in:        ✅ PRODUCTION (24h per day)`);
   console.log(`🔐 Auth:            ✅ Device ID only`);
-  console.log(`👁️  Watching:       ✅ UNLIMITED`);
+  console.log(`👁️  Watching:       ✅ Daily Check-ins Only`);
+  console.log(`🏆 Alive Score:     ✅ Managed in /api/alive-check`);
+  console.log(`🔑 Unified Code:    ✅ Syncs across both systems`);
   console.log(`📊 Tracking:        ✅ Streak + Total Check-ins`);
   console.log(`⚡ Performance:     ✅ OPTIMIZED`);
   console.log(`\n${'='.repeat(60)}`);
