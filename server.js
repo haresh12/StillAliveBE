@@ -5,6 +5,7 @@ const admin = require('firebase-admin');
 const { Resend } = require('resend');
 const cron = require('node-cron');
 const aliveCheckRoutes = require('./aliveCheck');
+const referralRoutes = require('./referrals');
 
 // ============================================
 // FIREBASE INITIALIZATION FROM ENV
@@ -45,6 +46,7 @@ const PORT = process.env.PORT || 5001;
 app.use(cors());
 app.use(express.json());
 
+app.use('/api/referrals', referralRoutes);
 app.use('/api/alive-check', aliveCheckRoutes);
 
 // ============================================
