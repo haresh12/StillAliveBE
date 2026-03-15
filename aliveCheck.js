@@ -233,6 +233,230 @@ const QUESTION_TOPICS = {
 };
 
 // ============================================
+// 📚 90-DAY SESSION JOURNEY — Progressive arc, session by session
+// Each entry defines WHAT THIS SESSION IS FOR, not just what topics to cover.
+// The AI uses this arc + past session summaries to generate fully fresh questions every time.
+// Age group and gender are injected into the prompt at generation time.
+// ============================================
+const SESSION_JOURNEY = {
+  health: [
+    {
+      range: [1, 1], phase: 'First Look',
+      arc: 'Very first health session. Wide-lens baseline — sleep, energy, stress, movement, nutrition, mood, body comfort. Keep it welcoming but get a real picture. Make them feel seen from question 1.',
+      themes: ['sleep quality & duration', 'energy levels today', 'stress & anxiety state', 'physical activity', 'nutrition quality', 'hydration', 'mood & mental state', 'overall body comfort & tension'],
+      q9: 'Ask what one thing about their health they wish someone would actually ask about — that nobody ever does.',
+    },
+    {
+      range: [2, 2], phase: 'Root Causes',
+      arc: 'Session 2. They gave you a baseline. Now go one level deeper into WHY. If sleep was poor last time, what disrupts it? If energy is low, when does it crash? Move from surface status to underlying causes.',
+      themes: ['sleep disruption patterns', 'energy drain triggers & peaks', 'stress sources (work/relationships/life)', 'exercise barriers & motivation', 'emotional eating patterns', 'afternoon slump reality', 'mental chatter & overthinking', 'specific body tension locations'],
+      q9: 'Ask when they last felt genuinely good in their body and what was different about that time.',
+    },
+    {
+      range: [3, 3], phase: 'Habits & Routines',
+      arc: 'Session 3. Explore the habits and routines behind their health. Morning routine, sleep consistency, exercise regularity, meal planning, screen time. What keeps falling apart despite good intentions?',
+      themes: ['morning routine quality', 'sleep schedule consistency', 'exercise habit vs intention gap', 'meal timing & planning reality', 'screen time before bed', 'caffeine & alcohol impact', 'stress-release techniques used', 'recovery habits between efforts'],
+      q9: 'Ask what one health habit they keep starting and failing at — and what gets in the way every single time.',
+    },
+    {
+      range: [4, 5], phase: 'Mind-Body',
+      arc: 'Sessions 4-5. The mind-body connection. Stress manifesting physically, emotions affecting health, anxiety patterns, mental health as physical health. Deeper territory — they\'re comfortable enough now.',
+      themes: ['anxiety & worry levels now', 'physical stress manifestations (tension/headaches/gut)', 'emotional vs physical energy', 'sleep quality vs sleep quantity distinction', 'body image relationship', 'chronic tension patterns', 'mental recovery & stillness', 'breath quality & nervous system regulation'],
+      q9: 'Ask how stress shows up in their body and whether they actually know how to release it when it hits.',
+    },
+    {
+      range: [6, 8], phase: 'Weekly Patterns',
+      arc: 'Sessions 6-8. Look for weekly cycles. When are they at their best? When do things fall apart? Work week vs weekend patterns. Recurring situations that wreck or support their health.',
+      themes: ['weekday vs weekend energy differences', 'social energy impact on health', 'work schedule physical effects', 'weekend recovery quality', 'consistent weekly health wins', 'consistent weekly health failures', 'circadian rhythm & natural sleep timing', 'environmental health triggers'],
+      q9: 'Ask which day of the week they feel worst and best — and whether they understand why.',
+    },
+    {
+      range: [9, 12], phase: 'Body Systems',
+      arc: 'Sessions 9-12. Deep dive into body systems. Immune function, digestion, hormonal patterns, chronic issues, recovery capacity. Questions should feel like a knowledgeable friend who remembers everything they\'ve said.',
+      themes: ['immune function & illness frequency', 'digestive health & gut signals', 'hormonal or cycle-related patterns', 'chronic pain or recurring discomfort', 'physical tension & posture patterns', 'breathing quality awareness', 'recovery speed after illness or exertion', 'body signals being ignored'],
+      q9: 'Ask what their body is trying to tell them that they keep ignoring.',
+    },
+    {
+      range: [13, 20], phase: 'Health Identity',
+      arc: 'Sessions 13-20. Identity-level questions. Are they becoming a healthy person or just doing healthy things occasionally? How they relate to health when life gets busy. The gap between who they are vs who they want to be physically.',
+      themes: ['health as identity vs occasional habit', 'health priority rank when life gets busy', 'prevention vs reaction relationship with health', 'medical care & doctor relationship', 'body acceptance vs body improvement tension', 'health knowledge & curiosity', 'health in social & peer contexts', 'health role models in their life'],
+      q9: 'Ask whether they genuinely see themselves as a healthy person — and what that actually means to them at this point.',
+    },
+    {
+      range: [21, 35], phase: 'Optimization',
+      arc: 'Sessions 21-35. We know them well now. Fine-tuning. What does their best health ever look like? What conditions created it? What specific habits separate their best periods from worst?',
+      themes: ['personal peak performance conditions', 'optimal sleep amount for their specific body', 'their specific stress triggers vs remedies', 'nutrition that energizes vs drains them specifically', 'exercise type that fits their body best', 'longevity habits worth starting now', 'health metric tracking usefulness', 'what thriving health means personally — not generically'],
+      q9: 'Ask what they would change about their daily health habits if they had 30 extra minutes every single day.',
+    },
+    {
+      range: [36, 90], phase: 'Mastery',
+      arc: 'Sessions 36-90. Long game thinking. Somatic awareness, advanced recovery, longevity investment, health as lifelong identity. Reference what you know about them from their history. Challenge them to think at a deeper level than before.',
+      themes: ['somatic awareness & body intelligence', 'longevity investment for future self', 'health in 10-year horizon', 'advanced recovery & resilience practices', 'mental performance & physical connection', 'health as competitive advantage in life', 'modelling health for people around them', 'health legacy & what they\'re building'],
+      q9: 'Ask what their health will look like in 10 years if they continue exactly as they are — and whether they\'re happy with that answer.',
+    },
+  ],
+
+  wealth: [
+    {
+      range: [1, 1], phase: 'First Look',
+      arc: 'First wealth session. How do they feel about money — anxious, confident, stuck? Income situation, financial control, spending awareness. Don\'t ask about specific numbers — ask about feelings, control, confidence.',
+      themes: ['financial confidence vs anxiety level', 'income satisfaction right now', 'spending awareness & control sense', 'financial security feeling', 'primary money stress source', 'career/work satisfaction today', 'savings habit existence', 'financial future optimism'],
+      q9: 'Ask what their biggest financial worry is — and how often they actually think about it.',
+    },
+    {
+      range: [2, 2], phase: 'Money Roots',
+      arc: 'Session 2. The WHY behind their financial state. Money beliefs, relationship with earning/spending/saving, patterns they\'re aware of. From status to story.',
+      themes: ['money mindset & inherited beliefs', 'spending triggers (emotional vs habitual)', 'earning comfort & ceiling sense', 'salary negotiation history & comfort', 'financial risk tolerance', 'debt relationship & emotional weight', 'financial comparison to peers', 'money conversations comfort level'],
+      q9: 'Ask what money means to them beyond bills — what would actually change if they had significantly more of it.',
+    },
+    {
+      range: [3, 3], phase: 'Income & Career',
+      arc: 'Session 3. Career trajectory and income growth. Growing, stagnant, or stuck? Do they see a path forward? Exploring the common tension between career satisfaction and financial dissatisfaction.',
+      themes: ['career growth trajectory clarity', 'income growth in last 12 months', 'professional skill development pace', 'job security feeling right now', 'career pivot or switch consideration', 'salary vs market awareness', 'side income or entrepreneurship thinking', 'work-life balance financial impact'],
+      q9: 'Ask where they want to be financially in 3 years — and what\'s actually standing between them and that.',
+    },
+    {
+      range: [4, 5], phase: 'Financial Habits',
+      arc: 'Sessions 4-5. Habits and systems. Do they track expenses? Save automatically? Have a plan or wing it? Impulse spending, subscription drain, the difference between people who get ahead financially is habits.',
+      themes: ['expense tracking habit reality', 'automatic savings existence', 'financial planning quality vs hoping', 'impulse purchase frequency & triggers', 'subscription & recurring cost awareness', 'emergency fund status', 'investment action if any', 'financial goal clarity & specificity'],
+      q9: 'Ask if they know exactly where their money goes each month — and what they\'d see if they looked honestly.',
+    },
+    {
+      range: [6, 8], phase: 'Wealth Building',
+      arc: 'Sessions 6-8. Building wealth, not just managing money. Savings rate, investments, passive income concepts, financial independence awareness. Are they thinking this month or this decade?',
+      themes: ['savings rate awareness & satisfaction', 'investment knowledge & actual action', 'financial independence concept (know it? want it?)', 'passive income ideas or reality', 'net worth awareness & tracking', 'debt paydown strategy if applicable', 'insurance & financial protection', 'financial education investment'],
+      q9: 'Ask if they feel like they\'re getting ahead or just keeping up — and what would have to change to actually accelerate.',
+    },
+    {
+      range: [9, 12], phase: 'Career Strategy',
+      arc: 'Sessions 9-12. Career as wealth engine. Strategic moves, skill investments, professional network, reputation. The difference between a 3% annual raise and 30% income growth is strategy.',
+      themes: ['career intentionality vs just showing up', 'professional network strength & investment', 'skill development for future income value', 'industry reputation & personal brand', 'mentorship (receiving or giving)', 'leadership development investment', 'differentiation in field or role', 'strategic job moves vs loyalty tradeoffs'],
+      q9: 'Ask what their biggest career regret is so far — and what they\'d do differently if they could.',
+    },
+    {
+      range: [13, 25], phase: 'Financial Freedom',
+      arc: 'Sessions 13-25. What does financial freedom actually mean to them specifically? Not generic millions — their version. Money as identity. Are they becoming a wealthy person or hoping to get lucky?',
+      themes: ['financial freedom personal definition', 'money as tool for specific life vision', 'time-money tradeoff awareness & choices', 'lifestyle design & cost clarity', 'wealth accumulation pace satisfaction', 'financial role models & their lessons', 'generosity & giving capacity', 'financial success definition evolving or fixed'],
+      q9: 'Ask what they\'d do with their time if money were no longer a constraint — and whether anything would actually change.',
+    },
+    {
+      range: [26, 90], phase: 'Mastery & Legacy',
+      arc: 'Sessions 26-90. Advanced wealth thinking. Legacy, impact, business ownership, multi-generational thinking. What is the wealth FOR? They\'ve done enough sessions to reveal their real financial patterns. Go deep.',
+      themes: ['wealth as legacy building intention', 'impact investing or giving capacity', 'business ownership or entrepreneurship path', 'wealth & identity (who they\'re becoming)', 'financial wisdom to pass forward', 'money & true freedom relationship', 'philanthropy or community investment', 'wealth & values alignment check'],
+      q9: 'Ask what financial legacy they want to leave — and whether their current actions are actually building that.',
+    },
+  ],
+
+  love: [
+    {
+      range: [1, 1], phase: 'First Look',
+      arc: 'First love session. Full picture of connection in their life right now. Romantic, family, friendships. Where do they feel most supported? Where do they feel most alone? Don\'t assume relationship status — keep questions inclusive.',
+      themes: ['current close relationship quality', 'feeling of being supported', 'social engagement level this week', 'loneliness vs connection feeling', 'family bond quality', 'close friendship depth', 'emotional support access', 'feeling valued by at least one person'],
+      q9: 'Ask who in their life makes them feel most understood — and what makes that person different from others.',
+    },
+    {
+      range: [2, 2], phase: 'Depth & Knowing',
+      arc: 'Session 2. Depth of connections. Are relationships surface-level or genuinely deep? Can they be vulnerable? Do they feel truly known? Quality of connection, not quantity of people.',
+      themes: ['ability to be fully vulnerable', 'feeling truly known by someone', 'depth vs breadth of current friendships', 'emotional safety in closest relationships', 'ability to actually ask for help', 'conflict comfort & avoidance', 'authentic expression vs performance in relationships', 'fear of rejection or judgment'],
+      q9: 'Ask whether they have someone they can tell absolutely anything to — and if not, what that costs them.',
+    },
+    {
+      range: [3, 3], phase: 'Relationship Patterns',
+      arc: 'Session 3. Patterns in how they connect and disconnect. Do they pull away when stressed? Over-give? Struggle to receive? What keeps showing up in their relationships regardless of who the person is?',
+      themes: ['stress response in relationships (withdraw vs cling)', 'over-giving vs under-giving tendency', 'ability to receive care without discomfort', 'communication under pressure quality', 'conflict resolution approach', 'trust development speed', 'past relationship impact on present behavior', 'relationship energy balance (who gives more?)'],
+      q9: 'Ask what pattern keeps showing up in their relationships that they wish they could change — and whether they\'ve tried.',
+    },
+    {
+      range: [4, 5], phase: 'Active Investment',
+      arc: 'Sessions 4-5. Are they actively investing in relationships or just maintaining? Intentional time, appreciation expressed, showing up. The best relationships are built, not found.',
+      themes: ['intentional time with loved ones this week', 'appreciation expressed recently (to whom?)', 'new meaningful conversations had', 'social initiative taking vs waiting', 'showing up for others when needed', 'relationship maintenance habits', 'romantic investment quality if applicable', 'friendship deepening vs broadening effort'],
+      q9: 'Ask when they last did something intentional to deepen a relationship — and what stopped them from doing it more.',
+    },
+    {
+      range: [6, 10], phase: 'Intimacy & Trust',
+      arc: 'Sessions 6-10. Intimacy territory. Emotional and physical intimacy. Trust. Being completely known and still feeling safe. Deeper relational healing or growth questions.',
+      themes: ['emotional intimacy depth in closest relationships', 'physical affection comfort & presence', 'trust level and how it was built or broken', 'ability to forgive and move forward', 'past wounds active impact on present relationships', 'romantic or partnership satisfaction if applicable', 'security in closest attachment', 'ability to be weak in front of someone'],
+      q9: 'Ask what scares them most about letting someone fully in — and whether that fear is protecting or limiting them.',
+    },
+    {
+      range: [11, 25], phase: 'Relationship Identity',
+      arc: 'Sessions 11-25. Who are they in their relationships? What kind of partner, friend, family member are they honestly versus who they want to be? The gap between desired and actual relational self.',
+      themes: ['how they show up vs how they want to show up', 'type of friend/partner/family they actually are', 'relationship growth since 5 years ago', 'love language awareness & expression', 'emotional intelligence in real moments', 'relationship repair & apology quality', 'relationship standards (settling vs realistic)', 'relationships as mirror of inner self'],
+      q9: 'Ask what the people closest to them would honestly say is their biggest blindspot as a partner, friend, or family member.',
+    },
+    {
+      range: [26, 90], phase: 'Love as Legacy',
+      arc: 'Sessions 26-90. What kind of relationships in 10 years? Relational legacy. Community, mentorship, deep lasting bonds. Love as a daily practice and choice.',
+      themes: ['long-term relationship vision clarity', 'community belonging & investment', 'mentorship & intergenerational connection', 'romantic partnership long game if applicable', 'family legacy creation', 'unconditional love as practiced skill', 'social contribution & generosity', 'love & spiritual practice intersection'],
+      q9: 'Ask what love means to them now versus what it meant 5 years ago — and what changed them.',
+    },
+  ],
+
+  purpose: [
+    {
+      range: [1, 1], phase: 'First Look',
+      arc: 'First purpose session. Do they feel like life has direction? What drives them? Where do they feel most alive? Wide lens — capture current sense of meaning, direction, fulfillment, growth. Meet them exactly where they are.',
+      themes: ['sense of life meaning right now', 'direction & life clarity level', 'values alignment today', 'motivation level & its source', 'personal growth feeling', 'contribution & impact sense', 'daily fulfillment', 'future optimism'],
+      q9: 'Ask what they would do with their life if they weren\'t afraid of anything — and whether they\'re doing any of it.',
+    },
+    {
+      range: [2, 2], phase: 'What Actually Matters',
+      arc: 'Session 2. Values and authentic priorities. Not what should matter or sounds good — what genuinely drives them. What would they regret not doing? What lights them up vs drains them?',
+      themes: ['top 3 real values in life', 'flow state activities & frequency', 'what they\'d regret not doing on deathbed', 'energy drains (purpose-blocking things)', 'energy sources (purpose-aligned things)', 'work meaning vs income necessity', 'who they\'re becoming vs who they currently are', 'comparison to others\' life paths'],
+      q9: 'Ask what they would do differently if they knew they had exactly 5 years left to live.',
+    },
+    {
+      range: [3, 3], phase: 'Direction & Goals',
+      arc: 'Session 3. Where are they going — do they actually know? Goals, gap between now and desired, plan vs hope. Is the distance to where they want to be growing or shrinking?',
+      themes: ['1-3 year goal clarity', 'gap between current and desired life (shrinking or growing?)', 'plan vs hope distinction', 'skill development toward actual goals', 'progress measurement habit', 'obstacles to clarity or direction', 'daily decisions alignment with stated goals', 'next concrete step they know but haven\'t taken'],
+      q9: 'Ask what they want their life to look like in 3 years — and what\'s genuinely standing between them and that person.',
+    },
+    {
+      range: [4, 5], phase: 'Action & Execution',
+      arc: 'Sessions 4-5. Purpose without action is fantasy. How much are they actually doing toward what matters? Procrastination, execution gaps, fear-driven avoidance. Are they moving or waiting?',
+      themes: ['procrastination triggers & patterns', 'action vs planning ratio', 'fear-driven vs strategic waiting distinction', 'progress this week on what actually matters', 'accountability structure (self or external)', 'momentum vs standstill feeling', 'resource allocation toward goals', '"I want to" vs "I do" gap'],
+      q9: 'Ask what they keep meaning to start — and what excuse they give themselves every time they don\'t.',
+    },
+    {
+      range: [6, 10], phase: 'Purpose & Work',
+      arc: 'Sessions 6-10. Purpose and work intersection. Is work aligned with purpose or separate? Do they need work to be purposeful? Relationship between career, calling, and meaning.',
+      themes: ['work as purpose vs income tool distinction', 'calling vs career clarity', 'meaning sources outside of work', 'creative expression outlet existence', 'professional contribution sense', 'learning & mastery motivation', 'ikigai intersection (love+good at+paid for+world needs)', 'work-purpose integration possibility & cost'],
+      q9: 'Ask whether they feel like their work matters — and if not, where they find meaning instead.',
+    },
+    {
+      range: [11, 20], phase: 'Identity & Becoming',
+      arc: 'Sessions 11-20. Purpose at identity level. Who are they becoming? Is daily life shaping them into the person they want to be? Character, growth, integrity, authenticity.',
+      themes: ['identity evolution direction', 'character traits actively being developed', 'authenticity vs performance in daily life', 'growth edge (what\'s expanding right now)', 'integrity (actions matching values) daily check', 'role models & mentors impact', 'legacy consciousness developing', 'spiritual or philosophical grounding'],
+      q9: 'Ask who they\'re becoming through how they live — and whether they genuinely like that person.',
+    },
+    {
+      range: [21, 40], phase: 'Impact & Legacy',
+      arc: 'Sessions 21-40. Impact beyond self. Who do they want to affect? What change? How does personal purpose connect to something larger? Purpose scaling from individual to meaningful contribution.',
+      themes: ['impact beyond immediate circle intention', 'unique contribution they\'re uniquely positioned to make', 'systemic or community change interest', 'teaching or mentoring others', 'creative legacy being built', 'cause alignment & social change', 'platform, influence, or voice development', 'life as a meaningful narrative they\'re writing'],
+      q9: 'Ask what the world would lose if they never fully became who they\'re capable of being.',
+    },
+    {
+      range: [41, 90], phase: 'Mastery & Transcendence',
+      arc: 'Sessions 41-90. The deepest questions. Life satisfaction as a whole. Meaning found in difficulty. Wisdom from experience. They\'ve been on this long enough to handle real depth. Go there.',
+      themes: ['life satisfaction as an integrated whole', 'meaning found in difficulty & suffering', 'gratitude depth & active practice', 'wisdom accumulated from experience', 'purpose beyond ego & self', 'spiritual or philosophical evolution', 'death awareness & legacy clarity', 'integration of all life areas into cohesive identity'],
+      q9: 'Ask what their life has taught them about what actually matters — and whether they\'re living that truth now.',
+    },
+  ],
+};
+
+function getSessionPhase(pillar, sessionN) {
+  const journey = SESSION_JOURNEY[pillar] || [];
+  for (const phase of journey) {
+    if (sessionN >= phase.range[0] && sessionN <= phase.range[1]) return phase;
+  }
+  return journey[journey.length - 1] || {
+    phase: 'Mastery', arc: 'Deep exploration of this pillar.',
+    themes: QUESTION_TOPICS[pillar]?.slice(0, 8) || [],
+    q9: 'What matters most to you in this area of your life right now?',
+  };
+}
+
+// ============================================
 // 🎨 GEN Z VIRAL QUOTE TEMPLATES (diversity seeds)
 // ============================================
 
@@ -457,7 +681,8 @@ async function aiScorePillar(profile, pillar, questions, answers, submissions) {
   const qaFormatted = questions.map((q, i) => {
     const raw = answers[i]?.answer !== undefined ? answers[i].answer : answers[i];
     const answerValue = typeof raw === 'object' && raw !== null ? (raw.answer ?? JSON.stringify(raw)) : raw;
-    return `  Q${i + 1}: ${q.text}\n  A${i + 1}: ${answerValue}`;
+    const isText = q.type === 'text';
+    return `  Q${i + 1}${isText ? ' [REFLECTION — weight heavily]' : ''}: ${q.text}\n  A${i + 1}: ${answerValue}`;
   }).join('\n\n');
 
   const prevSamePillar = submissions
@@ -499,8 +724,10 @@ ${scoringApproachInstructions[scoringStyle]}
 ═══════════════════════════════════════════
 
 ═══════════════════════════════════════════
-📝 TODAY'S ANSWERS (${pillarMeta?.emoji} ${rubric.name}) — 8 DEEP QUESTIONS:
+📝 TODAY'S ANSWERS (${pillarMeta?.emoji} ${rubric.name}):
 ${qaFormatted}
+
+⭐ NOTE: Any answer marked [REFLECTION] is a free-text response — treat it as the highest-signal data point. Weight it heavily in your scoring.
 ═══════════════════════════════════════════
 
 ═══════════════════════════════════════════
@@ -538,14 +765,14 @@ ${rubric.context_rules.map(r => `  • ${r}`).join('\n')}
 
 🎯 YOUR SCORING PROCESS (take your time):
 
-STEP 1: Read ALL 8 answers carefully. Notice specifics, not just numbers.
+STEP 1: Read ALL answers carefully. If there's a free-text [REFLECTION] answer, read it first — it's the most revealing.
 STEP 2: Identify the STRONGEST positive signal (what's working best?)
 STEP 3: Identify the BIGGEST red flag (what's most concerning?)
 STEP 4: Apply context rules — do any override your initial assessment?
 STEP 5: Compare to their history — is this a pattern or an anomaly?
 STEP 6: Match to the rubric bands — where do they truly fit?
 STEP 7: Assign ONE honest score (0-100) that captures their current state
-STEP 8: Write a UNIQUE justification that references SPECIFIC answers (avoid phrases you've used before)
+STEP 8: Write a UNIQUE justification that references SPECIFIC answers — especially the reflection if given (avoid phrases you've used before)
 
 CRITICAL RULES FOR VARIETY:
 - Use DIFFERENT reasoning each time — vary your analytical lens
@@ -556,18 +783,18 @@ CRITICAL RULES FOR VARIETY:
 Respond ONLY with valid JSON:
 {
   "score": <number 0-100>,
-  "justification": "<1 unique sentence in ${getLanguageName(userLanguage)}, max 25 words, reference SPECIFIC answer with fresh perspective>"
+  "justification": "<2-3 sentences in ${getLanguageName(userLanguage)}, written like a caring friend who genuinely sees them — warm, specific, NO clinical language. Reference their actual answers by name. Never use: 'indicates', 'levels', 'metrics', 'overall', 'it appears', 'based on your responses'. Speak directly to them using 'you'. 50-80 words.>"
 }`;
 
   try {
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       messages: [
-        { role: 'system', content: 'You are an expert wellness psychologist. Score accurately based on rubrics. Think deeply before scoring. VARY your approach each time. Respond ONLY with valid JSON. No markdown.' },
+        { role: 'system', content: `You are scoring ${name}'s wellness but writing about it like a sharp, caring friend — not a clinical report. Be warm, be real, be specific to what they actually said. No wellness-speak. No bullet points. Write in ${getLanguageName(userLanguage)}. VARY your approach each time. Respond ONLY with valid JSON. No markdown.` },
         { role: 'user', content: prompt }
       ],
-      temperature: 0.3,
-      max_tokens: 200,
+      temperature: 0.5,
+      max_tokens: 300,
     });
 
     let txt = completion.choices[0].message.content.trim().replace(/```json\n?/g, '').replace(/```\n?/g, '');
@@ -861,15 +1088,16 @@ ${qaContext}
 ${recentTips || 'First tip'}
 
 🎯 GENERATE ONE TIP THAT:
-✅ References their ACTUAL answers (quote something specific they said)
-✅ Is actionable within 24-48 hours (not vague like "take care of yourself")
-✅ Feels personal to ${name} (use their name ONLY if it flows naturally)
-✅ Addresses their BIGGEST opportunity based on their answers
-✅ Is encouraging but honest (no toxic positivity)
-✅ Is 15-25 words (short and punchy)
+✅ References their ACTUAL answers — quote something specific they said (e.g. "you mentioned your sleep is 3/5...")
+✅ Is actionable within 24-48 hours, name the exact action
+✅ Sounds like a caring friend texting them, not a wellness coach presenting advice
+✅ Addresses their BIGGEST gap from today's answers
+✅ Is honest but warm — don't sugarcoat, don't lecture
+✅ Is 25-40 words (enough to feel real, short enough to land)
 ✅ Is DIFFERENT from recent tips in approach and wording
 ✅ Matches the ${tipStyle} style
 ✅ Is in ${getLanguageName(userLanguage)} language
+✅ NO phrases like: "make sure to", "try to", "it's important to", "remember to"
 
 BAD TIP EXAMPLES (too generic):
 ❌ "Make sure to get enough rest tonight"
@@ -892,11 +1120,11 @@ Respond ONLY with valid JSON:
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       messages: [
-        { role: 'system', content: 'You are Dr. Sarah, a direct and caring wellness coach. Be specific, not generic. VARY your tips each time. Respond ONLY with valid JSON. No markdown.' },
+        { role: 'system', content: `You are ${name}'s sharp, caring best friend who just read all their answers. You text them advice the way a real friend does — specific, warm, no fluff, no coach-speak. VARY your tips each time. Respond ONLY with valid JSON. No markdown.` },
         { role: 'user', content: prompt }
       ],
       temperature: 0.85,
-      max_tokens: 100,
+      max_tokens: 150,
     });
 
     let txt = completion.choices[0].message.content.trim().replace(/```json\n?/g, '').replace(/```\n?/g, '');
@@ -905,6 +1133,60 @@ Respond ONLY with valid JSON:
   } catch (error) {
     console.error('Individual tip error:', error.message);
     return 'Small actions today create big changes tomorrow.';
+  }
+}
+
+// ============================================
+// 📝 SESSION SUMMARY — stored per submission, used for deep analysis
+// ============================================
+// Runs in parallel with other AI calls during submit.
+// Produces a 2-3 sentence paragraph that captures:
+//   • What the user revealed about themselves in this session
+//   • Patterns or concerns the AI noticed
+//   • What needs attention vs what's working
+// Never shown to user — purely internal data for deep analysis.
+// ============================================
+
+async function generateSessionSummary(profile, pillar, questions, answers, todayPillarScore, scoringJustification) {
+  const { name, ageGroup, gender } = profile;
+  const displayAge = ageGroup ? getAgeGroupLabel(ageGroup) : 'Adult';
+  const pillarMeta = PILLARS[pillar.toUpperCase()];
+
+  const qaBlock = questions.map((q, i) => {
+    const raw = answers[i]?.answer !== undefined ? answers[i].answer : answers[i];
+    const a = typeof raw === 'object' && raw !== null ? (raw.answer ?? JSON.stringify(raw)) : raw;
+    return `Q: ${q.text}\nA: ${a ?? '—'}`;
+  }).join('\n\n');
+
+  const prompt = `You are an analyst who has just reviewed a wellness check-in. Write a concise 2-3 sentence internal note summarising what this person revealed, what patterns or red flags you noticed, and what their score reflects about their current state. This note will be read by AI in future analysis sessions — be specific, honest, and data-rich.
+
+Person: ${name} | ${displayAge} | ${gender}
+Pillar checked: ${pillarMeta?.name} (${pillar})
+Score today: ${todayPillarScore}/100
+AI scoring note: ${scoringJustification || 'N/A'}
+
+Their answers:
+${qaBlock}
+
+Write 2-3 sentences max. Be specific — mention actual answers. No bullet points. No generic observations. Output only the paragraph, nothing else.`;
+
+  try {
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        { role: 'system', content: 'You write sharp, specific internal analyst notes about wellness check-ins. No fluff. Output only the summary paragraph.' },
+        { role: 'user', content: prompt }
+      ],
+      temperature: 0.4,
+      max_tokens: 200,
+    });
+    const summary = completion.choices[0].message.content.trim();
+    console.log(`📝 Session summary generated for ${name} (${pillar} ${todayPillarScore}/100)`);
+    return summary;
+  } catch (error) {
+    console.error('Session summary error:', error.message);
+    // Fallback: build a basic summary from raw data
+    return `${name} completed a ${pillarMeta?.name} check-in scoring ${todayPillarScore}/100. ${scoringJustification || 'No additional context.'}`;
   }
 }
 
@@ -1124,216 +1406,195 @@ Respond ONLY with valid JSON:
 // 📝 ADAPTIVE QUESTION GENERATION — ENFORCED DIVERSITY 10/10
 // ============================================
 
-const generatePersonalizedQuestions = async (profile, selectedPillar, previousSubmissions = []) => {
+async function generatePersonalizedQuestions(profile, selectedPillar, previousSubmissions, sessionNumber, storedSessionSummaries) {
   const { name, ageGroup, gender, language } = profile;
   const userLanguage = language || 'en';
   const displayAge = ageGroup ? getAgeGroupLabel(ageGroup) : 'Adult';
   const pillarMeta = PILLARS[selectedPillar.toUpperCase()];
   const rubric = SCORING_RUBRICS[selectedPillar];
-  const topicsBank = QUESTION_TOPICS[selectedPillar] || [];
 
-  const samePillarHistory = previousSubmissions
+  // Get the session arc for this session number
+  const phase = getSessionPhase(selectedPillar, sessionNumber);
+
+  // Build past session context — use stored summaries for efficiency, fall back to inline
+  const samePillarSummaries = (storedSessionSummaries || [])
     .filter(s => s.pillar === selectedPillar)
-    .slice(0, 3);
+    .slice(0, 8); // last 8 sessions of this pillar
 
-  const previouslyAskedQuestions = samePillarHistory
+  const pastSessionContext = samePillarSummaries.length > 0
+    ? samePillarSummaries.map((s, i) =>
+        `Session ${sessionNumber - 1 - i} [${s.date}] — Score: ${s.score}/100\n${s.summary}`
+      ).join('\n\n')
+    : previousSubmissions
+        .filter(s => s.pillar === selectedPillar)
+        .slice(0, 4)
+        .map(s => {
+          const score = s.pillarScores?.[selectedPillar] ?? s.todayPillarScore ?? s.score;
+          const qa = (s.questions || []).map((q, i) => {
+            const a = s.answers?.[i]?.answer?.answer ?? s.answers?.[i]?.answer ?? '—';
+            return `Q: ${q.text} → A: ${a}`;
+          }).join(' | ');
+          return `[${s.date}] Score: ${score}/100\n${qa}`;
+        }).join('\n\n');
+
+  // All previously asked question texts across all sessions of this pillar — hard dedup
+  const allPreviousQuestionTexts = previousSubmissions
+    .filter(s => s.pillar === selectedPillar)
     .flatMap(s => (s.questions || []).map(q => q.text))
-    .join('; ');
-
-  const previousTopicsUsed = samePillarHistory
-    .flatMap(s => (s.questions || []).map(q => {
-      return topicsBank.find(topic => q.text.toLowerCase().includes(topic.replace(/_/g, ' ')));
-    }))
     .filter(Boolean);
 
-  const diversitySeed = getDiversitySeed(name, previousSubmissions.length, selectedPillar);
-  const shuffledTopics = [...topicsBank].sort(() => 0.5 - Math.random());
-
-  const availableTopics = shuffledTopics.filter(t => !previousTopicsUsed.includes(t));
-  const selectedTopics = availableTopics.slice(0, 8);
-
-  if (selectedTopics.length < 8) {
-    const remaining = shuffledTopics.filter(t => !selectedTopics.includes(t));
-    selectedTopics.push(...remaining.slice(0, 8 - selectedTopics.length));
-  }
-
-  const adaptiveContext = samePillarHistory.length > 0
-    ? samePillarHistory.map(s => {
-      const prevQA = (s.questions || []).map((q, i) => {
-        const a = s.answers?.[i]?.answer?.answer || s.answers?.[i]?.answer || '—';
-        return `${q.text} → ${a}`;
-      }).join('; ');
-      return `${s.date} (score ${s.pillarScores?.[selectedPillar] || s.score}/100): ${prevQA}`;
-    }).join('\n')
-    : null;
-
+  // Other pillars context
   const pillarHistory = buildPillarHistory(previousSubmissions);
   const pillarContext = Object.keys(PILLARS).map(k => {
     const p = PILLARS[k];
     const scores = pillarHistory[p.id];
     const avg = scores.length > 0 ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : null;
-    return `${p.name}: ${avg !== null ? avg + '/100' : 'no data'}`;
-  }).join(', ');
+    return `${p.name}: ${avg !== null ? avg + '/100' : 'not checked yet'}`;
+  }).join(' | ');
 
-  const prompt = `CRITICAL: Generate DIVERSE, DEEP questions that feel personal to ${name}.
+  // Age/gender framing for question style
+  const ageGenderContext = (() => {
+    const ageFraming = {
+      '18-24': 'Young adult (18-24). Questions should feel peer-to-peer, not parental. Relevant to career starts, social pressure, identity formation, FOMO, relationships just starting.',
+      '25-34': 'Building years (25-34). Career climbing, relationship deepening, financial pressure, balancing ambition with real life. Real stakes now.',
+      '35-44': 'Prime but pressured (35-44). Often juggling career peak, family responsibilities, health wake-up calls. Questions can be more direct about trade-offs and priorities.',
+      '45-54': 'Mid-life reckoning (45-54). Legacy thinking, health investment, meaning deepening. More willing to go deep. Questions can challenge their assumptions.',
+      '55-64': 'Mature perspective (55-64). Wisdom earned, real stakes around health, relationships, legacy, and time. Honor their experience while still challenging them.',
+      '65+':   'Elder wisdom (65+). Long view on what matters, health as central, legacy as lived reality. Deep questions about meaning, contribution, and what they want to leave behind.',
+    };
+    return ageFraming[ageGroup] || 'Adult. Keep questions grounded in real daily life challenges.';
+  })();
 
-ALL questions MUST be in ${getLanguageName(userLanguage)} language.
-Questions text, options, labels - EVERYTHING must be in ${getLanguageName(userLanguage)}.
-Respond ONLY with valid JSON. No markdown.
+  const lang = getLanguageName(userLanguage);
 
-You are Dr. Sarah creating 8 wellness questions for ${name}.
+  const prompt = `You are creating a personalized ${pillarMeta?.name} check-in for ${name}. Everything must be in ${lang}. Respond ONLY with valid JSON. No markdown.
 
-👤 USER PROFILE:
-- Name: ${name}
-- Age: ${displayAge}
-- Gender: ${gender}
-- Language: ${getLanguageName(userLanguage)}
-- Today's focus: ${pillarMeta?.emoji} ${pillarMeta?.name}
-- Other pillars: ${pillarContext}
+━━━ WHO THIS IS ━━━
+${name} | ${displayAge} | ${gender}
+${ageGenderContext}
+Their other pillars: ${pillarContext}
 
-${adaptiveContext ? `📝 PREVIOUS ${pillarMeta?.name.toUpperCase()} CHECK-INS:\n${adaptiveContext}` : `📝 First time checking ${pillarMeta?.name} — make it welcoming but deep.`}
+━━━ SESSION ${sessionNumber} — ${phase.phase.toUpperCase()} ━━━
+${phase.arc}
 
-🚫 PREVIOUSLY ASKED QUESTIONS (NEVER repeat these):
-${previouslyAskedQuestions || 'None yet'}
+${pastSessionContext
+  ? `━━━ WHAT YOU KNOW ABOUT THEM FROM PAST SESSIONS ━━━\n${pastSessionContext}\n\nUSE THIS: Build on what they've revealed. Reference it in question framing. Go deeper than last time.`
+  : `━━━ FIRST SESSION ━━━\nThis is ${name}'s first time checking ${pillarMeta?.name}. Make the first question feel like the right first question.`
+}
 
-🚫 PREVIOUSLY USED TOPICS (avoid these):
-${previousTopicsUsed.join(', ') || 'None yet'}
+━━━ NEVER ASK THESE AGAIN (already asked in previous sessions) ━━━
+${allPreviousQuestionTexts.length > 0 ? allPreviousQuestionTexts.join('\n') : 'None yet — first session.'}
 
-🎯 REQUIRED TOPICS FOR THIS CHECK (use EXACTLY these 8 topics, one per question):
-${selectedTopics.map((t, i) => `Q${i + 1}: ${t}`).join('\n')}
+━━━ THIS SESSION'S FOCUS THEMES ━━━
+${phase.themes.map((t, i) => `Q${i + 1}: ${t}`).join('\n')}
+Q9 (reflection): ${phase.q9}
 
-📖 ${pillarMeta?.name.toUpperCase()} MEASUREMENT PRIORITIES:
-${rubric.what_matters.map(w => `  • ${w}`).join('\n')}
+━━━ SCORING CONTEXT ━━━
+${rubric.what_matters.map(w => `• ${w}`).join('\n')}
 
-⚡ KEY SIGNALS TO UNCOVER:
-${rubric.context_rules.map(r => `  • ${r}`).join('\n')}
+━━━ QUESTION TYPE STRATEGY ━━━
+Types: scale (1-5), yesno, choice (pick one from options), multiselect (pick multiple), text (free write)
 
-🎯 CREATE 8 QUESTIONS THAT:
+MOMENTUM RULE — Question order determines completion rate:
+• Q1-Q3: Always start FAST (scale/yesno/choice). Never start with text or multiselect.
+• Q4-Q7: Place heavier types here (text, multiselect) — user has momentum now.
+• Q8: End Q8 fast (scale or yesno).
+• Q9: Always text — the reflection closer. Already defined above, you generate it.
 
-CRITICAL REQUIREMENTS:
-✅ EXACTLY: 3 scale (1-5), 3 yesno, 2 choice
-✅ Each question MUST address ONE of the required topics above (in order: Q1 = topic 1, Q2 = topic 2, etc.)
-✅ NEVER repeat questions from their history
-✅ If they scored low before, dig into WHY with different angle
-✅ If they scored high before, explore DEPTH (what's working specifically?)
-✅ Use ${name} in only 1-2 questions max (feels personal, not robotic)
-✅ Conversational, age-appropriate for ${displayAge}
-✅ Choice questions: 4-5 options, ordered worst to best
-✅ Questions reveal the KEY SIGNALS from context rules
-✅ Mix of concrete (sleep hours) and emotional (how do you feel)
-✅ ALL text in ${getLanguageName(userLanguage)} language
+If first session: scale → choice → yesno → scale → yesno → choice → scale → yesno (all fast, build foundation)
+If trending down: quick → quick → quick → text → multiselect → text → quick → quick (get depth but ease in)
+If returning user with context: mix scale/choice for quick pulse, then text/multiselect to go deeper
 
-TOPIC-TO-QUESTION MAPPING EXAMPLES:
-- sleep_quality → "How would you rate the quality of your sleep last night?"
-- financial_confidence → "When you think about your finances, how confident do you feel?"
-- emotional_connection → "How emotionally connected did you feel to loved ones today?"
-- life_meaning → "How meaningful did today feel to you?"
+━━━ QUESTION QUALITY RULES ━━━
+✅ Reference their past answers in question framing when you have them ("last time you mentioned X, how is that now?")
+✅ Each question covers ONE theme from the list above
+✅ Questions feel like a perceptive friend asking, not a clinical intake form
+✅ Specific enough that the answer actually reveals something ("How many hours exactly?" not "Did you sleep enough?")
+✅ Q9 must be the deepest question of the session — something they'll actually think about
+✅ NEVER repeat any question from the previous sessions list above
+✅ ALL text in ${lang} — questions, options, labels, everything
 
-QUESTION QUALITY STANDARDS:
-🟢 GREAT: "How many hours of sleep did you actually get last night?" (specific, measurable)
-🟢 GREAT: "When you think about money right now, what's the first feeling that comes up?" (emotional depth)
-🟢 GREAT: "Did you have a conversation today that made you feel truly understood?" (relationship quality)
-🔴 BAD: "How is your health?" (too vague)
-🔴 BAD: "Are you stressed?" (too simple, already asked before probably)
-🔴 BAD: "Do you feel good?" (meaningless)
-
-Respond with valid JSON (NO MARKDOWN):
+━━━ OUTPUT FORMAT ━━━
+Return exactly this JSON structure:
 {
   "questions": [
-    {"id":"q1","pillar":"${selectedPillar}","text":"question about ${selectedTopics[0]} in ${getLanguageName(userLanguage)}","type":"scale","min":1,"max":5,"labels":["Low label","High label"]},
-    {"id":"q2","pillar":"${selectedPillar}","text":"question about ${selectedTopics[1]} in ${getLanguageName(userLanguage)}","type":"yesno"},
-    {"id":"q3","pillar":"${selectedPillar}","text":"question about ${selectedTopics[2]} in ${getLanguageName(userLanguage)}","type":"choice","options":["Worst","Bad","Okay","Good","Best"]},
-    {"id":"q4","pillar":"${selectedPillar}","text":"question about ${selectedTopics[3]} in ${getLanguageName(userLanguage)}","type":"scale","min":1,"max":5,"labels":["Low label","High label"]},
-    {"id":"q5","pillar":"${selectedPillar}","text":"question about ${selectedTopics[4]} in ${getLanguageName(userLanguage)}","type":"yesno"},
-    {"id":"q6","pillar":"${selectedPillar}","text":"question about ${selectedTopics[5]} in ${getLanguageName(userLanguage)}","type":"scale","min":1,"max":5,"labels":["Low label","High label"]},
-    {"id":"q7","pillar":"${selectedPillar}","text":"question about ${selectedTopics[6]} in ${getLanguageName(userLanguage)}","type":"yesno"},
-    {"id":"q8","pillar":"${selectedPillar}","text":"question about ${selectedTopics[7]} in ${getLanguageName(userLanguage)}","type":"choice","options":["Worst","Bad","Okay","Good","Best"]}
+    {"id":"q1","pillar":"${selectedPillar}","text":"question in ${lang}","type":"scale","min":1,"max":5,"labels":["low label","high label"]},
+    {"id":"q2","pillar":"${selectedPillar}","text":"question in ${lang}","type":"yesno"},
+    {"id":"q3","pillar":"${selectedPillar}","text":"question in ${lang}","type":"choice","options":["opt1","opt2","opt3","opt4","opt5"]},
+    {"id":"q4","pillar":"${selectedPillar}","text":"question in ${lang}","type":"multiselect","options":["opt1","opt2","opt3","opt4","opt5"]},
+    {"id":"q5","pillar":"${selectedPillar}","text":"question in ${lang}","type":"yesno"},
+    {"id":"q6","pillar":"${selectedPillar}","text":"question in ${lang}","type":"text","placeholder":"thoughtful placeholder in ${lang}"},
+    {"id":"q7","pillar":"${selectedPillar}","text":"question in ${lang}","type":"choice","options":["opt1","opt2","opt3","opt4","opt5"]},
+    {"id":"q8","pillar":"${selectedPillar}","text":"question in ${lang}","type":"scale","min":1,"max":5,"labels":["low label","high label"]},
+    {"id":"q9","pillar":"${selectedPillar}","text":"the reflection question in ${lang} — generated from the Q9 intent above","type":"text","placeholder":"thoughtful placeholder in ${lang}"}
   ]
 }`;
 
   try {
-    console.log(`🤖 Generating 8 diverse ${pillarMeta?.name} questions for ${name} in ${getLanguageName(userLanguage)}...`);
-    console.log(`🎯 Selected topics: ${selectedTopics.join(', ')}`);
+    console.log(`🤖 Generating session ${sessionNumber} (${phase.phase}) ${pillarMeta?.name} questions for ${name} in ${lang}...`);
 
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       messages: [
-        { role: 'system', content: 'You are Dr. Sarah, expert at creating diverse, deep wellness questions. Follow topic requirements strictly. Avoid repetition. Be specific. Respond ONLY with valid JSON, no markdown.' },
+        {
+          role: 'system',
+          content: `You create deeply personalized wellness check-in questions. You remember what users said in past sessions and build on it. Every question feels like it was written specifically for this person at this point in their journey. Never generic. Never repeated. Always in ${lang}. JSON only, no markdown.`
+        },
         { role: 'user', content: prompt }
       ],
-      temperature: 0.85,
-      max_tokens: 1200,
+      temperature: 0.88,
+      max_tokens: 1600,
     });
 
     let txt = completion.choices[0].message.content.trim().replace(/```json\n?/g, '').replace(/```\n?/g, '');
     const parsed = JSON.parse(txt);
 
-    if (!parsed.questions || parsed.questions.length !== 8) throw new Error('Bad question count');
+    if (!parsed.questions || parsed.questions.length < 9) throw new Error(`Bad question count: ${parsed.questions?.length}`);
 
-    parsed.questions.forEach(q => {
-      if (q.type === 'choice' && (!Array.isArray(q.options) || q.options.length < 4)) {
-        q.options = ['Very Bad', 'Bad', 'Okay', 'Good', 'Great'];
+    // Validate and fix question structure
+    parsed.questions.forEach((q) => {
+      if ((q.type === 'choice' || q.type === 'multiselect') && (!Array.isArray(q.options) || q.options.length < 4)) {
+        q.options = q.type === 'multiselect'
+          ? ['Option 1', 'Option 2', 'Option 3', 'Option 4']
+          : ['Very Low', 'Low', 'Okay', 'Good', 'Very Good'];
       }
+      if (q.type === 'scale' && (!q.min || !q.max)) { q.min = 1; q.max = 5; }
+      if (q.type === 'text' && !q.placeholder) { q.placeholder = '...'; }
     });
 
-    console.log(`✅ Generated 8 diverse ${pillarMeta?.name} questions for ${name} in ${getLanguageName(userLanguage)}`);
-    return { success: true, questions: parsed.questions };
+    // topicsUsed: record the themes for this session (for sessionSummaries field)
+    const topicsUsed = phase.themes;
+
+    console.log(`✅ Generated 9 ${phase.phase} ${pillarMeta?.name} questions for ${name} (session ${sessionNumber}) in ${lang}`);
+    return { success: true, questions: parsed.questions.slice(0, 9), sessionNumber, phase: phase.phase, topicsUsed };
 
   } catch (error) {
     console.error('Question generation error:', error.message);
 
-    const fallbacks = {
-      health: [
-        { id: 'q1', pillar: 'health', text: 'How many hours of sleep did you get last night?', type: 'scale', min: 1, max: 5, labels: ['Less than 4hrs', '8+ hours'] },
-        { id: 'q2', pillar: 'health', text: 'Did you move your body for at least 20 minutes today?', type: 'yesno' },
-        { id: 'q3', pillar: 'health', text: 'How would you describe your energy level right now?', type: 'choice', options: ['Completely drained', 'Low energy', 'Okay', 'Good energy', 'Fully energized'] },
-        { id: 'q4', pillar: 'health', text: 'How stressed or anxious are you feeling?', type: 'scale', min: 1, max: 5, labels: ['Very stressed', 'Completely calm'] },
-        { id: 'q5', pillar: 'health', text: 'Did you eat at least one nourishing meal today?', type: 'yesno' },
-        { id: 'q6', pillar: 'health', text: 'How clear and focused is your mind?', type: 'scale', min: 1, max: 5, labels: ['Very foggy', 'Crystal clear'] },
-        { id: 'q7', pillar: 'health', text: 'Are you experiencing any physical pain or discomfort?', type: 'yesno' },
-        { id: 'q8', pillar: 'health', text: 'Overall, how does your body feel right now?', type: 'choice', options: ['Terrible', 'Uncomfortable', 'Neutral', 'Good', 'Amazing'] },
-      ],
-      wealth: [
-        { id: 'q1', pillar: 'wealth', text: 'How confident do you feel about your finances right now?', type: 'scale', min: 1, max: 5, labels: ['Very anxious', 'Very confident'] },
-        { id: 'q2', pillar: 'wealth', text: 'Did you make any progress on a career or money goal today?', type: 'yesno' },
-        { id: 'q3', pillar: 'wealth', text: 'How satisfied are you with your work-life balance?', type: 'choice', options: ['Terrible', 'Poor', 'Okay', 'Good', 'Excellent'] },
-        { id: 'q4', pillar: 'wealth', text: 'How much is money stressing you out?', type: 'scale', min: 1, max: 5, labels: ['Extreme stress', 'No stress'] },
-        { id: 'q5', pillar: 'wealth', text: 'Do you feel in control of your financial situation?', type: 'yesno' },
-        { id: 'q6', pillar: 'wealth', text: 'How meaningful does your work feel?', type: 'scale', min: 1, max: 5, labels: ['Meaningless', 'Very meaningful'] },
-        { id: 'q7', pillar: 'wealth', text: 'Are you learning and growing professionally?', type: 'yesno' },
-        { id: 'q8', pillar: 'wealth', text: 'How secure do you feel about your income?', type: 'choice', options: ['Very insecure', 'Insecure', 'Neutral', 'Secure', 'Very secure'] },
-      ],
-      love: [
-        { id: 'q1', pillar: 'love', text: 'How connected do you feel to the people you care about?', type: 'scale', min: 1, max: 5, labels: ['Very alone', 'Deeply connected'] },
-        { id: 'q2', pillar: 'love', text: 'Did you have a meaningful conversation with someone today?', type: 'yesno' },
-        { id: 'q3', pillar: 'love', text: 'How would you describe your relationships right now?', type: 'choice', options: ['Struggling badly', 'Strained', 'Okay', 'Good', 'Thriving'] },
-        { id: 'q4', pillar: 'love', text: 'How supported and valued do you feel?', type: 'scale', min: 1, max: 5, labels: ['Not at all', 'Completely'] },
-        { id: 'q5', pillar: 'love', text: 'Did you express appreciation to someone today?', type: 'yesno' },
-        { id: 'q6', pillar: 'love', text: 'How emotionally safe do you feel in your closest relationships?', type: 'scale', min: 1, max: 5, labels: ['Very unsafe', 'Very safe'] },
-        { id: 'q7', pillar: 'love', text: 'Can you be your authentic self with the people close to you?', type: 'yesno' },
-        { id: 'q8', pillar: 'love', text: 'Overall, how is your social and emotional life?', type: 'choice', options: ['Very poor', 'Poor', 'Okay', 'Good', 'Excellent'] },
-      ],
-      purpose: [
-        { id: 'q1', pillar: 'purpose', text: 'How meaningful did today feel?', type: 'scale', min: 1, max: 5, labels: ['Empty', 'Very meaningful'] },
-        { id: 'q2', pillar: 'purpose', text: 'Did you work on something that truly matters to you?', type: 'yesno' },
-        { id: 'q3', pillar: 'purpose', text: 'How aligned do you feel with your life direction?', type: 'choice', options: ['Completely lost', 'Unsure', 'Finding my way', 'Aligned', 'Thriving'] },
-        { id: 'q4', pillar: 'purpose', text: 'How clear are you on what you want in life?', type: 'scale', min: 1, max: 5, labels: ['Very unclear', 'Crystal clear'] },
-        { id: 'q5', pillar: 'purpose', text: 'Did you learn or grow in some way today?', type: 'yesno' },
-        { id: 'q6', pillar: 'purpose', text: 'How much does your life align with your core values?', type: 'scale', min: 1, max: 5, labels: ['Not at all', 'Completely'] },
-        { id: 'q7', pillar: 'purpose', text: 'Do you feel like you made a positive difference today?', type: 'yesno' },
-        { id: 'q8', pillar: 'purpose', text: 'How optimistic are you about your future?', type: 'choice', options: ['Very pessimistic', 'Pessimistic', 'Neutral', 'Optimistic', 'Very optimistic'] },
-      ],
+    // Fallback: generate basic questions covering the phase themes
+    const fallbackQ = phase.themes.slice(0, 8).map((theme, i) => ({
+      id: `q${i + 1}`,
+      pillar: selectedPillar,
+      text: `How are you doing with ${theme}?`,
+      type: i % 3 === 0 ? 'scale' : i % 3 === 1 ? 'yesno' : 'choice',
+      ...(i % 3 === 0 ? { min: 1, max: 5, labels: ['Not well', 'Very well'] } : {}),
+      ...(i % 3 === 2 ? { options: ['Very Bad', 'Bad', 'Okay', 'Good', 'Great'] } : {}),
+    }));
+    const fallbackQ9 = {
+      id: 'q9', pillar: selectedPillar, type: 'text',
+      text: phase.q9.replace(/^Ask /, '').replace(/^ask /, ''),
+      placeholder: '...',
     };
 
-    return { success: true, questions: fallbacks[selectedPillar] || fallbacks.health };
+    return { success: true, questions: [...fallbackQ, fallbackQ9], sessionNumber, phase: phase.phase, topicsUsed: phase.themes };
   }
-};
+}
 
 // ============================================
 // AI ANALYSIS — DEEP INSIGHTS 10/10
 // ============================================
 
-const getPersonalizedAnalysis = async (profile, submissions) => {
+const getPersonalizedAnalysis = async (profile, submissions, lastAnalysis, stats, storedSessionSummaries) => {
   if (submissions.length < 3) {
     return { success: false, message: `You need at least 3 check-ins for AI insights. You have ${submissions.length}. Keep going!` };
   }
@@ -1343,9 +1604,7 @@ const getPersonalizedAnalysis = async (profile, submissions) => {
   const displayAge = ageGroup ? getAgeGroupLabel(ageGroup) : 'Adult';
   const last30 = submissions.slice(0, 30);
 
-  const diversitySeed = getDiversitySeed(name, submissions.length, 'analysis');
-  const analysisStyle = diversitySeed % 3 === 0 ? 'pattern_detective' :
-    diversitySeed % 3 === 1 ? 'strength_based' : 'growth_oriented';
+
 
   const pillarTrends = {};
   for (const key of Object.keys(PILLARS)) {
@@ -1370,111 +1629,218 @@ const getPersonalizedAnalysis = async (profile, submissions) => {
     }
   }
 
+  // Full context — use EVERY data point we have
   const historyContext = last30.map((s, i) => {
-    const base = `${s.date}: Alive=${s.score}/100 [${s.vibe}] | ${s.pillar}=${s.pillarScores?.[s.pillar] ?? s.score}/100`;
-    if (i < 10 && s.questions) {
-      const qa = s.questions.slice(0, 5).map((q, idx) => {
-        const a = s.answers?.[idx]?.answer?.answer ?? s.answers?.[idx]?.answer ?? '—';
-        return `${q.text} → ${a}`;
-      }).join(' | ');
-      return `${base} | Q&A: ${qa}`;
+    const pillarScore = s.pillarScores?.[s.pillar] ?? s.todayPillarScore ?? s.score;
+    const allPillarScores = s.pillarScores
+      ? Object.entries(s.pillarScores).map(([p, v]) => `${p}=${v}`).join(' ')
+      : '';
+
+    const lines = [`[${s.date}] Alive=${s.score}/100 | ${s.vibe} | Pillar checked: ${s.pillar}=${pillarScore}/100`];
+    if (allPillarScores) lines.push(`  All pillars: ${allPillarScores}`);
+
+    // Every Q&A answer — this is gold
+    if (s.questions?.length) {
+      const qa = s.questions.map((q, idx) => {
+        const raw = s.answers?.[idx];
+        const a = raw?.answer?.answer ?? raw?.answer ?? raw ?? '—';
+        return `  Q: ${q.text}\n  A: ${a}`;
+      }).join('\n');
+      lines.push(`  Answers:\n${qa}`);
     }
-    return base;
-  }).join('\n');
 
-  const rubricSummary = Object.keys(SCORING_RUBRICS).map(key => {
-    const r = SCORING_RUBRICS[key];
-    return `${r.name}: ${r.description} Key signals: ${r.what_matters.slice(0, 3).join(', ')}`;
-  }).join('\n');
+    // AI tip given after this test
+    if (s.individualTip) lines.push(`  AI tip given: "${s.individualTip}"`);
 
-  const analysisStyleInstructions = {
-    pattern_detective: 'Focus on CONNECTIONS between pillars. What patterns emerge? How do pillars influence each other?',
-    strength_based: 'Lead with what IS working. Build recommendations from their strengths.',
-    growth_oriented: 'Identify the BIGGEST opportunity for growth. What one change would cascade positively?'
-  };
+    // Scoring explanation
+    if (s.scoringJustification) lines.push(`  Why this score: ${s.scoringJustification}`);
 
-  const prompt = `CRITICAL: ${name} is trusting you with their wellness data. Give them REAL, ACTIONABLE insights.
+    // Breakdown details
+    if (s.breakdown) {
+      const bk = typeof s.breakdown === 'string' ? s.breakdown : JSON.stringify(s.breakdown);
+      lines.push(`  Breakdown: ${bk.slice(0, 200)}`);
+    }
 
-ALL output MUST be in ${getLanguageName(userLanguage)} language.
-Respond ONLY with valid JSON. No markdown.
+    // Pride moments and weakest
+    if (s.prideMoments?.length) lines.push(`  Pride: ${s.prideMoments.join(', ')}`);
+    if (s.weakestPillar) lines.push(`  Weakest: ${s.weakestPillar}${s.weakestBoost ? ` — boost: ${s.weakestBoost}` : ''}`);
 
-You are Dr. Maya, ${name}'s personal wellness psychologist with ${last30.length} check-ins of data.
+    return lines.join('\n');
+  }).join('\n\n');
 
-🎯 ANALYSIS STYLE FOR THIS CHECK: ${analysisStyle.toUpperCase()}
-${analysisStyleInstructions[analysisStyle]}
+  const pillarEntries = Object.entries(pillarTrends).sort((a, b) => a[1].average - b[1].average);
+  const pillarBlock = pillarEntries.map(([pid, d]) =>
+    `${PILLARS[pid.toUpperCase()]?.name} (${pid}): latest=${d.latest} avg=${d.average} trend=${d.trend} range=${d.lowest}–${d.highest} checks=${d.checks}`
+  ).join('\n');
 
-═══════════════════════════════════════════
-👤 ${name} | ${displayAge} | ${gender} | Language: ${getLanguageName(userLanguage)}
-═══════════════════════════════════════════
+  // Pull out EVERY free-text reflection answer — these are the most revealing data points
+  const reflections = last30
+    .flatMap(s => (s.questions || []).map((q, idx) => {
+      if (q.type !== 'text') return null;
+      const raw = s.answers?.[idx];
+      const a = raw?.answer?.answer ?? raw?.answer ?? raw ?? '';
+      if (!a || a === '—' || String(a).trim().length < 5) return null;
+      return `[${s.date}] ${q.text}\n→ "${a}"`;
+    }))
+    .filter(Boolean)
+    .join('\n\n');
 
-═══════════════════════════════════════════
-📊 FULL JOURNEY (${last30.length} checks):
+  // Pre-digested session summaries — prefer the dedicated top-level field (fastest, most complete),
+  // fall back to inline sessionSummary on submissions, then scoringJustification for old data.
+  const summarySource = (storedSessionSummaries && storedSessionSummaries.length > 0)
+    ? storedSessionSummaries.map(s =>
+        `[${s.date}] ${s.pillar?.toUpperCase()} ${s.score}/100 (alive ${s.aliveScore}/100)\n${s.summary}`
+      ).join('\n\n')
+    : last30
+        .filter(s => s.sessionSummary || s.scoringJustification)
+        .map((s) => {
+          const pillarScore = s.pillarScores?.[s.pillar] ?? s.todayPillarScore ?? s.score;
+          const header = `[${s.date}] ${s.pillar?.toUpperCase()} ${pillarScore}/100`;
+          const body = s.sessionSummary || `Score: ${pillarScore}/100. ${s.scoringJustification || ''}`;
+          return `${header}\n${body}`;
+        })
+        .join('\n\n');
+  const sessionSummaries = summarySource;
+
+  // Previous analysis context — so we never repeat the same things
+  const prevAnalysisContext = lastAnalysis?.data
+    ? `WHAT YOU TOLD THEM LAST TIME (do NOT repeat these angles):
+Headline: ${lastAnalysis.data.headline || '—'}
+Week focus: ${lastAnalysis.data.weekFocus || '—'}
+Climb plays: ${(lastAnalysis.data.climbPlays || []).map(p => p.play).join(' | ')}
+Generated: ${lastAnalysis.generatedAt || '—'}`
+    : 'This is their first analysis.';
+
+  // User stats for extra context
+  const statsContext = stats
+    ? `Check-in streak: ${stats.dayStreak || 0} days | Longest streak: ${stats.longestStreak || 0} days | Total check-ins ever: ${stats.totalCheckIns || last30.length}`
+    : `Total check-ins shown: ${last30.length}`;
+
+  // Build "what changed since last analysis" block — makes each analysis feel progressive
+  const changesSinceLastAnalysis = lastAnalysis?.data
+    ? (() => {
+        const newChecks = submissions.length - (lastAnalysis.submissionsCountAtGeneration || 0);
+        const recentNew = submissions.slice(0, newChecks);
+        if (recentNew.length === 0) return '';
+        const newScores = recentNew.map(s => {
+          const ps = s.pillarScores?.[s.pillar] ?? s.todayPillarScore ?? s.score;
+          return `${s.date} ${s.pillar} ${ps}/100${s.sessionSummary ? ': ' + s.sessionSummary : ''}`;
+        }).join('\n');
+        return `WHAT HAPPENED SINCE YOUR LAST ANALYSIS (${newChecks} new check-in${newChecks !== 1 ? 's' : ''}):\n${newScores}`;
+      })()
+    : '';
+
+  const lang = getLanguageName(userLanguage);
+
+  const prompt = `EVERYTHING must be written in ${lang}. JSON only — no markdown, no extra keys.
+
+You have been watching ${name} (${displayAge}, ${gender}) do their check-ins. You've read everything. Now you're going to tell them what you actually think.
+
+${statsContext}
+
+━━━ THEIR DATA ━━━
+
+PILLAR SCORES RIGHT NOW:
+${pillarBlock}
+
+SESSION-BY-SESSION STORY (most recent first — read all of it):
+${sessionSummaries || historyContext}
+
+WHAT THEY WROTE IN THEIR OWN WORDS (reflections):
+${reflections || 'None yet — work from scored answers.'}
+
+RAW HISTORY (scores + Q&A for cross-reference):
 ${historyContext}
-═══════════════════════════════════════════
 
-═══════════════════════════════════════════
-📈 PILLAR BREAKDOWN:
-${Object.entries(pillarTrends).map(([pid, data]) =>
-    `  ${PILLARS[pid.toUpperCase()]?.emoji} ${PILLARS[pid.toUpperCase()]?.name}: avg=${data.average}/100 | latest=${data.latest}/100 | trend=${data.trend} | range=${data.lowest}-${data.highest} | ${data.checks} checks`
-  ).join('\n')}
-═══════════════════════════════════════════
+${changesSinceLastAnalysis}
 
-═══════════════════════════════════════════
-📖 MEASUREMENT FRAMEWORK:
-${rubricSummary}
-═══════════════════════════════════════════
+${prevAnalysisContext}
 
-🎯 GENERATE ANALYSIS THAT IS:
-✅ SPECIFIC — reference actual dates, scores, answers (not "you seem stressed" but "your 3 Health checks averaged 45 with recurring poor sleep")
-✅ INSIGHTFUL — connect patterns across pillars using ${analysisStyle} approach
-✅ ACTIONABLE — give recommendations they can actually do THIS WEEK
-✅ HONEST — if something is concerning, say it (with care)
-✅ ENCOURAGING — focus on what's working too
-✅ FRESH — use different angles than typical analysis
-✅ In ${getLanguageName(userLanguage)} language
+━━━ HOW TO WRITE THIS ━━━
 
-STRUCTURE:
+You are NOT a wellness app. You are NOT a coach. You are the one person who has read every single thing ${name} wrote and actually paid attention.
 
-OBSERVATIONS (25-35 words in ${getLanguageName(userLanguage)}):
-The SINGLE most important pattern using ${analysisStyle} lens. Be specific. Reference dates/scores.
+WHAT MAKES THIS FEEL REAL:
+— Name specific things from their answers. Not "you seem stressed" but "you rated your sleep 2/5 three times in a row."
+— Connect dots they haven't connected. "Your wealth score tanks every time your energy is low — that's not random."
+— Say the thing a friend would say but a coach wouldn't. "You keep answering this question the same way. Something's not shifting."
+— Use short punchy sentences where it counts. Long where nuance matters.
+— If you see something repeating across sessions, name it directly. "This is the fourth time you've mentioned X."
+— If scores improved, acknowledge it specifically. "You went from 45 to 72 on health — what changed?"
+— If something is clearly not working, say so. With warmth, not a lecture.
 
-INSIGHTS (25-35 words in ${getLanguageName(userLanguage)}):
-What this pattern MEANS for their life. Connect pillars if you see it. Use ${analysisStyle} approach.
+WHAT KILLS THE ANALYSIS (automatic reject):
+— Any of these words/phrases: "journey", "mindful", "holistic", "self-care", "well-being", "wellness", "It looks like", "Based on your data", "Based on your responses", "It appears", "Great work", "keep it up", "you're doing great", "make sure to", "it's important to", "remember to", "leverage", "actionable", "empower", "optimize", "I noticed that", "I can see that"
+— Starting any sentence with "It" followed by a passive observation
+— Bullet points inside text fields
+— Generic advice that could apply to anyone
+— Repeating anything from the previous analysis
 
-RECOMMENDATIONS (3 actions, each 20-28 words in ${getLanguageName(userLanguage)}):
-- Actionable THIS WEEK
-- At least 1 MUST connect two pillars
-- Reference their specific patterns
-- Empowering but direct
-- Aligned with ${analysisStyle} approach
+━━━ OUTPUT FORMAT ━━━
 
-PILLAR CALLOUTS:
-- strongest: which pillar + why (1 sentence in ${getLanguageName(userLanguage)})
-- needsAttention: which pillar + kind specific note (1 sentence in ${getLanguageName(userLanguage)})
+WRITING RULES:
+— Specific to ${name}'s actual data. If it fits anyone, delete it.
+— Short. Punchy. People scan. Every word earns its place.
+— Name actual numbers. "4hrs sleep, 3 sessions in a row" not "sleep seems low."
+— BANNED: prioritize, focus on, well-being, holistic, journey, mindful, self-care, leverage, actionable, empower, optimize, it appears, based on your data, great work.
 
-Respond ONLY with valid JSON:
+━━━━━━━━━━━━━━━━━━━━
+
+hook: 8-12 words. The one honest thing ${name} needs to hear. A thought a real person texts them. Specific data only. In ${lang}.
+
+bullets: Exactly 3 items. Each = one short punchy insight from their actual data.
+  Format: "[specific fact]. [what it means — 4-6 words]."
+  RIGHT tone examples:
+    "Sleep under 5hrs in 4 of 6 sessions. Energy scores confirm it."
+    "Wealth confidence 8/10. Savings plan: none. That gap is real."
+    "Love score most consistent pillar. Holding everything up."
+  MAX 18 words per bullet. Zero fluff. Real data every time. In ${lang}.
+
+move: Under 15 words. One specific action tied to something ${name} actually said or scored.
+  NOT: "set a goal", "drink water", "journal", "go for a walk".
+  YES: names their actual data point, targets the root cause. In ${lang}.
+
+bright: Under 15 words. Their real strength. One specific number or pattern. No generic praise. In ${lang}.
+
+summary: 3-5 sentences. The full picture in plain language — like a smart friend texting a voice note.
+  Cover: the main pattern, what's connected, what needs to shift and why, what's genuinely working.
+  Specific numbers and dates. Short punchy sentences mixed with a couple longer ones where depth is needed.
+  This is the only place you can go deeper — but still no fluff, no AI slop. In ${lang}.
+
+nextReveal: Under 20 words. What the next sessions will show that they literally cannot see yet. Make them curious. In ${lang}.
+
 {
-  "observations": "specific pattern with dates/scores in ${getLanguageName(userLanguage)}",
-  "insights": "what it means in ${getLanguageName(userLanguage)}",
-  "recommendations": ["action 1 in ${getLanguageName(userLanguage)}", "action 2 in ${getLanguageName(userLanguage)}", "action 3 in ${getLanguageName(userLanguage)}"],
-  "pillarCallouts": {
-    "strongest": "pillar_id",
-    "needsAttention": "pillar_id",
-    "strongestNote": "why it's working in ${getLanguageName(userLanguage)}",
-    "attentionNote": "kind specific note in ${getLanguageName(userLanguage)}"
-  }
+  "hook": "...",
+  "bullets": ["bullet 1", "bullet 2", "bullet 3"],
+  "move": "...",
+  "bright": "...",
+  "summary": "...",
+  "nextReveal": "..."
 }`;
 
   try {
-    console.log(`🤖 Deep analysis for ${name} in ${getLanguageName(userLanguage)} using ${analysisStyle} approach...`);
+    console.log(`🤖 Deep analysis for ${name} in ${lang} | ${submissions.length} sessions | ${storedSessionSummaries?.length || 0} summaries stored`);
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o',
       messages: [
-        { role: 'system', content: `You are Dr. Maya, ${name}'s wellness psychologist. Be specific, connect patterns, kind but honest. Use ${analysisStyle} approach. JSON only.` },
+        {
+          role: 'system',
+          content: `You are ${name}'s most perceptive friend. You've read every check-in. You write short, punchy, specific — like someone who actually paid attention and has real things to say.
+
+Rules:
+1. Specific to ${name}'s data. If it fits anyone else, cut it.
+2. Short sentences. People scan. Make every word count.
+3. Name actual numbers and patterns — not vague impressions.
+4. If something's wrong, say it directly. Warmth without hedging.
+5. Connect pillars when the data shows it — name it explicitly.
+6. NEVER: prioritize, focus on, well-being, holistic, self-care, mindful, journey, leverage, actionable, empower, optimize, it appears, based on your data, great work, keep it up, lay a foundation.
+
+JSON only. No markdown. Write in ${lang}.`
+        },
         { role: 'user', content: prompt }
       ],
       temperature: 0.7,
-      max_tokens: 600,
+      max_tokens: 2600,
     });
 
     let txt = completion.choices[0].message.content.trim().replace(/```json\n?/g, '').replace(/```\n?/g, '');
@@ -1484,12 +1850,14 @@ Respond ONLY with valid JSON:
     return {
       success: true,
       analysis: {
-        observations: parsed.observations,
-        insights: parsed.insights,
-        recommendations: parsed.recommendations,
-        pillarCallouts: parsed.pillarCallouts || null,
+        hook:        parsed.hook                                    || null,
+        bullets:     Array.isArray(parsed.bullets) ? parsed.bullets : [],
+        move:        parsed.move        || null,
+        bright:      parsed.bright      || null,
+        summary:     parsed.summary     || null,
+        nextReveal:  parsed.nextReveal  || null,
         totalChecks: submissions.length,
-        pillarTrends
+        pillarTrends,
       }
     };
   } catch (error) {
@@ -1811,7 +2179,11 @@ router.get('/questions', requireDeviceId, async (req, res) => {
       return res.status(400).json({ success: false, error: 'Profile not completed. Please complete your profile first.', needsProfile: true });
 
     const data = doc.data();
-    const result = await generatePersonalizedQuestions(data.profile, pillar.toLowerCase(), data.submissions || []);
+    // Session N = number of times they've already checked this pillar + 1 (next session)
+    const pillarSessions = data.profile.pillarSessions || {};
+    const sessionNumber = (pillarSessions[pillar.toLowerCase()] || 0) + 1;
+
+    const result = await generatePersonalizedQuestions(data.profile, pillar.toLowerCase(), data.submissions || [], sessionNumber, data.sessionSummaries || []);
 
     if (!result.success) throw new Error('Question generation failed');
 
@@ -1819,7 +2191,10 @@ router.get('/questions', requireDeviceId, async (req, res) => {
       success: true,
       questions: result.questions,
       profile: { name: data.profile.name },
-      pillar: pillar.toLowerCase()
+      pillar: pillar.toLowerCase(),
+      sessionNumber,
+      phase: result.phase || 'Foundation',
+      topicsUsed: result.topicsUsed || [],
     });
   } catch (error) {
     console.error('Get questions error:', error);
@@ -1830,10 +2205,10 @@ router.get('/questions', requireDeviceId, async (req, res) => {
 router.post('/submit', requireDeviceId, checkDailyLimit, async (req, res) => {
   try {
     const { deviceId } = req;
-    const { questions, answers, pillar } = req.body;
+    const { questions, answers, pillar, topicsUsed } = req.body;
 
-    if (!questions || !answers || questions.length !== 8 || answers.length !== 8)
-      return res.status(400).json({ success: false, error: 'Invalid submission. 8 questions and 8 answers required.' });
+    if (!questions || !answers || questions.length < 8 || answers.length < 8 || questions.length > 9 || answers.length > 9)
+      return res.status(400).json({ success: false, error: 'Invalid submission. 8 or 9 questions and answers required.' });
     if (!pillar)
       return res.status(400).json({ success: false, error: 'Pillar is required' });
 
@@ -1877,10 +2252,11 @@ router.post('/submit', requireDeviceId, checkDailyLimit, async (req, res) => {
     // STEP 4: Pride moments
     const prideMoments = detectPrideMoment(pillar, todayPillarScore, aliveScore, submissions);
 
-    // STEP 5: Generate content
-    const [individualTipResult, quoteAndTipsResult] = await Promise.allSettled([
+    // STEP 5: Generate content (all in parallel — no extra latency)
+    const [individualTipResult, quoteAndTipsResult, sessionSummaryResult] = await Promise.allSettled([
       generateIndividualTip(profile, pillar, questions, answers, todayPillarScore, submissions),
-      generateQuoteAndStrategicTips(profile, pillar, questions, answers, pillarScores, aliveScore, scoringJustification, submissions)
+      generateQuoteAndStrategicTips(profile, pillar, questions, answers, pillarScores, aliveScore, scoringJustification, submissions),
+      generateSessionSummary(profile, pillar, questions, answers, todayPillarScore, scoringJustification),
     ]);
 
     const individualTip = individualTipResult.status === 'fulfilled'
@@ -1890,6 +2266,10 @@ router.post('/submit', requireDeviceId, checkDailyLimit, async (req, res) => {
     const { quote, message, strategicTips, weakestPillar, weakestBoost } = quoteAndTipsResult.status === 'fulfilled'
       ? quoteAndTipsResult.value
       : { quote: 'You showed up today', message: 'Every check-in is a step forward.', strategicTips: [], weakestPillar: weakest, weakestBoost: null };
+
+    const sessionSummary = sessionSummaryResult.status === 'fulfilled'
+      ? sessionSummaryResult.value
+      : `${profile.name} completed a ${pillar} check-in scoring ${todayPillarScore}/100.`;
 
     const today = getCurrentDateIST();
     const nowTimestamp = new Date().toISOString();
@@ -1907,6 +2287,8 @@ router.post('/submit', requireDeviceId, checkDailyLimit, async (req, res) => {
       pillar: pillar.toLowerCase(),
       questions,
       answers,
+      topicsUsed: Array.isArray(topicsUsed) ? topicsUsed : [],
+      sessionSummary,            // AI digest of this session — used for deep analysis
 
       todayPillarScore,           // this pillar's score today
       scoringJustification,
@@ -1941,8 +2323,30 @@ router.post('/submit', requireDeviceId, checkDailyLimit, async (req, res) => {
     const lastCheckDate = data.lastCheckDate || '';
     const todayCount = lastCheckDate === today ? (data.todayCount || 0) + 1 : 1;
 
+    // Increment session counter for this pillar
+    const currentPillarSessions = data.profile.pillarSessions || {};
+    const newSessionNumber = (currentPillarSessions[pillar.toLowerCase()] || 0) + 1;
+    const updatedPillarSessions = { ...currentPillarSessions, [pillar.toLowerCase()]: newSessionNumber };
+
+    // ── SESSION SUMMARIES — separate top-level field for fast analysis reads ──
+    // Stores a compact digest of every session without loading full Q&A arrays.
+    // Capped at 60 entries (same as MAX_STORED_SUBMISSIONS), newest first.
+    const existingSummaries = data.sessionSummaries || [];
+    const newSummaryEntry = {
+      id: submissionId,
+      date: today,
+      pillar: pillar.toLowerCase(),
+      score: todayPillarScore,
+      aliveScore,
+      summary: sessionSummary,
+      topicsUsed: Array.isArray(topicsUsed) ? topicsUsed : [],
+    };
+    const updatedSummaries = [newSummaryEntry, ...existingSummaries].slice(0, MAX_STORED_SUBMISSIONS);
+
     await docRef.update({
       submissions: updatedSubmissions,
+      sessionSummaries: updatedSummaries,
+      'profile.pillarSessions': updatedPillarSessions,
       totalLifetimeChecks: admin.firestore.FieldValue.increment(1),
       todayCount,
       lastCheckDate: today,
@@ -1978,7 +2382,8 @@ router.post('/submit', requireDeviceId, checkDailyLimit, async (req, res) => {
         weakestBoost,
         prideMoments,
         date: today,
-        timestamp: nowTimestamp
+        timestamp: nowTimestamp,
+        sessionNumber: newSessionNumber,
       },
       remaining: MAX_DAILY_CHECKS - todayCount,
       profile: { name: profile.name }
@@ -2214,12 +2619,42 @@ router.get('/analytics', requireDeviceId, async (req, res) => {
   }
 });
 
+// GET — load cached analysis (no gate, no AI call)
+router.get('/ai-analysis', requireDeviceId, async (req, res) => {
+  try {
+    const { deviceId } = req;
+    const doc = await getDb().collection('aliveChecks').doc(deviceId).get();
+    if (!doc.exists) return res.json({ success: true, analysis: null, canGenerate: true, checksUntilGenerate: 0, totalChecks: 0 });
+
+    const data = doc.data();
+    const submissions = data.submissions || [];
+    const last = data.lastAnalysis || null;
+
+    const newSince = last ? submissions.length - (last.submissionsCountAtGeneration || 0) : submissions.length;
+    const canGenerate = !last || newSince >= 4;
+    const checksUntilGenerate = canGenerate ? 0 : Math.max(0, 4 - newSince);
+
+    return res.json({
+      success: true,
+      analysis: last?.data || null,
+      generatedAt: last?.generatedAt || null,
+      canGenerate,
+      checksUntilGenerate,
+      totalChecks: submissions.length,
+    });
+  } catch (error) {
+    console.error('Get AI analysis error:', error);
+    res.status(500).json({ success: false, error: 'Failed to load analysis.' });
+  }
+});
+
+// POST — generate fresh analysis (gated)
 router.post('/ai-analysis', requireDeviceId, async (req, res) => {
   try {
     const { deviceId } = req;
     const doc = await getDb().collection('aliveChecks').doc(deviceId).get();
 
-    if (!doc.exists) return res.status(404).json({ success: false, error: 'No data found. Complete at least 3 checks.' });
+    if (!doc.exists) return res.status(404).json({ success: false, error: 'No data found. Complete some checks first.' });
 
     const data = doc.data();
     const profile = data.profile;
@@ -2227,11 +2662,30 @@ router.post('/ai-analysis', requireDeviceId, async (req, res) => {
 
     if (!profile?.profileCompleted)
       return res.status(400).json({ success: false, error: 'Profile not completed', needsProfile: true });
-    if (submissions.length < 3)
-      return res.status(400).json({ success: false, error: `You need at least 3 checks for AI insights. You have ${submissions.length}. Keep going!` });
 
-    const analysisResult = await getPersonalizedAnalysis(profile, submissions);
+    if (submissions.length < 1)
+      return res.status(400).json({ success: false, error: 'Complete at least one check-in first.' });
+
+    const lastAnalysis = data.lastAnalysis || null;
+    if (lastAnalysis) {
+      const newSince = submissions.length - (lastAnalysis.submissionsCountAtGeneration || 0);
+      if (newSince < 4)
+        return res.status(400).json({ success: false, error: `Complete ${4 - newSince} more check-in${4 - newSince !== 1 ? 's' : ''} to unlock a fresh analysis.`, checksNeeded: 4 - newSince });
+    }
+
+    const stats = data.stats || null;
+    const storedSessionSummaries = data.sessionSummaries || [];
+    const analysisResult = await getPersonalizedAnalysis(profile, submissions, lastAnalysis, stats, storedSessionSummaries);
     if (!analysisResult.success) return res.status(500).json(analysisResult);
+
+    // Persist to Firestore
+    await getDb().collection('aliveChecks').doc(deviceId).update({
+      lastAnalysis: {
+        data: analysisResult.analysis,
+        generatedAt: new Date().toISOString(),
+        submissionsCountAtGeneration: submissions.length,
+      },
+    });
 
     res.json({ success: true, ...analysisResult, profile: { name: profile.name } });
   } catch (error) {
@@ -2277,6 +2731,71 @@ router.get('/today-count', requireDeviceId, async (req, res) => {
   } catch (error) {
     console.error('Get today count error:', error);
     res.status(500).json({ success: false, error: 'Failed to get count' });
+  }
+});
+
+// ── GET /stats — combined total check-ins + day streak (Alive + Mirror) ──────
+router.get('/stats', requireDeviceId, async (req, res) => {
+  try {
+    const { deviceId } = req;
+    const db = getDb();
+
+    // 1. Fetch both sources in parallel
+    const [aliveDoc, mirrorSnap] = await Promise.all([
+      db.collection('aliveChecks').doc(deviceId).get(),
+      db.collection('mirrorCheckins').where('deviceId', '==', deviceId).get(),
+    ]);
+
+    const aliveSubmissions = aliveDoc.exists ? (aliveDoc.data().submissions || []) : [];
+    const totalCheckIns = aliveSubmissions.length + mirrorSnap.size;
+
+    // 2. Build set of all active dates (YYYY-MM-DD)
+    const activeDates = new Set();
+    aliveSubmissions.forEach(s => { if (s.date) activeDates.add(s.date.slice(0, 10)); });
+    mirrorSnap.docs.forEach(d => { const dt = d.data().date; if (dt) activeDates.add(dt.slice(0, 10)); });
+
+    const sortedAsc = [...activeDates].sort(); // oldest first
+
+    // 3. Longest streak
+    let longestStreak = sortedAsc.length > 0 ? 1 : 0;
+    let tempStreak = 1;
+    for (let i = 1; i < sortedAsc.length; i++) {
+      const diff = (new Date(sortedAsc[i]) - new Date(sortedAsc[i - 1])) / 86400000;
+      if (Math.round(diff) === 1) { tempStreak++; longestStreak = Math.max(longestStreak, tempStreak); }
+      else tempStreak = 1;
+    }
+
+    // 4. Current day streak (consecutive days ending today or yesterday — streak still alive)
+    let dayStreak = 0;
+    if (sortedAsc.length > 0) {
+      const todayStr = new Date().toISOString().slice(0, 10);
+      const lastDate = sortedAsc[sortedAsc.length - 1];
+      const diffFromToday = Math.round((new Date(todayStr) - new Date(lastDate)) / 86400000);
+
+      if (diffFromToday <= 1) { // last activity was today or yesterday
+        dayStreak = 1;
+        for (let i = sortedAsc.length - 2; i >= 0; i--) {
+          const diff = Math.round((new Date(sortedAsc[i + 1]) - new Date(sortedAsc[i])) / 86400000);
+          if (diff === 1) dayStreak++;
+          else break;
+        }
+      }
+    }
+
+    // 5. Persist computed stats to Firestore so they survive across sessions
+    if (aliveDoc.exists) {
+      await db.collection('aliveChecks').doc(deviceId).update({
+        'stats.dayStreak': dayStreak,
+        'stats.longestStreak': longestStreak,
+        'stats.totalCheckIns': totalCheckIns,
+        'stats.updatedAt': new Date().toISOString(),
+      });
+    }
+
+    res.json({ success: true, dayStreak, longestStreak, totalCheckIns });
+  } catch (error) {
+    console.error('Stats error:', error);
+    res.status(500).json({ success: false, error: 'Failed to load stats' });
   }
 });
 
