@@ -5,6 +5,7 @@ const admin = require('firebase-admin');
 const { Resend } = require('resend');
 const cron = require('node-cron');
 const aliveCheckRoutes = require('./aliveCheck');
+const referralRoutes = require('./referrals');
 
 // ============================================
 // FIREBASE INITIALIZATION FROM ENV
@@ -45,8 +46,9 @@ const PORT = process.env.PORT || 5001;
 app.use(cors());
 app.use(express.json());
 
+// REMOVED: Referral routes — referral feature removed
+// app.use('/api/referrals', referralRoutes);
 app.use('/api/alive-check', aliveCheckRoutes);
-
 
 // ============================================
 // CONSTANTS
@@ -59,14 +61,55 @@ const MAX_CHECK_IN_FREQUENCY = 30;
 // HELPER FUNCTIONS
 // ============================================
 
-// Generate 6-character code
+// ✅ UNIFIED: Generate 6-character code (same as aliveCheck)
 const generateCode = () => {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // No confusing chars
   let code = '';
   for (let i = 0; i < 6; i++) {
     code += chars[Math.floor(Math.random() * chars.length)];
   }
   return code;
+};
+
+// ✅ UNIFIED: Ensure code exists across BOTH collections
+const ensureCodeExists = async (deviceId) => {
+  try {
+    // Check users collection first
+    const userDoc = await db.collection('users').doc(deviceId).get();
+    if (userDoc.exists && userDoc.data().code) {
+      return userDoc.data().code;
+    }
+
+    // Check aliveChecks collection
+    const aliveCheckDoc = await db.collection('aliveChecks').doc(deviceId).get();
+    if (aliveCheckDoc.exists && aliveCheckDoc.data().profile?.code) {
+      return aliveCheckDoc.data().profile.code;
+    }
+
+    // Generate new code
+    let code = generateCode();
+    let attempts = 0;
+
+    // Ensure uniqueness across BOTH collections
+    while (attempts < 10) {
+      const [usersQuery, aliveQuery] = await Promise.all([
+        db.collection('users').where('code', '==', code).limit(1).get(),
+        db.collection('aliveChecks').where('profile.code', '==', code).limit(1).get()
+      ]);
+
+      if (usersQuery.empty && aliveQuery.empty) {
+        break;
+      }
+
+      code = generateCode();
+      attempts++;
+    }
+
+    return code;
+  } catch (error) {
+    console.error('Code generation error:', error);
+    return generateCode(); // Fallback
+  }
 };
 
 // Get existing user or create new one
@@ -87,10 +130,24 @@ const getUserByDeviceId = async (deviceId) => {
       };
     }
 
+    // ✅ NEW: Auto-generate code when creating user
+    const code = await ensureCodeExists(deviceId);
+
+    // ✅ ALSO sync to aliveChecks if profile exists
+    const aliveCheckRef = db.collection('aliveChecks').doc(deviceId);
+    const aliveCheckDoc = await aliveCheckRef.get();
+    if (aliveCheckDoc.exists && aliveCheckDoc.data().profile && !aliveCheckDoc.data().profile.code) {
+      await aliveCheckRef.update({
+        'profile.code': code,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+      console.log(`✅ Code synced to aliveChecks: ${deviceId} → ${code}`);
+    }
+
     const userData = {
       deviceId,
       displayName: 'User',
-      code: null,
+      code, // ✅ Auto-generated!
       squadMembers: [],
       checkInFrequency: 1,
       streak: 0,
@@ -102,7 +159,7 @@ const getUserByDeviceId = async (deviceId) => {
     };
 
     await userRef.set(userData);
-    console.log('New user created:', deviceId);
+    console.log('New user created with code:', deviceId, '→', code);
 
     return {
       success: true,
@@ -113,7 +170,7 @@ const getUserByDeviceId = async (deviceId) => {
     console.error('Error in getUserByDeviceId:', error);
     return { success: false, error: error.message };
   }
-};
+};;
 
 // ✅ PRODUCTION MODE - 1 day = 24 hours
 const getCheckInIntervalMs = (frequency) => {
@@ -129,9 +186,10 @@ const safeWatchersCount = (val) => {
 };
 
 // ============================================
-// 📧 EMAIL FUNCTIONS - SIMPLE & VALUABLE
+// 📧 EMAIL FUNCTIONS - REMOVED (check-in feature removed)
 // ============================================
 
+/* REMOVED: Squad/check-in email alert system
 const formatTimeDifference = (milliseconds) => {
   const seconds = Math.floor(milliseconds / 1000);
   const minutes = Math.floor(seconds / 60);
@@ -383,9 +441,12 @@ const sendMissedCheckInEmail = async (user, squadMemberEmail, overdueTime) => {
   }
 };
 
+END REMOVED EMAIL FUNCTIONS */
+
 // ============================================
-// 🔥 CRON JOB: OPTIMIZED FOR PERFORMANCE
+// 🔥 CRON JOB: REMOVED (check-in feature removed)
 // ============================================
+/*
 
 const checkMissedCheckIns = async () => {
   try {
@@ -516,6 +577,7 @@ setTimeout(() => {
   console.log('🚀 Running initial check...');
   checkMissedCheckIns();
 }, 5000);
+*/  // END REMOVED CRON JOB
 
 // ============================================
 // ROUTES
@@ -525,7 +587,7 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
-    version: '2.1.0',
+    version: '3.0.0', // ✅ Bumped for unified code
     features: {
       emailAlerts: true,
       cronJob: true,
@@ -534,6 +596,8 @@ app.get('/health', (req, res) => {
       firebaseFromEnv: true,
       totalCheckIns: true,
       streakTracking: true,
+      unifiedCode: true, // ✅ NEW
+      aliveCheckIntegration: true, // ✅ NEW
     }
   });
 });
@@ -599,12 +663,52 @@ app.post('/api/users/me', getDeviceId, async (req, res) => {
         lastCheckIn: userData.lastCheckIn,
         createdAt: userData.createdAt,
         watchersCount: safeWatchersCount(userData.watchersCount),
+        subscription: userData.subscription || null,
       },
       isNewUser: req.isNewUser || false,
     });
   } catch (error) {
     console.error('Get user error:', error);
     res.status(500).json({ success: false, error: 'Failed to get user' });
+  }
+});
+
+app.get('/api/version-check', async (req, res) => {
+  try {
+    console.log('🔍 Version check API called');
+
+    // ✅ Fetch from Firestore appConfig/versionControl
+    const versionDoc = await db.collection('appConfig').doc('versionControl').get();
+
+    if (!versionDoc.exists) {
+      console.log('⚠️ No version config found in Firestore');
+      return res.json({
+        success: true,
+        versionControl: null
+      });
+    }
+
+    const versionData = versionDoc.data();
+    console.log('✅ Version config found:', versionData.minimumVersion);
+
+    res.json({
+      success: true,
+      versionControl: {
+        minimumVersion: versionData.minimumVersion,
+        latestVersion: versionData.latestVersion,
+        forceUpdate: versionData.forceUpdate,
+        updateMessages: versionData.updateMessages,
+        appStoreUrl: versionData.appStoreUrl
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Version check error:', error);
+    res.json({
+      success: false,
+      versionControl: null,
+      error: error.message
+    });
   }
 });
 
@@ -648,6 +752,7 @@ app.post('/api/users/update-name', getDeviceId, async (req, res) => {
   }
 });
 
+/* REMOVED: Check-in frequency — check-in feature removed
 app.post('/api/users/checkin-frequency', getDeviceId, async (req, res) => {
   try {
     const { frequency } = req.body;
@@ -684,7 +789,9 @@ app.post('/api/users/checkin-frequency', getDeviceId, async (req, res) => {
     res.status(500).json({ success: false, error: 'Failed to update frequency' });
   }
 });
+*/  // END REMOVED checkin-frequency
 
+// ✅ UNIFIED: Generate code and sync to BOTH collections
 app.post('/api/users/generate-code', getDeviceId, async (req, res) => {
   try {
     const userRef = db.collection('users').doc(req.deviceId);
@@ -694,6 +801,7 @@ app.post('/api/users/generate-code', getDeviceId, async (req, res) => {
       return res.status(404).json({ success: false, error: 'User not found' });
     }
 
+    // Check if code already exists
     if (userDoc.data().code) {
       return res.json({
         success: true,
@@ -702,34 +810,26 @@ app.post('/api/users/generate-code', getDeviceId, async (req, res) => {
       });
     }
 
-    let code = generateCode();
-    let attempts = 0;
+    // ✅ Generate unified code
+    const code = await ensureCodeExists(req.deviceId);
 
-    while (attempts < 10) {
-      const existingCode = await db
-        .collection('users')
-        .where('code', '==', code)
-        .get();
-
-      if (existingCode.empty) {
-        break;
-      }
-
-      code = generateCode();
-      attempts++;
-    }
-
-    if (attempts >= 10) {
-      return res.status(500).json({
-        success: false,
-        error: 'Failed to generate unique code. Please try again.'
-      });
-    }
-
+    // ✅ Save to users collection
     await userRef.update({
       code,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
+
+    // ✅ Sync to aliveChecks collection if profile exists
+    const aliveCheckRef = db.collection('aliveChecks').doc(req.deviceId);
+    const aliveCheckDoc = await aliveCheckRef.get();
+
+    if (aliveCheckDoc.exists && aliveCheckDoc.data().profile) {
+      await aliveCheckRef.update({
+        'profile.code': code,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      console.log(`✅ Code synced to aliveChecks: ${req.deviceId} → ${code}`);
+    }
 
     console.log('Code generated:', req.deviceId, '→', code);
 
@@ -744,9 +844,10 @@ app.post('/api/users/generate-code', getDeviceId, async (req, res) => {
 });
 
 // ============================================
-// CHECK-IN ROUTE - DUAL TRACKING
+// CHECK-IN ROUTES - REMOVED (check-in feature removed)
 // ============================================
 
+/* REMOVED: check-in and check-in status routes
 app.post('/api/users/checkin', getDeviceId, async (req, res) => {
   try {
     const userRef = db.collection('users').doc(req.deviceId);
@@ -861,10 +962,13 @@ app.post('/api/users/checkin/status', getDeviceId, async (req, res) => {
     res.status(500).json({ success: false, error: 'Failed to get status' });
   }
 });
+*/  // END REMOVED check-in routes
 
 // ============================================
-// SQUAD ROUTES
+// SQUAD ROUTES - REMOVED (check-in feature removed)
 // ============================================
+
+/*
 
 app.post('/api/squad/add-member', getDeviceId, async (req, res) => {
   try {
@@ -990,10 +1094,13 @@ app.post('/api/squad/members/:id/remove', getDeviceId, async (req, res) => {
     res.status(500).json({ success: false, error: 'Failed to remove squad member' });
   }
 });
+*/  // END REMOVED squad routes
 
 // ============================================
-// WATCHING ROUTES
+// WATCHING ROUTES - REMOVED (check-in feature removed)
 // ============================================
+
+/*
 
 app.post('/api/watching/add', async (req, res) => {
   try {
@@ -1016,6 +1123,7 @@ app.post('/api/watching/add', async (req, res) => {
       });
     }
 
+    // ✅ Search ONLY in users collection (Still Alive daily check-ins)
     const targetSnapshot = await db
       .collection('users')
       .where('code', '==', codeUpper)
@@ -1071,7 +1179,7 @@ app.post('/api/watching/add', async (req, res) => {
       }
     });
 
-    console.log('Watching added:', deviceId, '→', codeUpper);
+    console.log('Watching added (Daily Check-in):', deviceId, '→', codeUpper);
 
     res.json({
       success: true,
@@ -1153,7 +1261,7 @@ app.get('/api/watching/list', async (req, res) => {
       });
     }
 
-    console.log(`Watching list fetched (${deviceId}): ${watching.length} people`);
+    console.log(`Watching list fetched (Daily Check-in) (${deviceId}): ${watching.length} people`);
 
     res.json({
       success: true,
@@ -1209,7 +1317,7 @@ app.delete('/api/watching/:id', async (req, res) => {
       }
     });
 
-    console.log('Stopped watching:', id);
+    console.log('Stopped watching (Daily Check-in):', id);
 
     res.json({
       success: true,
@@ -1225,9 +1333,10 @@ app.delete('/api/watching/:id', async (req, res) => {
     res.status(500).json({ success: false, error: 'Failed to stop watching' });
   }
 });
+*/  // END REMOVED watching routes
 
 // ============================================
-// ACCOUNT MANAGEMENT
+// ACCOUNT MANAGEMENT ✅
 // ============================================
 
 app.post('/api/account/delete', getDeviceId, async (req, res) => {
@@ -1307,6 +1416,999 @@ app.post('/api/account/delete', getDeviceId, async (req, res) => {
 });
 
 // ============================================
+// PULSE CHALLENGES
+// ============================================
+
+const STATIC_CHALLENGES = [
+  {
+    id: 'c2', emoji: '🌙', duration: '30 DAYS',
+    title: '30-Day Momentum Build',
+    tagline: 'The most popular starting point.',
+    benefit: 'Most people quit before day 21. You won\'t. In 30 days your Alive Score reveals exactly which pillar has been quietly holding the rest of you back — and you\'ll finally know where to focus.',
+    baseSeed: 57204,
+  },
+  {
+    id: 'c5', emoji: '⚡', duration: '60 DAYS',
+    title: '60-Day Deep Rewire',
+    tagline: 'Where real patterns finally surface.',
+    benefit: 'Two months strips away the excuses. Your actual patterns show up in the data — not the ones you think you have. The gap between your strongest and weakest pillar starts closing. People around you notice something is different.',
+    baseSeed: 31847,
+  },
+  {
+    id: 'c3', emoji: '🏆', duration: '90 DAYS',
+    title: '90-Day Baseline Shift',
+    tagline: 'Your new normal — permanently.',
+    benefit: 'This is the point of no return. What used to drain you starts losing its grip. Things that once felt heavy become automatic. Your emotional baseline moves — and it doesn\'t come back down.',
+    baseSeed: 79312,
+  },
+  {
+    id: 'c4', emoji: '🌟', duration: '1 YEAR',
+    title: '1-Year Total Transformation',
+    tagline: 'The long game. The real one.',
+    benefit: 'Most people overestimate what they can do in a week. They catastrophically underestimate what they can do in a year. 8 in 10 people who finish this say they don\'t recognise their old self.',
+    baseSeed: 81097,
+  },
+];
+
+// GET /api/pulse/challenges — list all challenges with live enroll counts
+app.get('/api/pulse/challenges', async (req, res) => {
+  try {
+    const deviceId = req.query.deviceId || null;
+    const challenges = await Promise.all(
+      STATIC_CHALLENGES.map(async (ch) => {
+        // Get total enroll count from Firestore (falls back to seed)
+        let enrollCount = ch.baseSeed;
+        try {
+          const countDoc = await db.collection('challengeEnrollments').doc(ch.id).get();
+          if (countDoc.exists) enrollCount = ch.baseSeed + (countDoc.data().count || 0);
+        } catch (_) { }
+
+        // Check if this device is enrolled
+        let enrolled = false;
+        if (deviceId) {
+          try {
+            const userEnroll = await db.collection('challengeEnrollments')
+              .doc(ch.id).collection('members').doc(deviceId).get();
+            enrolled = userEnroll.exists;
+          } catch (_) { }
+        }
+
+        return { ...ch, enrollCount, enrolled };
+      })
+    );
+
+    res.json({ success: true, challenges });
+  } catch (error) {
+    console.error('Get challenges error:', error);
+    res.status(500).json({ success: false, error: 'Failed to load challenges' });
+  }
+});
+
+// POST /api/pulse/challenges/enroll — enroll a device in a challenge
+app.post('/api/pulse/challenges/enroll', getDeviceId, async (req, res) => {
+  try {
+    const deviceId = req.deviceId;
+    const { challengeId } = req.body;
+
+    if (!challengeId) return res.status(400).json({ success: false, error: 'challengeId required' });
+
+    const challenge = STATIC_CHALLENGES.find(c => c.id === challengeId);
+    if (!challenge) return res.status(404).json({ success: false, error: 'Challenge not found' });
+
+    const challengeRef = db.collection('challengeEnrollments').doc(challengeId);
+    const memberRef = challengeRef.collection('members').doc(deviceId);
+
+    const alreadyEnrolled = await memberRef.get();
+    if (!alreadyEnrolled.exists) {
+      // Atomically increment count and add member
+      await db.runTransaction(async (t) => {
+        const countDoc = await t.get(challengeRef);
+        const currentCount = countDoc.exists ? (countDoc.data().count || 0) : 0;
+        t.set(challengeRef, { count: currentCount + 1, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+        t.set(memberRef, { enrolledAt: admin.firestore.FieldValue.serverTimestamp(), deviceId });
+      });
+    }
+
+    // Return updated count
+    const updatedDoc = await challengeRef.get();
+    const liveCount = challenge.baseSeed + (updatedDoc.exists ? updatedDoc.data().count || 0 : 1);
+
+    res.json({ success: true, challengeId, enrollCount: liveCount });
+  } catch (error) {
+    console.error('Enroll challenge error:', error);
+    res.status(500).json({ success: false, error: 'Failed to enroll' });
+  }
+});
+
+// POST /api/pulse/challenges/log-activity
+// Called after each pillar check-in to record pillar count for that day
+app.post('/api/pulse/challenges/log-activity', getDeviceId, async (req, res) => {
+  try {
+    const deviceId = req.deviceId;
+    const { pillarCount } = req.body; // 0-4
+
+    if (pillarCount == null) {
+      return res.status(400).json({ success: false, error: 'pillarCount required' });
+    }
+
+    // Find which challenge this device is enrolled in
+    let enrolledChallengeId = null;
+    for (const ch of STATIC_CHALLENGES) {
+      const memberRef = db.collection('challengeEnrollments')
+        .doc(ch.id).collection('members').doc(deviceId);
+      const snap = await memberRef.get();
+      if (snap.exists) { enrolledChallengeId = ch.id; break; }
+    }
+
+    if (!enrolledChallengeId) {
+      return res.json({ success: false, error: 'Not enrolled in any challenge' });
+    }
+
+    // Store today's activity: key = YYYY-MM-DD
+    const today = new Date().toISOString().slice(0, 10);
+    const activityRef = db
+      .collection('challengeActivity')
+      .doc(`${deviceId}_${enrolledChallengeId}`)
+      .collection('days')
+      .doc(today);
+
+    await activityRef.set({
+      date: today,
+      pillarCount: Math.min(4, Math.max(0, parseInt(pillarCount) || 0)),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    res.json({ success: true, date: today, pillarCount });
+  } catch (error) {
+    console.error('Log activity error:', error);
+    res.status(500).json({ success: false, error: 'Failed to log activity' });
+  }
+});
+
+// GET /api/pulse/challenges/progress?deviceId=X
+// Returns dot grid: enrolledChallengeId, enrolledAt, days array [{date, pillarCount}]
+app.get('/api/pulse/challenges/progress', async (req, res) => {
+  try {
+    const { deviceId } = req.query;
+    if (!deviceId) return res.status(400).json({ success: false, error: 'deviceId required' });
+
+    // Find enrolled challenge
+    let enrolledChallengeId = null;
+    let enrolledAt = null;
+    for (const ch of STATIC_CHALLENGES) {
+      const memberRef = db.collection('challengeEnrollments')
+        .doc(ch.id).collection('members').doc(deviceId);
+      const snap = await memberRef.get();
+      if (snap.exists) {
+        enrolledChallengeId = ch.id;
+        enrolledAt = snap.data().enrolledAt?.toDate()?.toISOString() || null;
+        break;
+      }
+    }
+
+    if (!enrolledChallengeId) {
+      return res.json({ success: true, enrolled: false, days: [] });
+    }
+
+    // Fetch all activity days
+    const activitySnap = await db
+      .collection('challengeActivity')
+      .doc(`${deviceId}_${enrolledChallengeId}`)
+      .collection('days')
+      .orderBy('date', 'asc')
+      .get();
+
+    const days = activitySnap.docs.map(d => ({
+      date: d.data().date,
+      pillarCount: d.data().pillarCount || 0,
+    }));
+
+    res.json({
+      success: true,
+      enrolled: true,
+      challengeId: enrolledChallengeId,
+      enrolledAt,
+      days,
+    });
+  } catch (error) {
+    console.error('Get progress error:', error);
+    res.status(500).json({ success: false, error: 'Failed to get progress' });
+  }
+});
+// ════════════════════════════════════════════
+// MIRROR — Daily Emotional Check-in
+// ════════════════════════════════════════════
+const { OpenAI } = require('openai');
+const mirrorOpenAI = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+const MIRROR_SYSTEM_PROMPT = `You are Mirror. One job: make the person feel completely heard. Nothing else.
+
+Voice: the one friend who tells you the truth, not the one who comforts you. Raw, direct, human.
+
+Rules (never break these):
+- Exactly 2 sentences. Short ones. End there.
+- Sentence 1: use their exact words or a specific detail from what they wrote. Do not paraphrase. Do not ignore their note.
+- Sentence 2: one honest, specific observation about today. A fact, not comfort.
+- Good sentence 2 examples: "That's a heavy one to carry." / "You got through it anyway." / "That kind of day leaves a mark." / "That's worth more than you're giving it." / "You showed up anyway."
+- Write like a human texting. Short. Direct. No filler.
+- BANNED (never use): it seems, it appears, navigating, understandable, it sounds like, it's clear, I can see, keep going, hang in there, I understand, that must be, I hear you, silver lining, proud of you, well done, you're doing great, remember to, make sure to
+- NEVER give advice. NEVER suggest next steps. NEVER add encouragement or hope.
+- No emojis. No hashtags. Write in second person ("You said X. That's Y."). Two sentences. Stop.`;
+
+const MOOD_LABELS = { 1: 'Rough', 2: 'Okay', 3: 'Good', 4: 'Thriving' };
+
+// Follow-up purpose: understand how they PROCESSED the emotion after.
+// Rough → how did they cope/get through it?
+// Okay  → how did they sit with it or shake it?
+// Good  → did they actually enjoy/celebrate it?
+// Thriving → did they let themselves fully have it?
+const FOLLOW_UP_POOLS = {
+  1: [
+    'How did you get through the rest of that day?',
+    'What did you do with the weight of it?',
+    'Did anything help, or did you just push through?',
+    'How did you handle it in the end?',
+    'Did you let yourself sit with it, or distract?',
+  ],
+  2: [
+    'Did you just let it pass, or try to shake it?',
+    'What did you end up doing with the rest of the day?',
+    'Did you do anything to try and shift the vibe?',
+    'How did you sit with the flatness?',
+    'Did it stay that way all day, or shift at some point?',
+  ],
+  3: [
+    'Did you actually let yourself enjoy it?',
+    'What did you do with that energy?',
+    'Did you celebrate it at all, or just keep moving?',
+    'How did you make the most of it?',
+    'Did you share it with anyone?',
+  ],
+  4: [
+    'Did you let yourself fully have that day?',
+    'How did you actually enjoy it — what did you do?',
+    'Did you celebrate it, or just ride the wave?',
+    'What did you do with all that energy?',
+    'Did you mark the moment at all?',
+  ],
+};
+function pickFollowUpQ(moodLevel) {
+  const pool = FOLLOW_UP_POOLS[moodLevel] || FOLLOW_UP_POOLS[2];
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+function buildMirrorContext(mood, aliveData, note) {
+  const noteSection = note
+    ? `What they wrote (USE THIS — quote their exact words): "${note}"`
+    : 'They did not add a note.';
+  return `Today's mood: ${MOOD_LABELS[mood.moodLevel]} (${mood.moodLevel}/4)
+${noteSection}
+
+Alive Score today: Overall ${aliveData.aliveScore || 'N/A'} | Health ${aliveData.health || 'N/A'} | Wealth ${aliveData.wealth || 'N/A'} | Love ${aliveData.love || 'N/A'} | Purpose ${aliveData.purpose || 'N/A'}`;
+}
+
+// GET /api/mirror/today — today's latest entry + unanswered follow-up from yesterday
+app.get('/api/mirror/today', async (req, res) => {
+  try {
+    const deviceId = req.headers['x-device-id'];
+    if (!deviceId) return res.status(400).json({ success: false, error: 'Missing device ID' });
+
+    const today = req.headers['x-dev-date'] || new Date().toISOString().split('T')[0];
+    const yesterdayD = new Date(today + 'T00:00:00Z');
+    yesterdayD.setUTCDate(yesterdayD.getUTCDate() - 1);
+    const yesterday = yesterdayD.toISOString().split('T')[0];
+
+    // Query all device docs — filter by date in JS (avoids composite index requirement)
+    const allSnap = await db.collection('mirrorCheckins')
+      .where('deviceId', '==', deviceId)
+      .get();
+    const all = allSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+
+    const todayDocs = all
+      .filter(c => c.date === today)
+      .sort((a, b) => (b.timestamp?.toMillis?.() || 0) - (a.timestamp?.toMillis?.() || 0));
+    const latestToday = todayDocs[0] || null;
+
+    const yestDocs = all
+      .filter(c => c.date === yesterday)
+      .sort((a, b) => (b.timestamp?.toMillis?.() || 0) - (a.timestamp?.toMillis?.() || 0));
+    const latestYest = yestDocs[0] || null;
+
+    // Return unanswered follow-up from yesterday's most recent entry
+    let followUp = null;
+    if (latestYest?.followUpQ && !latestYest?.followUpA) {
+      followUp = {
+        q: latestYest.followUpQ,
+        moodLevel: latestYest.moodLevel,
+        mood: latestYest.mood,
+        docId: latestYest.id,
+      };
+    }
+
+    const todayTsMs = latestToday?.timestamp?.toMillis?.() || null;
+    res.json({
+      success: true,
+      checkedIn: todayDocs.length > 0,
+      today: latestToday ? {
+        mood: latestToday.mood, moodLevel: latestToday.moodLevel,
+        observation: latestToday.observation, note: latestToday.note,
+        streak: latestToday.streak, id: latestToday.id,
+        tsMs: todayTsMs,
+      } : null,
+      followUp,
+    });
+  } catch (err) {
+    console.error('Mirror today error:', err);
+    res.status(500).json({ success: false, error: 'Failed to fetch today' });
+  }
+});
+
+// POST /api/mirror/checkin — save immediately, generate AI async
+app.post('/api/mirror/checkin', async (req, res) => {
+  try {
+    const deviceId = req.headers['x-device-id'];
+    if (!deviceId) return res.status(400).json({ success: false, error: 'Missing device ID' });
+
+    // followUpDocId + followUpAnswer: answer to yesterday's pending follow-up, submitted together
+    const { moodLevel, note, aliveData, followUpDocId, followUpAnswer } = req.body;
+    if (!moodLevel || moodLevel < 1 || moodLevel > 4) {
+      return res.status(400).json({ success: false, error: 'Invalid moodLevel (1-4)' });
+    }
+
+    const today = req.headers['x-dev-date'] || new Date().toISOString().split('T')[0];
+    const todayMs = new Date(today + 'T00:00:00Z').getTime();
+
+    // Get history for streak + AI context
+    const histSnap = await db.collection('mirrorCheckins')
+      .where('deviceId', '==', deviceId)
+      .get();
+    const allDocs = histSnap.docs.map(d => ({ date: d.data().date, moodLevel: d.data().moodLevel }));
+
+    // ── Block duplicate check-in ─────────────────────────────────────────────
+    const todayDocs = histSnap.docs
+      .filter(d => d.data().date === today)
+      .sort((a, b) => (b.data().timestamp?.toMillis?.() || 0) - (a.data().timestamp?.toMillis?.() || 0));
+    if (todayDocs.length > 0) {
+      const e = todayDocs[0].data();
+      return res.status(409).json({
+        success: false, alreadyCheckedIn: true,
+        docId: todayDocs[0].id, mood: e.mood, moodLevel: e.moodLevel,
+        note: e.note || null, observation: e.observation || null, streak: e.streak || 1,
+      });
+    }
+    // ────────────────────────────────────────────────────────────────────────
+
+    // Streak uses unique days only
+    const uniquePastDates = [...new Set(allDocs.filter(d => d.date !== today).map(d => d.date))].sort().reverse();
+    let streak = 1;
+    for (let i = 0; i < uniquePastDates.length; i++) {
+      const expected = new Date(todayMs - (i + 1) * 86400000).toISOString().split('T')[0];
+      if (uniquePastDates[i] === expected) streak++;
+      else break;
+    }
+
+    const followUpQ = pickFollowUpQ(moodLevel);
+    const docRef = db.collection('mirrorCheckins').doc(); // auto-ID — unlimited entries per day
+
+    // Save check-in + optionally save yesterday's follow-up answer in one shot
+    const batch = db.batch();
+    batch.set(docRef, {
+      deviceId, date: today, docId: docRef.id,
+      mood: MOOD_LABELS[moodLevel], moodLevel,
+      note: note || null, observation: null, followUpQ,
+      aliveScore: aliveData?.aliveScore || null,
+      streak, timestamp: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    if (followUpDocId && followUpAnswer) {
+      const prevRef = db.collection('mirrorCheckins').doc(followUpDocId);
+      batch.update(prevRef, { followUpA: followUpAnswer });
+    }
+    await batch.commit();
+
+    // Respond immediately — client shows done state right away
+    res.json({ success: true, observation: null, followUpQ, streak, mood: MOOD_LABELS[moodLevel], moodLevel, docId: docRef.id });
+
+    // Generate AI observation in background
+    try {
+      const ctx = buildMirrorContext({ moodLevel }, aliveData || {}, note);
+      const completion = await mirrorOpenAI.chat.completions.create({
+        model: 'gpt-4o-mini', max_tokens: 120,
+        messages: [
+          { role: 'system', content: MIRROR_SYSTEM_PROMPT },
+          { role: 'user', content: ctx },
+        ],
+      });
+      const observation = completion.choices[0]?.message?.content?.trim() || '';
+      if (observation) await docRef.update({ observation });
+    } catch (aiErr) {
+      console.error('Mirror AI error:', aiErr.message);
+      await docRef.update({ observation: 'Something real is happening. Keep showing up.' });
+    }
+  } catch (err) {
+    console.error('Mirror checkin error:', err);
+    res.status(500).json({ success: false, error: 'Failed to save check-in' });
+  }
+});
+
+// POST /api/mirror/followup — save follow-up answer
+app.post('/api/mirror/followup', async (req, res) => {
+  try {
+    const deviceId = req.headers['x-device-id'];
+    if (!deviceId) return res.status(400).json({ success: false, error: 'Missing device ID' });
+
+    const { docId, answer } = req.body;
+    if (!docId || !answer) return res.status(400).json({ success: false, error: 'Missing docId or answer' });
+
+    await db.collection('mirrorCheckins').doc(docId).update({ followUpA: answer });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Mirror followup error:', err);
+    res.status(500).json({ success: false, error: 'Failed to save follow-up' });
+  }
+});
+
+// POST /api/mirror/analysis — deep pattern analysis, gated: 7 unique check-ins since last
+app.post('/api/mirror/analysis', async (req, res) => {
+  try {
+    const deviceId = req.headers['x-device-id'];
+    if (!deviceId) return res.status(400).json({ success: false, error: 'Missing device ID' });
+
+    const { aliveData } = req.body;
+    const THRESHOLD = 7;
+
+    // 1. Get all check-ins, deduplicate by date (latest per day)
+    const checkinSnap = await db.collection('mirrorCheckins').where('deviceId', '==', deviceId).get();
+    const byDate = {};
+    checkinSnap.docs.forEach(d => {
+      const r = d.data();
+      const tsMs = r.timestamp?.toMillis?.() || 0;
+      if (!byDate[r.date] || tsMs > (byDate[r.date].tsMs || 0)) byDate[r.date] = { ...r, tsMs };
+    });
+    const uniqueCheckins = Object.values(byDate).sort((a, b) => a.date.localeCompare(b.date));
+    const totalUniqueDays = uniqueCheckins.length;
+
+    // 2. Check if there's already an analysis and how many check-ins since
+    const analysisSnap = await db.collection('mirrorAnalyses').where('deviceId', '==', deviceId).get();
+    const analyses = analysisSnap.docs
+      .map(d => ({ id: d.id, ...d.data(), generatedAtMs: d.data().generatedAt?.toMillis?.() || 0 }))
+      .sort((a, b) => b.generatedAtMs - a.generatedAtMs);
+    const latestAnalysis = analyses[0] || null;
+
+    const checkinsSinceLast = Math.max(0, latestAnalysis ? totalUniqueDays - (latestAnalysis.checkinCount || 0) : totalUniqueDays);
+    if (checkinsSinceLast < THRESHOLD) {
+      return res.status(403).json({
+        success: false, locked: true,
+        needed: THRESHOLD - checkinsSinceLast,
+        checkinsSinceLast, totalUniqueDays,
+      });
+    }
+
+    if (totalUniqueDays === 0) {
+      return res.status(403).json({ success: false, locked: true, needed: THRESHOLD, checkinsSinceLast: 0, totalUniqueDays: 0 });
+    }
+
+    // 3. Use last 30 unique-date check-ins for analysis
+    const checkins = uniqueCheckins.slice(-30);
+    const dist = { 1: 0, 2: 0, 3: 0, 4: 0 };
+    checkins.forEach(c => { if (c.moodLevel) dist[c.moodLevel]++; });
+
+    // Day-of-week mood averages
+    const DAY_NAMES_A = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    const dayStats = {};
+    checkins.forEach(c => {
+      const day = DAY_NAMES_A[new Date(c.date + 'T00:00:00').getDay()];
+      if (!dayStats[day]) dayStats[day] = { total: 0, count: 0 };
+      dayStats[day].total += c.moodLevel;
+      dayStats[day].count++;
+    });
+    const dayBreakdown = Object.entries(dayStats)
+      .sort((a, b) => DAY_NAMES_A.indexOf(a[0]) - DAY_NAMES_A.indexOf(b[0]))
+      .map(([day, s]) => `${day}:${(s.total / s.count).toFixed(1)}`)
+      .join(' | ');
+
+    // Recent trend: last 5 vs previous 5
+    const sorted = [...checkins].reverse();
+    const last5avg = sorted.slice(0, 5).reduce((s, c) => s + c.moodLevel, 0) / Math.min(5, sorted.length);
+    const prev5avg = sorted.slice(5, 10).length
+      ? sorted.slice(5, 10).reduce((s, c) => s + c.moodLevel, 0) / sorted.slice(5, 10).length
+      : null;
+    const trendNote = prev5avg === null ? 'not enough data for trend'
+      : last5avg > prev5avg + 0.3 ? `improving (last 5 avg ${last5avg.toFixed(1)} vs prev 5 avg ${prev5avg.toFixed(1)})`
+      : last5avg < prev5avg - 0.3 ? `declining (last 5 avg ${last5avg.toFixed(1)} vs prev 5 avg ${prev5avg.toFixed(1)})`
+      : `stable (last 5 avg ${last5avg.toFixed(1)})`;
+
+    const history = checkins.map(c => {
+      const parts = [`${c.date} | ${MOOD_LABELS[c.moodLevel] || '?'}`];
+      if (c.note) parts.push(`note: "${c.note}"`);
+      if (c.followUpA) parts.push(`follow-up: "${c.followUpA}"`);
+      return parts.join(' | ');
+    }).join('\n');
+
+    const userPrompt = `Read this person's full check-in history and return EXACTLY this format — 6 labeled lines, nothing else:
+
+PATTERN: [one sentence — dominant mood, what kept showing up, include rough/good/okay counts]
+QUOTE: "[copy their EXACT words from a note]" — [what it reveals about them, max 8 words]
+HIDDEN: [one sentence — something about timing, day of week, or triggers they definitely haven't noticed themselves — be specific, use the day breakdown data]
+TRUTH: [one sentence — the most uncomfortable specific truth this data shows — not generic, not soft]
+CONCLUSION: [one sentence using "we" — honest verdict: are we doing well or do we need to work on something specific. e.g. "We need to deal with whatever's happening at work every week." or "We're in a good stretch — let's not sleepwalk through it."]
+GOALS: [goal 1] | [goal 2] | [goal 3] | [goal 4] | [goal 5]
+
+Rules:
+- PATTERN: state counts, e.g. "8 rough days out of 13 — mostly in the first half."
+- QUOTE: copy word-for-word from their notes. Put in quotes. Do not paraphrase.
+- HIDDEN: must use the day-of-week data or timing data to name a specific pattern. e.g. "Mondays average 1.5 — worst day by far." If no clear day pattern, look for trigger patterns in notes.
+- TRUTH: must be specific to their data. Not "you're stressed" — say WHY and WHAT. Make it land.
+- CONCLUSION: "we" always. Name the actual thing to work on or celebrate. No vague language.
+- GOALS: always include. Write exactly 3-5 goals separated by " | ". Goals must be specific, concrete, and directly derived from their check-in patterns and notes — not generic. Each goal is one short actionable sentence. e.g. "Text one person when work feels heavy" or "Block 20 mins after work before checking your phone" or "Name what made the good days good and repeat it". Tailor to what their data actually shows.
+- If data is genuinely unclear for a section, say so briefly — do not invent.
+- No padding, no intro, no bullet points, no emojis. Six labeled lines only.
+
+Stats:
+Total: ${checkins.length} check-ins | Rough ${dist[1]}× · Okay ${dist[2]}× · Good ${dist[3]}× · Thriving ${dist[4]}×
+Trend: ${trendNote}
+Day averages (1=Rough 4=Thriving): ${dayBreakdown}
+Alive Score: ${aliveData?.aliveScore || 'N/A'} | Health: ${aliveData?.pillarScores?.health || 'N/A'} | Wealth: ${aliveData?.pillarScores?.wealth || 'N/A'} | Love: ${aliveData?.pillarScores?.love || 'N/A'} | Purpose: ${aliveData?.pillarScores?.purpose || 'N/A'}
+
+Check-ins (oldest → newest):
+${history}`;
+
+    const completion = await mirrorOpenAI.chat.completions.create({
+      model: 'gpt-4o-mini',
+      max_tokens: 480,
+      messages: [
+        { role: 'system', content: 'You are Mirror — the one friend who has read every single check-in and tells the truth. Return exactly 6 labeled lines: PATTERN:, QUOTE:, HIDDEN:, TRUTH:, CONCLUSION:, GOALS:. No bullets. No intro. No extra text. Each line starts with its label. GOALS: is always the last line — write 3-5 short goals separated by " | ", specific to their data. Be specific throughout — reference actual counts, days, words they wrote. The goal: make them say "how did it know that?" Sound like a person paying close attention, not an AI.' },
+        { role: 'user', content: userPrompt },
+      ],
+    });
+
+    const analysis = completion.choices[0]?.message?.content?.trim() || 'Mirror sees something forming. Check back as more data arrives.';
+
+    // 4. Persist analysis so user can view it anytime
+    await db.collection('mirrorAnalyses').add({
+      deviceId, analysis,
+      checkinCount: totalUniqueDays,
+      generatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    res.json({ success: true, analysis, checkinCount: totalUniqueDays });
+  } catch (err) {
+    console.error('Mirror analysis error:', err);
+    res.status(500).json({ success: false, error: 'Failed to generate analysis' });
+  }
+});
+
+// GET /api/mirror/analysis/status — latest saved analysis + progress toward next
+app.get('/api/mirror/analysis/status', async (req, res) => {
+  try {
+    const deviceId = req.headers['x-device-id'];
+    if (!deviceId) return res.status(400).json({ success: false });
+
+    const THRESHOLD = 7;
+
+    // Unique check-in days
+    const checkinSnap = await db.collection('mirrorCheckins').where('deviceId', '==', deviceId).get();
+    const uniqueDates = new Set(checkinSnap.docs.map(d => d.data().date));
+    const totalUniqueDays = uniqueDates.size;
+
+    // Latest saved analysis
+    const analysisSnap = await db.collection('mirrorAnalyses').where('deviceId', '==', deviceId).get();
+    const analyses = analysisSnap.docs
+      .map(d => ({ id: d.id, ...d.data(), generatedAtMs: d.data().generatedAt?.toMillis?.() || 0 }))
+      .sort((a, b) => b.generatedAtMs - a.generatedAtMs);
+    const latest = analyses[0] || null;
+
+    const checkinsSinceLast = Math.max(0, latest ? totalUniqueDays - (latest.checkinCount || 0) : totalUniqueDays);
+    const needed = Math.max(0, THRESHOLD - checkinsSinceLast);
+    const canGenerate = needed === 0;
+
+    res.json({
+      success: true,
+      latest: latest ? {
+        analysis: latest.analysis,
+        generatedAtMs: latest.generatedAtMs,
+        checkinCount: latest.checkinCount,
+      } : null,
+      totalUniqueDays,
+      checkinsSinceLast,
+      needed,
+      canGenerate,
+    });
+  } catch (e) {
+    console.error('[Mirror] analysis status error:', e);
+    res.status(500).json({ success: false });
+  }
+});
+
+// ── Goals CRUD ──────────────────────────────────────────────────────────────
+
+// GET /api/mirror/goals
+app.get('/api/mirror/goals', async (req, res) => {
+  try {
+    const deviceId = req.headers['x-device-id'];
+    if (!deviceId) return res.status(400).json({ success: false });
+    const snap = await db.collection('mirrorGoals')
+      .where('deviceId', '==', deviceId)
+      .get();
+    const goals = snap.docs
+      .map(d => {
+        const data = d.data();
+        return { id: d.id, text: data.text, source: data.source,
+          createdAt: data.createdAt?.toMillis?.() || 0 };
+      })
+      .sort((a, b) => b.createdAt - a.createdAt);
+    res.json({ success: true, goals });
+  } catch (e) {
+    console.error('[Goals] fetchGoals error:', e);
+    res.status(500).json({ success: false });
+  }
+});
+
+// POST /api/mirror/goals
+app.post('/api/mirror/goals', async (req, res) => {
+  try {
+    const deviceId = req.headers['x-device-id'];
+    const { text, source = 'custom' } = req.body;
+    if (!deviceId || !text?.trim()) return res.status(400).json({ success: false });
+    const ref = db.collection('mirrorGoals').doc();
+    await ref.set({ deviceId, text: text.trim(), source, completed: false,
+      createdAt: admin.firestore.FieldValue.serverTimestamp() });
+    res.json({ success: true, id: ref.id, text: text.trim(), source, completed: false });
+  } catch (e) { res.status(500).json({ success: false }); }
+});
+
+// PATCH /api/mirror/goals/:id — toggle complete
+app.patch('/api/mirror/goals/:id', async (req, res) => {
+  try {
+    const { completed } = req.body;
+    const update = completed
+      ? { completed: true, completedAt: admin.firestore.FieldValue.serverTimestamp() }
+      : { completed: false };
+    await db.collection('mirrorGoals').doc(req.params.id).update(update);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ success: false }); }
+});
+
+// DELETE /api/mirror/goals/:id
+app.delete('/api/mirror/goals/:id', async (req, res) => {
+  try {
+    await db.collection('mirrorGoals').doc(req.params.id).delete();
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ success: false }); }
+});
+
+// GET /api/mirror/history — all check-ins for 365-dot grid
+app.get('/api/mirror/history', async (req, res) => {
+  try {
+    const deviceId = req.headers['x-device-id'];
+    if (!deviceId) return res.status(400).json({ success: false, error: 'Missing device ID' });
+
+    const snap = await db.collection('mirrorCheckins')
+      .where('deviceId', '==', deviceId)
+      .get();
+
+    // Deduplicate by date — keep latest entry per day (GitHub contribution-graph style)
+    const byDate = {};
+    snap.docs.forEach(d => {
+      const r = d.data();
+      const tsMs = r.timestamp?.toMillis?.() || 0;
+      if (!byDate[r.date] || tsMs > (byDate[r.date].tsMs || 0)) {
+        byDate[r.date] = {
+          id: d.id, date: r.date, moodLevel: r.moodLevel, mood: r.mood,
+          note: r.note || null, observation: r.observation || null,
+          followUpQ: r.followUpQ || null, followUpA: r.followUpA || null,
+          streak: r.streak || null, tsMs,
+        };
+      }
+    });
+    const checkins = Object.values(byDate).sort((a, b) => a.tsMs - b.tsMs || a.date.localeCompare(b.date));
+
+    res.json({ success: true, checkins });
+  } catch (err) {
+    console.error('Mirror history error:', err);
+    res.status(500).json({ success: false, error: 'Failed to fetch history' });
+  }
+});
+
+// DELETE /api/mirror/today — DEV ONLY: reset today's check-in for testing
+app.delete('/api/mirror/today', async (req, res) => {
+  try {
+    const deviceId = req.headers['x-device-id'];
+    if (!deviceId) return res.status(400).json({ success: false });
+    const today = new Date().toISOString().split('T')[0];
+    const snap = await db.collection('mirrorCheckins').where('deviceId', '==', deviceId).get();
+    const batch = db.batch();
+    snap.docs.filter(d => d.data().date === today).forEach(d => batch.delete(d.ref));
+    await batch.commit();
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ============================================
+// SUBSCRIPTION ROUTES
+// ============================================
+
+// POST /api/subscription/sync
+// Called by the app after purchase, restore, or app foreground.
+// Stores the full subscription state in the user's Firestore document.
+app.post('/api/subscription/sync', async (req, res) => {
+  try {
+    const deviceId = req.headers['x-device-id'] || req.body.deviceId;
+    if (!deviceId) {
+      return res.status(400).json({ success: false, error: 'deviceId required' });
+    }
+
+    const {
+      isPremium,
+      isTrial,
+      planType,           // 'annual' | 'monthly' | null
+      productIdentifier,  // e.g. 'com.d73.stillalive.pro_annual'
+      trialEndsAt,        // ISO string or null
+      expiresAt,          // ISO string or null
+      willRenew,
+      periodType,         // 'trial' | 'normal' | 'intro'
+      originalPurchaseDate,
+      isSandbox,
+      billingIssue,
+      rcAppUserId,        // RevenueCat anonymous user ID
+    } = req.body;
+
+    const now = admin.firestore.FieldValue.serverTimestamp();
+    const userRef = db.collection('users').doc(deviceId);
+    const userDoc = await userRef.get();
+
+    if (!userDoc.exists) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    const subscriptionData = {
+      isPremium: Boolean(isPremium),
+      isTrial: Boolean(isTrial),
+      planType: planType || null,
+      productIdentifier: productIdentifier || null,
+      trialEndsAt: trialEndsAt || null,
+      expiresAt: expiresAt || null,
+      willRenew: willRenew !== undefined ? Boolean(willRenew) : null,
+      periodType: periodType || null,
+      originalPurchaseDate: originalPurchaseDate || null,
+      isSandbox: Boolean(isSandbox),
+      billingIssue: billingIssue || null,
+      rcAppUserId: rcAppUserId || null,
+      lastSyncedAt: now,
+    };
+
+    await userRef.update({
+      subscription: subscriptionData,
+      updatedAt: now,
+    });
+
+    console.log(`💳 Subscription synced: ${deviceId} | premium=${isPremium} | trial=${isTrial} | plan=${planType}`);
+
+    res.json({ success: true, subscription: { ...subscriptionData, lastSyncedAt: new Date().toISOString() } });
+  } catch (err) {
+    console.error('❌ Subscription sync error:', err);
+    res.status(500).json({ success: false, error: 'Failed to sync subscription' });
+  }
+});
+
+// GET /api/subscription/status
+// Returns current subscription status for a device.
+app.get('/api/subscription/status', async (req, res) => {
+  try {
+    const deviceId = req.headers['x-device-id'];
+    if (!deviceId) {
+      return res.status(400).json({ success: false, error: 'x-device-id header required' });
+    }
+
+    const userDoc = await db.collection('users').doc(deviceId).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    const subscription = userDoc.data().subscription || null;
+    res.json({ success: true, subscription });
+  } catch (err) {
+    console.error('❌ Subscription status error:', err);
+    res.status(500).json({ success: false, error: 'Failed to get subscription status' });
+  }
+});
+
+// POST /api/webhooks/revenuecat
+// RevenueCat server-to-server webhook handler.
+// Configure in RevenueCat dashboard → Project Settings → Webhooks.
+// Set Authorization header to process.env.RC_WEBHOOK_SECRET.
+app.post('/api/webhooks/revenuecat', express.json({ type: '*/*' }), async (req, res) => {
+  try {
+    // Validate webhook secret
+    const secret = process.env.RC_WEBHOOK_SECRET;
+    if (secret) {
+      const auth = req.headers['authorization'];
+      if (auth !== secret) {
+        console.warn('⚠️ RevenueCat webhook: invalid secret');
+        return res.status(401).json({ success: false, error: 'Unauthorized' });
+      }
+    }
+
+    const event = req.body?.event;
+    if (!event) {
+      return res.status(400).json({ success: false, error: 'No event in body' });
+    }
+
+    const {
+      type,
+      app_user_id,
+      product_id,
+      period_type,        // 'TRIAL' | 'NORMAL' | 'INTRO'
+      expiration_at_ms,
+      purchased_at_ms,
+      will_renew,
+      is_sandbox,
+      billing_issues_detected_at,
+      cancel_reason,
+    } = event;
+
+    console.log(`📨 RC Webhook: ${type} | user=${app_user_id} | product=${product_id}`);
+
+    // Map RC app_user_id to our deviceId
+    // RC uses $RCAnonymousID:xxxx by default — we also alias our deviceId to RC,
+    // so look up by rcAppUserId field OR try app_user_id as deviceId directly.
+    let userRef = null;
+    let deviceId = null;
+
+    // First try: app_user_id is our deviceId (if we aliased it)
+    const directDoc = await db.collection('users').doc(app_user_id).get();
+    if (directDoc.exists) {
+      userRef = directDoc.ref;
+      deviceId = app_user_id;
+    } else {
+      // Second try: find by rcAppUserId field
+      const snap = await db.collection('users')
+        .where('subscription.rcAppUserId', '==', app_user_id)
+        .limit(1)
+        .get();
+      if (!snap.empty) {
+        userRef = snap.docs[0].ref;
+        deviceId = snap.docs[0].id;
+      }
+    }
+
+    if (!userRef) {
+      // User not found — still return 200 so RC doesn't retry forever
+      console.warn(`⚠️ RC Webhook: no user found for app_user_id=${app_user_id}`);
+      return res.json({ success: true, warning: 'user_not_found' });
+    }
+
+    const isTrial = period_type === 'TRIAL';
+    const planType = product_id?.includes('annual') ? 'annual' : product_id?.includes('monthly') ? 'monthly' : null;
+    const trialEndsAt = isTrial && expiration_at_ms ? new Date(expiration_at_ms).toISOString() : null;
+    const expiresAt = expiration_at_ms ? new Date(expiration_at_ms).toISOString() : null;
+    const now = admin.firestore.FieldValue.serverTimestamp();
+
+    let isPremium = false;
+    let subscriptionUpdate = {};
+
+    switch (type) {
+      case 'INITIAL_PURCHASE':
+      case 'RENEWAL':
+      case 'UNCANCELLATION':
+        isPremium = true;
+        subscriptionUpdate = {
+          isPremium: true,
+          isTrial,
+          planType,
+          productIdentifier: product_id,
+          trialEndsAt,
+          expiresAt,
+          willRenew: Boolean(will_renew),
+          periodType: period_type?.toLowerCase() || null,
+          originalPurchaseDate: purchased_at_ms ? new Date(purchased_at_ms).toISOString() : null,
+          isSandbox: Boolean(is_sandbox),
+          billingIssue: null,
+          lastSyncedAt: now,
+          webhookType: type,
+          webhookReceivedAt: now,
+        };
+        break;
+
+      case 'TRIAL_STARTED':
+        isPremium = true;
+        subscriptionUpdate = {
+          isPremium: true,
+          isTrial: true,
+          planType,
+          productIdentifier: product_id,
+          trialEndsAt,
+          expiresAt,
+          willRenew: Boolean(will_renew),
+          periodType: 'trial',
+          originalPurchaseDate: purchased_at_ms ? new Date(purchased_at_ms).toISOString() : null,
+          isSandbox: Boolean(is_sandbox),
+          billingIssue: null,
+          lastSyncedAt: now,
+          webhookType: type,
+          webhookReceivedAt: now,
+        };
+        break;
+
+      case 'TRIAL_CONVERTED':
+        isPremium = true;
+        subscriptionUpdate = {
+          isPremium: true,
+          isTrial: false,
+          planType,
+          productIdentifier: product_id,
+          trialEndsAt: null,
+          expiresAt,
+          willRenew: Boolean(will_renew),
+          periodType: 'normal',
+          isSandbox: Boolean(is_sandbox),
+          billingIssue: null,
+          lastSyncedAt: now,
+          webhookType: type,
+          webhookReceivedAt: now,
+        };
+        break;
+
+      case 'TRIAL_CANCELLED':
+      case 'CANCELLATION':
+        // Keep access until expiration — don't flip isPremium yet; expiry handles it
+        subscriptionUpdate = {
+          willRenew: false,
+          cancelReason: cancel_reason || null,
+          lastSyncedAt: now,
+          webhookType: type,
+          webhookReceivedAt: now,
+        };
+        break;
+
+      case 'EXPIRATION':
+        isPremium = false;
+        subscriptionUpdate = {
+          isPremium: false,
+          isTrial: false,
+          willRenew: false,
+          expiresAt,
+          trialEndsAt: null,
+          lastSyncedAt: now,
+          webhookType: type,
+          webhookReceivedAt: now,
+        };
+        break;
+
+      case 'BILLING_ISSUE':
+        subscriptionUpdate = {
+          billingIssue: new Date().toISOString(),
+          lastSyncedAt: now,
+          webhookType: type,
+          webhookReceivedAt: now,
+        };
+        break;
+
+      default:
+        console.log(`ℹ️ RC Webhook unhandled type: ${type}`);
+        return res.json({ success: true, note: 'unhandled_event_type' });
+    }
+
+    await userRef.update({
+      'subscription': {
+        ...(await userRef.get()).data()?.subscription,
+        ...subscriptionUpdate,
+      },
+      updatedAt: now,
+    });
+
+    console.log(`✅ RC Webhook processed: ${type} | deviceId=${deviceId} | isPremium=${isPremium}`);
+    res.json({ success: true });
+
+  } catch (err) {
+    console.error('❌ RevenueCat webhook error:', err);
+    // Return 200 to prevent RC from retrying on our server errors
+    res.json({ success: false, error: err.message });
+  }
+});
+
+// ============================================
 // ERROR HANDLING
 // ============================================
 
@@ -1327,22 +2429,20 @@ app.use((err, req, res, next) => {
   });
 });
 
-
 // ============================================
 // START SERVER
 // ============================================
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n${'='.repeat(60)}`);
-  console.log(`🚀 STILL ALIVE SERVER - PRODUCTION MODE`);
+  console.log(`🚀 ALIVE SCORE SERVER - PRODUCTION MODE`);
   console.log(`${'='.repeat(60)}\n`);
   console.log(`📡 Server:          http://localhost:${PORT}`);
   console.log(`📝 Environment:     ${process.env.NODE_ENV || 'production'}`);
-  console.log(`📧 Email alerts:    ✅ ENABLED`);
-  console.log(`⏰ Cron schedule:   ✅ Every 1 hour (at :00)`);
-  console.log(`⚡ Check-in:        ✅ PRODUCTION (24h per day)`);
   console.log(`🔐 Auth:            ✅ Device ID only`);
-  console.log(`👁️  Watching:       ✅ UNLIMITED`);
-  console.log(`📊 Tracking:        ✅ Streak + Total Check-ins`);
+  console.log(`🏆 Alive Score:     ✅ Managed in /api/alive-check`);
+  console.log(`🔑 Unified Code:    ✅ Auto-generated on first use`);
+  console.log(`🤖 AI Scoring:      ✅ GPT-4o-mini per pillar`);
+  console.log(`📊 Analytics:       ✅ Pillar trends & history`);
   console.log(`⚡ Performance:     ✅ OPTIMIZED`);
   console.log(`\n${'='.repeat(60)}`);
 });

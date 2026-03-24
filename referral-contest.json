@@ -1,0 +1,116 @@
+{
+  "enabled": true,
+  "startDate": "2026-02-28T00:00:00Z",
+  "endDate": "2026-04-15T23:59:59Z",
+
+  "prizePool": 2000,
+  "prizes": {
+    "1": 1000,
+    "2": 600,
+    "3": 400
+  },
+
+  "maxParticipants": 500,
+
+  "rules": {
+    "en": [
+      { "title": "One account per person", "desc": "Each code belongs to one unique user. Duplicates are disqualified." },
+      { "title": "Valid referrals only", "desc": "Referrals count when invited users sign up and complete their first check-in." },
+      { "title": "Monthly reset", "desc": "Rankings reset on the 1st. Prizes paid within 7 business days." },
+      { "title": "Prize distribution", "desc": "1st: $1,000 · 2nd: $600 · 3rd: $400. Paid via bank transfer or UPI." },
+      { "title": "No self-referrals", "desc": "Using your own code or bots results in permanent disqualification." },
+      { "title": "Fair play", "desc": "We reserve the right to disqualify entries violating fair-play guidelines." }
+    ],
+    "ru": [
+      { "title": "Один аккаунт на человека", "desc": "Каждый код принадлежит одному уникальному пользователю. Дубликаты дисквалифицируются." },
+      { "title": "Только действительные рефералы", "desc": "Рефералы учитываются, когда приглашённые пользователи регистрируются и завершают первую сессию." },
+      { "title": "Ежемесячный сброс", "desc": "Рейтинг сбрасывается 1-го числа. Призы выплачиваются в течение 7 рабочих дней." },
+      { "title": "Распределение призов", "desc": "1-е место: $1,000 · 2-е: $600 · 3-е: $400. Выплата через банковский перевод или UPI." },
+      { "title": "Запрет на самореферал", "desc": "Использование собственного кода или ботов приводит к постоянной дисквалификации." },
+      { "title": "Честная игра", "desc": "Мы оставляем за собой право дисквалифицировать записи, нарушающие правила честной игры." }
+    ],
+    "es": [
+      { "title": "Una cuenta por persona", "desc": "Cada código pertenece a un usuario único. Los duplicados son descalificados." },
+      { "title": "Solo referencias válidas", "desc": "Las referencias cuentan cuando los usuarios invitados se registran y completan su primera sesión." },
+      { "title": "Reinicio mensual", "desc": "Las clasificaciones se reinician el día 1. Premios pagados dentro de 7 días hábiles." },
+      { "title": "Distribución de premios", "desc": "1º: $1,000 · 2º: $600 · 3º: $400. Pagado mediante transferencia bancaria o UPI." },
+      { "title": "Sin autorreferencias", "desc": "Usar tu propio código o bots resulta en descalificación permanente." },
+      { "title": "Juego limpio", "desc": "Nos reservamos el derecho de descalificar entradas que violen las pautas de juego limpio." }
+    ],
+    "pt": [
+      { "title": "Uma conta por pessoa", "desc": "Cada código pertence a um usuário único. Duplicatas são desqualificadas." },
+      { "title": "Apenas referências válidas", "desc": "As referências contam quando os usuários convidados se inscrevem e completam sua primeira sessão." },
+      { "title": "Reinício mensal", "desc": "As classificações são reiniciadas no dia 1. Prêmios pagos dentro de 7 dias úteis." },
+      { "title": "Distribuição de prêmios", "desc": "1º: $1,000 · 2º: $600 · 3º: $400. Pago via transferência bancária ou UPI." },
+      { "title": "Sem autorreferências", "desc": "Usar seu próprio código ou bots resulta em desqualificação permanente." },
+      { "title": "Jogo justo", "desc": "Reservamo-nos o direito de desqualificar entradas que violem as diretrizes de jogo justo." }
+    ],
+    "fr": [
+      { "title": "Un compte par personne", "desc": "Chaque code appartient à un utilisateur unique. Les doublons sont disqualifiés." },
+      { "title": "Références valides uniquement", "desc": "Les références comptent lorsque les utilisateurs invités s'inscrivent et terminent leur première session." },
+      { "title": "Réinitialisation mensuelle", "desc": "Les classements sont réinitialisés le 1er. Prix payés dans les 7 jours ouvrables." },
+      { "title": "Distribution des prix", "desc": "1er: $1,000 · 2ème: $600 · 3ème: $400. Payé par virement bancaire ou UPI." },
+      { "title": "Pas d'auto-parrainage", "desc": "L'utilisation de votre propre code ou de bots entraîne une disqualification permanente." },
+      { "title": "Jeu équitable", "desc": "Nous nous réservons le droit de disqualifier les entrées violant les directives de jeu équitable." }
+    ],
+    "de": [
+      { "title": "Ein Konto pro Person", "desc": "Jeder Code gehört zu einem einzigartigen Benutzer. Duplikate werden disqualifiziert." },
+      { "title": "Nur gültige Empfehlungen", "desc": "Empfehlungen zählen, wenn eingeladene Benutzer sich anmelden und ihre erste Sitzung abschließen." },
+      { "title": "Monatlicher Reset", "desc": "Rankings werden am 1. zurückgesetzt. Preise innerhalb von 7 Werktagen ausgezahlt." },
+      { "title": "Preisverteilung", "desc": "1.: $1,000 · 2.: $600 · 3.: $400. Bezahlt per Banküberweisung oder UPI." },
+      { "title": "Keine Selbstempfehlungen", "desc": "Die Verwendung Ihres eigenen Codes oder von Bots führt zu einer dauerhaften Disqualifikation." },
+      { "title": "Faires Spiel", "desc": "Wir behalten uns das Recht vor, Einträge zu disqualifizieren, die gegen Fair-Play-Richtlinien verstoßen." }
+    ]
+  },
+
+  "legal": {
+    "en": {
+      "termsUrl": "https://grey-entree-512.notion.site/Pulse-Terms-and-Conditions-2f24abc1b14480d4b638ce4aa4d80c72",
+      "privacyUrl": "https://grey-entree-512.notion.site/Pulse-Privacy-Policy-8c3ae034b2524fd881557f4d7e28ad8b",
+      "appleDisclaimer": "Apple is not a sponsor of or affiliated with this promotional contest.",
+      "termsCheckboxText": "I agree to the Terms & Privacy Policy",
+      "leaderboardConsentText": "Show my name on the public leaderboard",
+      "prizeConsentText": "Compete for this month's prize pool"
+    },
+    "ru": {
+      "termsUrl": "https://grey-entree-512.notion.site/Pulse-Terms-and-Conditions-2f24abc1b14480d4b638ce4aa4d80c72",
+      "privacyUrl": "https://grey-entree-512.notion.site/Pulse-Privacy-Policy-8c3ae034b2524fd881557f4d7e28ad8b",
+      "appleDisclaimer": "Apple не является спонсором этого рекламного конкурса и не связана с ним.",
+      "termsCheckboxText": "Я согласен с Условиями и Политикой конфиденциальности",
+      "leaderboardConsentText": "Показывать моё имя в публичной таблице лидеров",
+      "prizeConsentText": "Участвовать в розыгрыше призового фонда этого месяца"
+    },
+    "es": {
+      "termsUrl": "https://grey-entree-512.notion.site/Pulse-Terms-and-Conditions-2f24abc1b14480d4b638ce4aa4d80c72",
+      "privacyUrl": "https://grey-entree-512.notion.site/Pulse-Privacy-Policy-8c3ae034b2524fd881557f4d7e28ad8b",
+      "appleDisclaimer": "Apple no es patrocinador ni está afiliado a este concurso promocional.",
+      "termsCheckboxText": "Acepto los Términos y la Política de Privacidad",
+      "leaderboardConsentText": "Mostrar mi nombre en la tabla de clasificación pública",
+      "prizeConsentText": "Competir por el premio de este mes"
+    },
+    "pt": {
+      "termsUrl": "https://grey-entree-512.notion.site/Pulse-Terms-and-Conditions-2f24abc1b14480d4b638ce4aa4d80c72",
+      "privacyUrl": "https://grey-entree-512.notion.site/Pulse-Privacy-Policy-8c3ae034b2524fd881557f4d7e28ad8b",
+      "appleDisclaimer": "A Apple não é patrocinadora nem está afiliada a este concurso promocional.",
+      "termsCheckboxText": "Concordo com os Termos e Política de Privacidade",
+      "leaderboardConsentText": "Mostrar meu nome na classificação pública",
+      "prizeConsentText": "Competir pelo prêmio deste mês"
+    },
+    "fr": {
+      "termsUrl": "https://grey-entree-512.notion.site/Pulse-Terms-and-Conditions-2f24abc1b14480d4b638ce4aa4d80c72",
+      "privacyUrl": "https://grey-entree-512.notion.site/Pulse-Privacy-Policy-8c3ae034b2524fd881557f4d7e28ad8b",
+      "appleDisclaimer": "Apple n'est pas sponsor ni affilié à ce concours promotionnel.",
+      "termsCheckboxText": "J'accepte les Conditions et la Politique de Confidentialité",
+      "leaderboardConsentText": "Afficher mon nom dans le classement public",
+      "prizeConsentText": "Participer au concours pour le prix de ce mois"
+    },
+    "de": {
+      "termsUrl": "https://grey-entree-512.notion.site/Pulse-Terms-and-Conditions-2f24abc1b14480d4b638ce4aa4d80c72",
+      "privacyUrl": "https://grey-entree-512.notion.site/Pulse-Privacy-Policy-8c3ae034b2524fd881557f4d7e28ad8b",
+      "appleDisclaimer": "Apple ist kein Sponsor und nicht mit diesem Werbewettbewerb verbunden.",
+      "termsCheckboxText": "Ich stimme den Bedingungen und der Datenschutzrichtlinie zu",
+      "leaderboardConsentText": "Meinen Namen in der öffentlichen Bestenliste anzeigen",
+      "prizeConsentText": "Um den Preis dieses Monats konkurrieren"
+    }
+  }
+}
