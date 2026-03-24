@@ -663,6 +663,7 @@ app.post('/api/users/me', getDeviceId, async (req, res) => {
         lastCheckIn: userData.lastCheckIn,
         createdAt: userData.createdAt,
         watchersCount: safeWatchersCount(userData.watchersCount),
+        subscription: userData.subscription || null,
       },
       isNewUser: req.isNewUser || false,
     });
@@ -2121,6 +2122,289 @@ app.delete('/api/mirror/today', async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ============================================
+// SUBSCRIPTION ROUTES
+// ============================================
+
+// POST /api/subscription/sync
+// Called by the app after purchase, restore, or app foreground.
+// Stores the full subscription state in the user's Firestore document.
+app.post('/api/subscription/sync', async (req, res) => {
+  try {
+    const deviceId = req.headers['x-device-id'] || req.body.deviceId;
+    if (!deviceId) {
+      return res.status(400).json({ success: false, error: 'deviceId required' });
+    }
+
+    const {
+      isPremium,
+      isTrial,
+      planType,           // 'annual' | 'monthly' | null
+      productIdentifier,  // e.g. 'com.d73.stillalive.pro_annual'
+      trialEndsAt,        // ISO string or null
+      expiresAt,          // ISO string or null
+      willRenew,
+      periodType,         // 'trial' | 'normal' | 'intro'
+      originalPurchaseDate,
+      isSandbox,
+      billingIssue,
+      rcAppUserId,        // RevenueCat anonymous user ID
+    } = req.body;
+
+    const now = admin.firestore.FieldValue.serverTimestamp();
+    const userRef = db.collection('users').doc(deviceId);
+    const userDoc = await userRef.get();
+
+    if (!userDoc.exists) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    const subscriptionData = {
+      isPremium: Boolean(isPremium),
+      isTrial: Boolean(isTrial),
+      planType: planType || null,
+      productIdentifier: productIdentifier || null,
+      trialEndsAt: trialEndsAt || null,
+      expiresAt: expiresAt || null,
+      willRenew: willRenew !== undefined ? Boolean(willRenew) : null,
+      periodType: periodType || null,
+      originalPurchaseDate: originalPurchaseDate || null,
+      isSandbox: Boolean(isSandbox),
+      billingIssue: billingIssue || null,
+      rcAppUserId: rcAppUserId || null,
+      lastSyncedAt: now,
+    };
+
+    await userRef.update({
+      subscription: subscriptionData,
+      updatedAt: now,
+    });
+
+    console.log(`💳 Subscription synced: ${deviceId} | premium=${isPremium} | trial=${isTrial} | plan=${planType}`);
+
+    res.json({ success: true, subscription: { ...subscriptionData, lastSyncedAt: new Date().toISOString() } });
+  } catch (err) {
+    console.error('❌ Subscription sync error:', err);
+    res.status(500).json({ success: false, error: 'Failed to sync subscription' });
+  }
+});
+
+// GET /api/subscription/status
+// Returns current subscription status for a device.
+app.get('/api/subscription/status', async (req, res) => {
+  try {
+    const deviceId = req.headers['x-device-id'];
+    if (!deviceId) {
+      return res.status(400).json({ success: false, error: 'x-device-id header required' });
+    }
+
+    const userDoc = await db.collection('users').doc(deviceId).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    const subscription = userDoc.data().subscription || null;
+    res.json({ success: true, subscription });
+  } catch (err) {
+    console.error('❌ Subscription status error:', err);
+    res.status(500).json({ success: false, error: 'Failed to get subscription status' });
+  }
+});
+
+// POST /api/webhooks/revenuecat
+// RevenueCat server-to-server webhook handler.
+// Configure in RevenueCat dashboard → Project Settings → Webhooks.
+// Set Authorization header to process.env.RC_WEBHOOK_SECRET.
+app.post('/api/webhooks/revenuecat', express.json({ type: '*/*' }), async (req, res) => {
+  try {
+    // Validate webhook secret
+    const secret = process.env.RC_WEBHOOK_SECRET;
+    if (secret) {
+      const auth = req.headers['authorization'];
+      if (auth !== secret) {
+        console.warn('⚠️ RevenueCat webhook: invalid secret');
+        return res.status(401).json({ success: false, error: 'Unauthorized' });
+      }
+    }
+
+    const event = req.body?.event;
+    if (!event) {
+      return res.status(400).json({ success: false, error: 'No event in body' });
+    }
+
+    const {
+      type,
+      app_user_id,
+      product_id,
+      period_type,        // 'TRIAL' | 'NORMAL' | 'INTRO'
+      expiration_at_ms,
+      purchased_at_ms,
+      will_renew,
+      is_sandbox,
+      billing_issues_detected_at,
+      cancel_reason,
+    } = event;
+
+    console.log(`📨 RC Webhook: ${type} | user=${app_user_id} | product=${product_id}`);
+
+    // Map RC app_user_id to our deviceId
+    // RC uses $RCAnonymousID:xxxx by default — we also alias our deviceId to RC,
+    // so look up by rcAppUserId field OR try app_user_id as deviceId directly.
+    let userRef = null;
+    let deviceId = null;
+
+    // First try: app_user_id is our deviceId (if we aliased it)
+    const directDoc = await db.collection('users').doc(app_user_id).get();
+    if (directDoc.exists) {
+      userRef = directDoc.ref;
+      deviceId = app_user_id;
+    } else {
+      // Second try: find by rcAppUserId field
+      const snap = await db.collection('users')
+        .where('subscription.rcAppUserId', '==', app_user_id)
+        .limit(1)
+        .get();
+      if (!snap.empty) {
+        userRef = snap.docs[0].ref;
+        deviceId = snap.docs[0].id;
+      }
+    }
+
+    if (!userRef) {
+      // User not found — still return 200 so RC doesn't retry forever
+      console.warn(`⚠️ RC Webhook: no user found for app_user_id=${app_user_id}`);
+      return res.json({ success: true, warning: 'user_not_found' });
+    }
+
+    const isTrial = period_type === 'TRIAL';
+    const planType = product_id?.includes('annual') ? 'annual' : product_id?.includes('monthly') ? 'monthly' : null;
+    const trialEndsAt = isTrial && expiration_at_ms ? new Date(expiration_at_ms).toISOString() : null;
+    const expiresAt = expiration_at_ms ? new Date(expiration_at_ms).toISOString() : null;
+    const now = admin.firestore.FieldValue.serverTimestamp();
+
+    let isPremium = false;
+    let subscriptionUpdate = {};
+
+    switch (type) {
+      case 'INITIAL_PURCHASE':
+      case 'RENEWAL':
+      case 'UNCANCELLATION':
+        isPremium = true;
+        subscriptionUpdate = {
+          isPremium: true,
+          isTrial,
+          planType,
+          productIdentifier: product_id,
+          trialEndsAt,
+          expiresAt,
+          willRenew: Boolean(will_renew),
+          periodType: period_type?.toLowerCase() || null,
+          originalPurchaseDate: purchased_at_ms ? new Date(purchased_at_ms).toISOString() : null,
+          isSandbox: Boolean(is_sandbox),
+          billingIssue: null,
+          lastSyncedAt: now,
+          webhookType: type,
+          webhookReceivedAt: now,
+        };
+        break;
+
+      case 'TRIAL_STARTED':
+        isPremium = true;
+        subscriptionUpdate = {
+          isPremium: true,
+          isTrial: true,
+          planType,
+          productIdentifier: product_id,
+          trialEndsAt,
+          expiresAt,
+          willRenew: Boolean(will_renew),
+          periodType: 'trial',
+          originalPurchaseDate: purchased_at_ms ? new Date(purchased_at_ms).toISOString() : null,
+          isSandbox: Boolean(is_sandbox),
+          billingIssue: null,
+          lastSyncedAt: now,
+          webhookType: type,
+          webhookReceivedAt: now,
+        };
+        break;
+
+      case 'TRIAL_CONVERTED':
+        isPremium = true;
+        subscriptionUpdate = {
+          isPremium: true,
+          isTrial: false,
+          planType,
+          productIdentifier: product_id,
+          trialEndsAt: null,
+          expiresAt,
+          willRenew: Boolean(will_renew),
+          periodType: 'normal',
+          isSandbox: Boolean(is_sandbox),
+          billingIssue: null,
+          lastSyncedAt: now,
+          webhookType: type,
+          webhookReceivedAt: now,
+        };
+        break;
+
+      case 'TRIAL_CANCELLED':
+      case 'CANCELLATION':
+        // Keep access until expiration — don't flip isPremium yet; expiry handles it
+        subscriptionUpdate = {
+          willRenew: false,
+          cancelReason: cancel_reason || null,
+          lastSyncedAt: now,
+          webhookType: type,
+          webhookReceivedAt: now,
+        };
+        break;
+
+      case 'EXPIRATION':
+        isPremium = false;
+        subscriptionUpdate = {
+          isPremium: false,
+          isTrial: false,
+          willRenew: false,
+          expiresAt,
+          trialEndsAt: null,
+          lastSyncedAt: now,
+          webhookType: type,
+          webhookReceivedAt: now,
+        };
+        break;
+
+      case 'BILLING_ISSUE':
+        subscriptionUpdate = {
+          billingIssue: new Date().toISOString(),
+          lastSyncedAt: now,
+          webhookType: type,
+          webhookReceivedAt: now,
+        };
+        break;
+
+      default:
+        console.log(`ℹ️ RC Webhook unhandled type: ${type}`);
+        return res.json({ success: true, note: 'unhandled_event_type' });
+    }
+
+    await userRef.update({
+      'subscription': {
+        ...(await userRef.get()).data()?.subscription,
+        ...subscriptionUpdate,
+      },
+      updatedAt: now,
+    });
+
+    console.log(`✅ RC Webhook processed: ${type} | deviceId=${deviceId} | isPremium=${isPremium}`);
+    res.json({ success: true });
+
+  } catch (err) {
+    console.error('❌ RevenueCat webhook error:', err);
+    // Return 200 to prevent RC from retrying on our server errors
+    res.json({ success: false, error: err.message });
   }
 });
 

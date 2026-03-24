@@ -668,7 +668,7 @@ function getDiversitySeed(deviceId, checkCount, pillar) {
 // ============================================
 
 async function aiScorePillar(profile, pillar, questions, answers, submissions) {
-  const { name, ageGroup, gender, language } = profile;
+  const { name, ageGroup, gender, language, vision, pillarBaselines, goalTimeline } = profile;
   const userLanguage = language || 'en';
   const displayAge = ageGroup ? getAgeGroupLabel(ageGroup) : 'Adult';
   const rubric = SCORING_RUBRICS[pillar];
@@ -721,6 +721,9 @@ ${scoringApproachInstructions[scoringStyle]}
 
 ═══════════════════════════════════════════
 👤 PERSON: ${name} | ${displayAge} | ${gender}
+${vision ? `\n🎯 THEIR VISION: "${vision}"` : ''}
+${pillarBaselines ? `📊 THEIR STARTING BASELINE for ${pillar}: ${pillarBaselines[pillar] ?? 'unknown'}/100` : ''}
+${goalTimeline ? `⏱️ COMMITTED CHALLENGE: ${goalTimeline} days` : ''}
 ═══════════════════════════════════════════
 
 ═══════════════════════════════════════════
@@ -1041,7 +1044,7 @@ function detectPrideMoment(todayPillar, todayPillarScore, aliveScore, submission
 // ============================================
 
 async function generateIndividualTip(profile, pillar, questions, answers, todayPillarScore, submissions) {
-  const { name, language, ageGroup } = profile;
+  const { name, language, ageGroup, vision, pillarBaselines, goalTimeline } = profile;
   const userLanguage = language || 'en';
   const pillarMeta = PILLARS[pillar.toUpperCase()];
 
@@ -1083,6 +1086,9 @@ ${tipStyleInstructions[tipStyle]}
 ${qaContext}
 
 📊 Their ${pillarMeta?.name} score: ${todayPillarScore}/100
+${pillarBaselines ? `They started at ${pillarBaselines[pillar] ?? '—'}/100 in ${pillarMeta?.name} — they've ${todayPillarScore > (pillarBaselines[pillar] ?? 50) ? 'improved since they started' : 'not moved much yet — dig into why'}.` : ''}
+${vision ? `🎯 THEIR 1-YEAR VISION: "${vision}" — make the tip feel like it moves them toward this` : ''}
+${goalTimeline ? `⏱️ They committed to a ${goalTimeline}-day challenge. Acknowledge the commitment if relevant.` : ''}
 
 🚫 RECENT TIPS (DO NOT REPEAT THESE PATTERNS):
 ${recentTips || 'First tip'}
@@ -1148,7 +1154,7 @@ Respond ONLY with valid JSON:
 // ============================================
 
 async function generateSessionSummary(profile, pillar, questions, answers, todayPillarScore, scoringJustification) {
-  const { name, ageGroup, gender } = profile;
+  const { name, ageGroup, gender, vision, pillarBaselines, goalTimeline } = profile;
   const displayAge = ageGroup ? getAgeGroupLabel(ageGroup) : 'Adult';
   const pillarMeta = PILLARS[pillar.toUpperCase()];
 
@@ -1164,6 +1170,9 @@ Person: ${name} | ${displayAge} | ${gender}
 Pillar checked: ${pillarMeta?.name} (${pillar})
 Score today: ${todayPillarScore}/100
 AI scoring note: ${scoringJustification || 'N/A'}
+${pillarBaselines ? `Baseline when they started: ${pillarMeta?.name}=${pillarBaselines[pillar] ?? '—'}/100 — note any movement.` : ''}
+${vision ? `Their declared vision: "${vision}"` : ''}
+${goalTimeline ? `Committed to a ${goalTimeline}-day challenge.` : ''}
 
 Their answers:
 ${qaBlock}
@@ -1195,7 +1204,7 @@ Write 2-3 sentences max. Be specific — mention actual answers. No bullet point
 // ============================================
 
 async function generateQuoteAndStrategicTips(profile, todayPillar, questions, answers, pillarScores, aliveScore, scoringJustification, submissions) {
-  const { name, ageGroup, gender, language } = profile;
+  const { name, ageGroup, gender, language, vision, goalTimeline } = profile;
   const userLanguage = language || 'en';
   const displayAge = ageGroup ? getAgeGroupLabel(ageGroup) : 'Adult';
   const pillarMeta = PILLARS[todayPillar.toUpperCase()];
@@ -1246,6 +1255,8 @@ ${name} is a ${displayAge} who just scored ${aliveScore}/100 on their aliveness.
 Their vibe: ${vibe}
 Their ${pillarMeta?.name} score: ${pillarScores[todayPillar]}/100
 Scoring reason: ${scoringJustification}
+${vision ? `Their 1-year vision: "${vision}" — quote/message can nod to this without being cheesy` : ''}
+${goalTimeline ? `They committed to a ${goalTimeline}-day challenge — they're someone who makes real commitments` : ''}
 
 Their answers today:
 ${qaContext}
@@ -1407,7 +1418,7 @@ Respond ONLY with valid JSON:
 // ============================================
 
 async function generatePersonalizedQuestions(profile, selectedPillar, previousSubmissions, sessionNumber, storedSessionSummaries) {
-  const { name, ageGroup, gender, language } = profile;
+  const { name, ageGroup, gender, language, vision, pillarBaselines, goalTimeline } = profile;
   const userLanguage = language || 'en';
   const displayAge = ageGroup ? getAgeGroupLabel(ageGroup) : 'Adult';
   const pillarMeta = PILLARS[selectedPillar.toUpperCase()];
@@ -1473,6 +1484,11 @@ async function generatePersonalizedQuestions(profile, selectedPillar, previousSu
 ${name} | ${displayAge} | ${gender}
 ${ageGenderContext}
 Their other pillars: ${pillarContext}
+
+${(vision || pillarBaselines || goalTimeline) ? `━━━ PERSONAL CONTEXT (use this to make questions deeply relevant) ━━━
+${vision ? `Their vision — what they wrote about who they want to be in 1 year: "${vision}"` : ''}
+${pillarBaselines ? `Their self-assessed starting point: Health=${pillarBaselines.health}/100, Wealth=${pillarBaselines.wealth}/100, Love=${pillarBaselines.love}/100, Purpose=${pillarBaselines.purpose}/100. Use this as context for where they started vs where they are now.` : ''}
+${goalTimeline ? `Their committed challenge: ${goalTimeline} days. They made a commitment — questions can acknowledge this.` : ''}` : ''}
 
 ━━━ SESSION ${sessionNumber} — ${phase.phase.toUpperCase()} ━━━
 ${phase.arc}
@@ -1599,7 +1615,7 @@ const getPersonalizedAnalysis = async (profile, submissions, lastAnalysis, stats
     return { success: false, message: `You need at least 3 check-ins for AI insights. You have ${submissions.length}. Keep going!` };
   }
 
-  const { name, ageGroup, gender, language } = profile;
+  const { name, ageGroup, gender, language, vision, pillarBaselines, goalTimeline } = profile;
   const userLanguage = language || 'en';
   const displayAge = ageGroup ? getAgeGroupLabel(ageGroup) : 'Adult';
   const last30 = submissions.slice(0, 30);
@@ -1737,6 +1753,9 @@ Generated: ${lastAnalysis.generatedAt || '—'}`
 You have been watching ${name} (${displayAge}, ${gender}) do their check-ins. You've read everything. Now you're going to tell them what you actually think.
 
 ${statsContext}
+${vision ? `━━━ WHO THEY SAID THEY WANT TO BE (written on day 1) ━━━\n"${vision}"\nAre they moving toward this? Be honest. Name the gap or the progress.` : ''}
+${pillarBaselines ? `━━━ WHERE THEY STARTED (their own baseline) ━━━\nHealth=${pillarBaselines.health}/100  Wealth=${pillarBaselines.wealth}/100  Love=${pillarBaselines.love}/100  Purpose=${pillarBaselines.purpose}/100\nCompare to current scores. Has anything actually changed since day 1?` : ''}
+${goalTimeline ? `━━━ THEIR COMMITMENT ━━━\nThey committed to a ${goalTimeline}-day challenge on day 1. Reference their progress toward it.` : ''}
 
 ━━━ THEIR DATA ━━━
 
@@ -2001,7 +2020,7 @@ const checkDailyLimit = async (req, res, next) => {
 router.post('/profile', requireDeviceId, async (req, res) => {
   try {
     const { deviceId } = req;
-    const { name, ageGroup, gender, language, leaderboardConsent } = req.body;
+    const { name, ageGroup, gender, language, leaderboardConsent, pillarBaselines, vision, goalTimeline } = req.body;
 
     const docRef = getDb().collection('aliveChecks').doc(deviceId);
     const doc = await docRef.get();
@@ -2017,6 +2036,9 @@ router.post('/profile', requireDeviceId, async (req, res) => {
       if (gender) updateData['profile.gender'] = gender;
       if (language) updateData['profile.language'] = language;
       if (typeof leaderboardConsent === 'boolean') updateData['profile.leaderboardConsent'] = leaderboardConsent;
+      if (pillarBaselines && typeof pillarBaselines === 'object') updateData['profile.pillarBaselines'] = pillarBaselines;
+      if (vision) updateData['profile.vision'] = vision.trim();
+      if (goalTimeline) updateData['profile.goalTimeline'] = goalTimeline;
 
       await docRef.update(updateData);
 
@@ -2077,6 +2099,9 @@ router.post('/profile', requireDeviceId, async (req, res) => {
         language: language || 'en',
         code, // ✅ AUTO-GENERATED CODE
         leaderboardConsent: typeof leaderboardConsent === 'boolean' ? leaderboardConsent : true, // ✅ Default ON
+        ...(pillarBaselines && typeof pillarBaselines === 'object' ? { pillarBaselines } : {}),
+        ...(vision ? { vision: vision.trim() } : {}),
+        ...(goalTimeline ? { goalTimeline } : {}),
         profileCompleted: true,
         profileCompletedAt: admin.firestore.FieldValue.serverTimestamp()
       };
