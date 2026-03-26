@@ -167,7 +167,6 @@ const getUserByDeviceId = async (deviceId) => {
         'profile.code': code,
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       });
-      console.log(`✅ Code synced to aliveChecks: ${deviceId} → ${code}`);
     }
 
     const userData = {
@@ -185,7 +184,6 @@ const getUserByDeviceId = async (deviceId) => {
     };
 
     await userRef.set(userData);
-    console.log('New user created with code:', deviceId, '→', code);
 
     return {
       success: true,
@@ -753,8 +751,6 @@ app.post('/api/users/update-name', getDeviceId, async (req, res) => {
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
-    console.log('Display name updated:', req.deviceId, '→', displayName);
-
     const updatedDoc = await userRef.get();
     const userData = updatedDoc.data();
 
@@ -803,7 +799,6 @@ app.post('/api/users/checkin-frequency', getDeviceId, async (req, res) => {
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
-    console.log('Check-in frequency updated:', req.deviceId, '→', days, 'days');
 
     res.json({
       success: true,
@@ -854,10 +849,7 @@ app.post('/api/users/generate-code', getDeviceId, async (req, res) => {
         'profile.code': code,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
-      console.log(`✅ Code synced to aliveChecks: ${req.deviceId} → ${code}`);
     }
-
-    console.log('Code generated:', req.deviceId, '→', code);
 
     res.json({
       success: true,
@@ -924,8 +916,6 @@ app.post('/api/users/checkin', getDeviceId, async (req, res) => {
     });
 
     await batch.commit();
-
-    console.log('Check-in:', req.deviceId, '→ Streak:', newStreak, '| Total:', newTotalCheckIns);
 
     res.json({
       success: true,
@@ -1050,8 +1040,6 @@ app.post('/api/squad/add-member', getDeviceId, async (req, res) => {
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
-    console.log('Squad member added:', req.deviceId, '→', emailLower);
-
     res.json({
       success: true,
       member: newMember,
@@ -1107,8 +1095,6 @@ app.post('/api/squad/members/:id/remove', getDeviceId, async (req, res) => {
       squadMembers,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
-
-    console.log('Squad member removed:', req.deviceId, '→ ID:', id);
 
     res.json({
       success: true,
@@ -1205,8 +1191,6 @@ app.post('/api/watching/add', async (req, res) => {
       }
     });
 
-    console.log('Watching added (Daily Check-in):', deviceId, '→', codeUpper);
-
     res.json({
       success: true,
       watch: {
@@ -1287,8 +1271,6 @@ app.get('/api/watching/list', async (req, res) => {
       });
     }
 
-    console.log(`Watching list fetched (Daily Check-in) (${deviceId}): ${watching.length} people`);
-
     res.json({
       success: true,
       watching,
@@ -1343,8 +1325,6 @@ app.delete('/api/watching/:id', async (req, res) => {
       }
     });
 
-    console.log('Stopped watching (Daily Check-in):', id);
-
     res.json({
       success: true,
       message: 'Stopped watching',
@@ -1368,7 +1348,6 @@ app.delete('/api/watching/:id', async (req, res) => {
 app.post('/api/account/delete', getDeviceId, async (req, res) => {
   try {
     const deviceId = req.deviceId;
-    console.log('Deleting account for device:', deviceId);
 
     const watchingAsWatcherSnap = await db
       .collection('watching')
@@ -1422,8 +1401,6 @@ app.post('/api/account/delete', getDeviceId, async (req, res) => {
       .get();
     const alertDeletes = alertsSnapshot.docs.map(doc => doc.ref.delete());
     await Promise.all(alertDeletes);
-
-    console.log('Account deleted for device:', deviceId);
 
     res.json({
       success: true,
@@ -2155,21 +2132,6 @@ app.get('/api/mirror/history', async (req, res) => {
   }
 });
 
-// DELETE /api/mirror/today — DEV ONLY: reset today's check-in for testing
-app.delete('/api/mirror/today', async (req, res) => {
-  try {
-    const deviceId = req.headers['x-device-id'];
-    if (!deviceId) return res.status(400).json({ success: false });
-    const today = new Date().toISOString().split('T')[0];
-    const snap = await db.collection('mirrorCheckins').where('deviceId', '==', deviceId).get();
-    const batch = db.batch();
-    snap.docs.filter(d => d.data().date === today).forEach(d => batch.delete(d.ref));
-    await batch.commit();
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
 
 // ============================================
 // SUBSCRIPTION ROUTES
@@ -2225,8 +2187,6 @@ app.post('/api/subscription/sync', async (req, res) => {
       subscription: subscriptionData,
       updatedAt: now,
     }, { merge: true });
-
-    console.log(`💳 Subscription synced: ${deviceId} | premium=${isPremium} | trial=${isTrial} | plan=${planType}`);
 
     res.json({ success: true, subscription: { ...subscriptionData, lastSyncedAt: new Date().toISOString() } });
   } catch (err) {
@@ -2289,19 +2249,15 @@ app.post('/api/webhooks/revenuecat', express.json({ type: '*/*' }), async (req, 
       cancel_reason,
     } = event;
 
-    console.log(`📨 RC Webhook: ${type} | user=${app_user_id} | product=${product_id}`);
-
     // Map RC app_user_id to our deviceId
     // RC uses $RCAnonymousID:xxxx by default — we also alias our deviceId to RC,
     // so look up by rcAppUserId field OR try app_user_id as deviceId directly.
     let userRef = null;
-    let deviceId = null;
 
     // First try: app_user_id is our deviceId (if we aliased it)
     const directDoc = await db.collection('users').doc(app_user_id).get();
     if (directDoc.exists) {
       userRef = directDoc.ref;
-      deviceId = app_user_id;
     } else {
       // Second try: find by rcAppUserId field
       const snap = await db.collection('users')
@@ -2310,7 +2266,6 @@ app.post('/api/webhooks/revenuecat', express.json({ type: '*/*' }), async (req, 
         .get();
       if (!snap.empty) {
         userRef = snap.docs[0].ref;
-        deviceId = snap.docs[0].id;
       }
     }
 
@@ -2320,20 +2275,18 @@ app.post('/api/webhooks/revenuecat', express.json({ type: '*/*' }), async (req, 
       return res.json({ success: true, warning: 'user_not_found' });
     }
 
-    const isTrial = period_type === 'TRIAL';
+    const isTrial = period_type === 'TRIAL' || period_type === 'INTRO';
     const planType = product_id?.includes('annual') ? 'annual' : product_id?.includes('monthly') ? 'monthly' : null;
     const trialEndsAt = isTrial && expiration_at_ms ? new Date(expiration_at_ms).toISOString() : null;
     const expiresAt = expiration_at_ms ? new Date(expiration_at_ms).toISOString() : null;
     const now = admin.firestore.FieldValue.serverTimestamp();
 
-    let isPremium = false;
     let subscriptionUpdate = {};
 
     switch (type) {
       case 'INITIAL_PURCHASE':
       case 'RENEWAL':
       case 'UNCANCELLATION':
-        isPremium = true;
         subscriptionUpdate = {
           isPremium: true,
           isTrial,
@@ -2353,7 +2306,6 @@ app.post('/api/webhooks/revenuecat', express.json({ type: '*/*' }), async (req, 
         break;
 
       case 'TRIAL_STARTED':
-        isPremium = true;
         subscriptionUpdate = {
           isPremium: true,
           isTrial: true,
@@ -2373,7 +2325,6 @@ app.post('/api/webhooks/revenuecat', express.json({ type: '*/*' }), async (req, 
         break;
 
       case 'TRIAL_CONVERTED':
-        isPremium = true;
         subscriptionUpdate = {
           isPremium: true,
           isTrial: false,
@@ -2404,7 +2355,6 @@ app.post('/api/webhooks/revenuecat', express.json({ type: '*/*' }), async (req, 
         break;
 
       case 'EXPIRATION':
-        isPremium = false;
         subscriptionUpdate = {
           isPremium: false,
           isTrial: false,
@@ -2427,7 +2377,6 @@ app.post('/api/webhooks/revenuecat', express.json({ type: '*/*' }), async (req, 
         break;
 
       default:
-        console.log(`ℹ️ RC Webhook unhandled type: ${type}`);
         return res.json({ success: true, note: 'unhandled_event_type' });
     }
 
@@ -2439,13 +2388,147 @@ app.post('/api/webhooks/revenuecat', express.json({ type: '*/*' }), async (req, 
       updatedAt: now,
     });
 
-    console.log(`✅ RC Webhook processed: ${type} | deviceId=${deviceId} | isPremium=${isPremium}`);
     res.json({ success: true });
 
   } catch (err) {
     console.error('❌ RevenueCat webhook error:', err);
     // Return 200 to prevent RC from retrying on our server errors
     res.json({ success: false, error: err.message });
+  }
+});
+
+// ============================================
+// ADMIN ROUTES
+// ============================================
+
+// GET /api/admin/users
+// Lists all users with subscription info for admin review.
+// Requires x-admin-secret header matching ADMIN_SECRET env var.
+app.get('/api/admin/users', async (req, res) => {
+  const secret = process.env.ADMIN_SECRET;
+  if (!secret || req.headers['x-admin-secret'] !== secret) {
+    return res.status(401).json({ success: false, error: 'Unauthorized' });
+  }
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 100, 500);
+    const filterPremium = req.query.isPremium;
+    const filterTrial   = req.query.isTrial;
+
+    const snap = await db.collection('users').orderBy('createdAt', 'desc').limit(limit).get();
+    const now  = new Date();
+
+    const users = snap.docs.map(doc => {
+      const d   = doc.data();
+      const sub = d.subscription || null;
+
+      const expiresDate    = sub?.expiresAt    ? new Date(sub.expiresAt)    : null;
+      const trialEndsDate  = sub?.trialEndsAt  ? new Date(sub.trialEndsAt)  : null;
+      const expiresInDays  = expiresDate   ? Math.ceil((expiresDate   - now) / 86400000) : null;
+      const trialDaysLeft  = trialEndsDate ? Math.ceil((trialEndsDate - now) / 86400000) : null;
+
+      let status = 'none';
+      if (sub?.isPremium) {
+        if (sub.isTrial)               status = 'trial';
+        else if (sub.willRenew === false) status = 'cancelled_active';
+        else                           status = 'active';
+      } else if (sub?.expiresAt) {
+        status = 'expired';
+      }
+
+      return {
+        deviceId:    doc.id,
+        displayName: d.displayName || null,
+        createdAt:   d.createdAt?.toDate?.()?.toISOString() || null,
+        subscription: sub ? {
+          status,
+          isPremium:           sub.isPremium,
+          isTrial:             sub.isTrial,
+          planType:            sub.planType,
+          periodType:          sub.periodType,
+          productIdentifier:   sub.productIdentifier,
+          trialEndsAt:         sub.trialEndsAt    || null,
+          trialDaysLeft:       trialDaysLeft !== null ? `${trialDaysLeft}d` : null,
+          expiresAt:           sub.expiresAt      || null,
+          expiresInDays:       expiresInDays !== null ? `${expiresInDays}d` : null,
+          willRenew:           sub.willRenew,
+          isSandbox:           sub.isSandbox,
+          billingIssue:        sub.billingIssue   || null,
+          lastSyncedAt:        sub.lastSyncedAt?.toDate?.()?.toISOString() || sub.lastSyncedAt || null,
+          webhookType:         sub.webhookType    || null,
+          rcAppUserId:         sub.rcAppUserId    || null,
+        } : null,
+      };
+    });
+
+    const filtered = users.filter(u => {
+      if (filterPremium === 'true'  && !u.subscription?.isPremium) return false;
+      if (filterPremium === 'false' &&  u.subscription?.isPremium) return false;
+      if (filterTrial   === 'true'  && !u.subscription?.isTrial)   return false;
+      if (filterTrial   === 'false' &&  u.subscription?.isTrial)   return false;
+      return true;
+    });
+
+    res.json({ success: true, total: filtered.length, users: filtered });
+  } catch (err) {
+    console.error('❌ Admin users list error:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/admin/users/:deviceId
+// Full details for one user — subscription state, trial info, renewal dates, etc.
+app.get('/api/admin/users/:deviceId', async (req, res) => {
+  const secret = process.env.ADMIN_SECRET;
+  if (!secret || req.headers['x-admin-secret'] !== secret) {
+    return res.status(401).json({ success: false, error: 'Unauthorized' });
+  }
+  try {
+    const doc = await db.collection('users').doc(req.params.deviceId).get();
+    if (!doc.exists) return res.status(404).json({ success: false, error: 'User not found' });
+
+    const d   = doc.data();
+    const sub = d.subscription || null;
+    const now = new Date();
+
+    res.json({
+      success: true,
+      user: {
+        deviceId:           doc.id,
+        displayName:        d.displayName       || null,
+        code:               d.code              || null,
+        createdAt:          d.createdAt?.toDate?.()?.toISOString()  || null,
+        updatedAt:          d.updatedAt?.toDate?.()?.toISOString()  || null,
+        streak:             d.streak            || 0,
+        totalCheckIns:      d.totalCheckIns     || 0,
+        checkInFrequency:   d.checkInFrequency  || 1,
+        lastCheckIn:        d.lastCheckIn?.toDate?.()?.toISOString() || null,
+        watchersCount:      d.watchersCount     || 0,
+        squadMembersCount:  (d.squadMembers     || []).length,
+        subscription: sub ? {
+          isPremium:             sub.isPremium,
+          isTrial:               sub.isTrial,
+          planType:              sub.planType,
+          periodType:            sub.periodType,
+          productIdentifier:     sub.productIdentifier,
+          trialEndsAt:           sub.trialEndsAt            || null,
+          trialDaysLeft:         sub.trialEndsAt ? Math.ceil((new Date(sub.trialEndsAt) - now) / 86400000) : null,
+          expiresAt:             sub.expiresAt              || null,
+          expiresInDays:         sub.expiresAt ? Math.ceil((new Date(sub.expiresAt) - now) / 86400000) : null,
+          willRenew:             sub.willRenew,
+          originalPurchaseDate:  sub.originalPurchaseDate   || null,
+          isSandbox:             sub.isSandbox,
+          billingIssue:          sub.billingIssue           || null,
+          cancelReason:          sub.cancelReason           || null,
+          lastSyncedAt:          sub.lastSyncedAt?.toDate?.()?.toISOString()        || sub.lastSyncedAt        || null,
+          webhookType:           sub.webhookType            || null,
+          webhookReceivedAt:     sub.webhookReceivedAt?.toDate?.()?.toISOString()  || sub.webhookReceivedAt   || null,
+          rcAppUserId:           sub.rcAppUserId            || null,
+        } : null,
+      },
+    });
+  } catch (err) {
+    console.error('❌ Admin user detail error:', err);
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
