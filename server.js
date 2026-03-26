@@ -8,13 +8,39 @@ const aliveCheckRoutes = require('./aliveCheck');
 const referralRoutes = require('./referrals');
 
 // ============================================
+// STARTUP ENV VALIDATION — fail fast, clear errors
+// ============================================
+const REQUIRED_ENV = [
+  'FIREBASE_TYPE', 'FIREBASE_PROJECT_ID', 'FIREBASE_PRIVATE_KEY_ID',
+  'FIREBASE_PRIVATE_KEY', 'FIREBASE_CLIENT_EMAIL', 'OPENAI_API_KEY',
+  // RC_WEBHOOK_SECRET is optional — only needed if using RC server-to-server webhooks.
+  // Subscription state is synced directly from the app via /api/subscription/sync.
+];
+const missingEnv = REQUIRED_ENV.filter(k => !process.env[k]);
+if (missingEnv.length) {
+  console.error('❌ FATAL: Missing required environment variables:', missingEnv.join(', '));
+  process.exit(1);
+}
+
+// ============================================
+// GLOBAL ERROR HANDLERS — prevent silent crashes
+// ============================================
+process.on('unhandledRejection', (reason) => {
+  console.error('⚠️  Unhandled Promise Rejection:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('💥 Uncaught Exception:', err);
+  process.exit(1);
+});
+
+// ============================================
 // FIREBASE INITIALIZATION FROM ENV
 // ============================================
 const serviceAccount = {
   type: process.env.FIREBASE_TYPE,
   project_id: process.env.FIREBASE_PROJECT_ID,
   private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
-  private_key: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+  private_key: (process.env.FIREBASE_PRIVATE_KEY || '').replace(/\\n/g, '\n'),
   client_email: process.env.FIREBASE_CLIENT_EMAIL,
   client_id: process.env.FIREBASE_CLIENT_ID,
   auth_uri: process.env.FIREBASE_AUTH_URI,
@@ -1533,15 +1559,30 @@ app.post('/api/pulse/challenges/log-activity', getDeviceId, async (req, res) => 
 
     // Find which challenge this device is enrolled in
     let enrolledChallengeId = null;
+    let enrolledMemberRef   = null;
+    let enrolledMemberSnap  = null;
     for (const ch of STATIC_CHALLENGES) {
       const memberRef = db.collection('challengeEnrollments')
         .doc(ch.id).collection('members').doc(deviceId);
       const snap = await memberRef.get();
-      if (snap.exists) { enrolledChallengeId = ch.id; break; }
+      if (snap.exists) {
+        enrolledChallengeId = ch.id;
+        enrolledMemberRef   = memberRef;
+        enrolledMemberSnap  = snap;
+        break;
+      }
     }
 
     if (!enrolledChallengeId) {
       return res.json({ success: false, error: 'Not enrolled in any challenge' });
+    }
+
+    // Mark first test — Day 1 of the grid starts here, not at enrollment
+    if (!enrolledMemberSnap.data()?.firstTestAt) {
+      await enrolledMemberRef.set(
+        { firstTestAt: admin.firestore.FieldValue.serverTimestamp() },
+        { merge: true },
+      );
     }
 
     // Store today's activity: key = YYYY-MM-DD
@@ -1566,7 +1607,8 @@ app.post('/api/pulse/challenges/log-activity', getDeviceId, async (req, res) => 
 });
 
 // GET /api/pulse/challenges/progress?deviceId=X
-// Returns dot grid: enrolledChallengeId, enrolledAt, days array [{date, pillarCount}]
+// Returns dot grid: challengeId, enrolledAt, startDate (firstTestAt), days [{date, pillarCount}]
+// startDate is null until the user completes their first test — Day 1 starts from there.
 app.get('/api/pulse/challenges/progress', async (req, res) => {
   try {
     const { deviceId } = req.query;
@@ -1574,14 +1616,17 @@ app.get('/api/pulse/challenges/progress', async (req, res) => {
 
     // Find enrolled challenge
     let enrolledChallengeId = null;
-    let enrolledAt = null;
+    let enrolledAt          = null;
+    let startDate           = null; // firstTestAt — null until first test is done
     for (const ch of STATIC_CHALLENGES) {
       const memberRef = db.collection('challengeEnrollments')
         .doc(ch.id).collection('members').doc(deviceId);
       const snap = await memberRef.get();
       if (snap.exists) {
+        const data      = snap.data();
         enrolledChallengeId = ch.id;
-        enrolledAt = snap.data().enrolledAt?.toDate()?.toISOString() || null;
+        enrolledAt      = data.enrolledAt?.toDate()?.toISOString()  || null;
+        startDate       = data.firstTestAt?.toDate()?.toISOString() || null;
         break;
       }
     }
@@ -1608,6 +1653,7 @@ app.get('/api/pulse/challenges/progress', async (req, res) => {
       enrolled: true,
       challengeId: enrolledChallengeId,
       enrolledAt,
+      startDate,  // null until first test — frontend uses this as Day 1 origin
       days,
     });
   } catch (error) {
@@ -2156,11 +2202,6 @@ app.post('/api/subscription/sync', async (req, res) => {
 
     const now = admin.firestore.FieldValue.serverTimestamp();
     const userRef = db.collection('users').doc(deviceId);
-    const userDoc = await userRef.get();
-
-    if (!userDoc.exists) {
-      return res.status(404).json({ success: false, error: 'User not found' });
-    }
 
     const subscriptionData = {
       isPremium: Boolean(isPremium),
@@ -2178,10 +2219,12 @@ app.post('/api/subscription/sync', async (req, res) => {
       lastSyncedAt: now,
     };
 
-    await userRef.update({
+    // Use set+merge so this works even if the user doc doesn't exist yet
+    // (e.g. RC initialises faster than the first alive-check API call on a fresh install)
+    await userRef.set({
       subscription: subscriptionData,
       updatedAt: now,
-    });
+    }, { merge: true });
 
     console.log(`💳 Subscription synced: ${deviceId} | premium=${isPremium} | trial=${isTrial} | plan=${planType}`);
 
@@ -2220,14 +2263,12 @@ app.get('/api/subscription/status', async (req, res) => {
 // Set Authorization header to process.env.RC_WEBHOOK_SECRET.
 app.post('/api/webhooks/revenuecat', express.json({ type: '*/*' }), async (req, res) => {
   try {
-    // Validate webhook secret
+    // Validate webhook secret — always required, no bypass
     const secret = process.env.RC_WEBHOOK_SECRET;
-    if (secret) {
-      const auth = req.headers['authorization'];
-      if (auth !== secret) {
-        console.warn('⚠️ RevenueCat webhook: invalid secret');
-        return res.status(401).json({ success: false, error: 'Unauthorized' });
-      }
+    const auth = req.headers['authorization'];
+    if (auth !== secret) {
+      console.warn('⚠️ RevenueCat webhook: invalid or missing secret');
+      return res.status(401).json({ success: false, error: 'Unauthorized' });
     }
 
     const event = req.body?.event;
