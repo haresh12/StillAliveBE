@@ -6,6 +6,34 @@ const { Resend } = require('resend');
 const cron = require('node-cron');
 const aliveCheckRoutes = require('./aliveCheck');
 const referralRoutes = require('./referrals');
+const { router: wellnessRouter, setDb: wellnessSetDb } = require('./wellnessAgents');
+const {
+  router: driftRouter,
+  setDb: driftSetDb,
+  processScheduledTriggers: processDriftScheduledTriggers,
+  runDriftNightlyAnalysis,
+} = require('./driftAgent');
+const {
+  router: lunaRouter,
+  setDb: lunaSetDb,
+  processScheduledTriggers: processLunaScheduledTriggers,
+  runLunaNightlyAnalysis,
+} = require('./lunaAgent');
+const {
+  router: bondRouter,
+  setDb: bondSetDb,
+  processScheduledTriggers: processBondScheduledTriggers,
+  runBondNightlyAnalysis,
+} = require('./bondAgent');
+const {
+  router: vitaRouter,
+  setDb: vitaSetDb,
+  processScheduledTriggers: processVitaScheduledTriggers,
+  runVitaNightlyAnalysis,
+} = require('./vitaAgent');
+const { runNexus, setDb: nexusSetDb } = require('./nexus');
+const { router: communityRouter, setDb: communitySetDb } = require('./community');
+
 
 // ============================================
 // STARTUP ENV VALIDATION — fail fast, clear errors
@@ -57,6 +85,17 @@ admin.initializeApp({
 const db = admin.firestore();
 console.log('🔥 Firebase initialized from environment variables');
 
+// Inject Firestore into modules
+wellnessSetDb(db);
+driftSetDb(db);
+lunaSetDb(db);
+bondSetDb(db);
+vitaSetDb(db);
+nexusSetDb(db);
+communitySetDb(db)
+
+
+
 // ============================================
 // RESEND INITIALIZATION
 // ============================================
@@ -75,6 +114,16 @@ app.use(express.json());
 // REMOVED: Referral routes — referral feature removed
 // app.use('/api/referrals', referralRoutes);
 app.use('/api/alive-check', aliveCheckRoutes);
+app.use('/api/community', communityRouter);
+
+// ── Wellness Agents (Pulse v2) ────────────────────────────────────────────────
+app.use('/api/wellness', wellnessRouter);
+// Tracker routes also accessible at /api/trackers/ (frontend uses this prefix)
+app.use('/api/trackers', wellnessRouter);
+app.use('/api/drift', driftRouter);
+app.use('/api/luna', lunaRouter);
+app.use('/api/bond', bondRouter);
+app.use('/api/vita', vitaRouter);
 
 // ============================================
 // CONSTANTS
@@ -603,6 +652,35 @@ setTimeout(() => {
 }, 5000);
 */  // END REMOVED CRON JOB
 
+// ── DRIFT: proactive triggers — every minute for tighter reminder timing ──
+cron.schedule('* * * * *', () => {
+  processDriftScheduledTriggers(db).catch(e => console.error('DRIFT proactive cron error:', e));
+  processLunaScheduledTriggers(db).catch(e => console.error('LUNA proactive cron error:', e));
+  processBondScheduledTriggers(db).catch(e => console.error('BOND proactive cron error:', e));
+  processVitaScheduledTriggers(db).catch(e => console.error('VITA proactive cron error:', e));
+});
+
+// ── NEXUS: background orchestrator — every 6 hours ───────────────────────────
+cron.schedule('0 */6 * * *', () => {
+  runNexus(db).catch(e => console.error('NEXUS cron error:', e));
+});
+
+// ── DRIFT: nightly sleep pattern analysis — 2am daily ─────────────────────────
+cron.schedule('0 2 * * *', () => {
+  runDriftNightlyAnalysis(db).catch(e => console.error('DRIFT nightly analysis error:', e));
+  runLunaNightlyAnalysis(db).catch(e => console.error('LUNA nightly analysis error:', e));
+  runBondNightlyAnalysis(db).catch(e => console.error('BOND nightly analysis error:', e));
+  runVitaNightlyAnalysis(db).catch(e => console.error('VITA nightly analysis error:', e));
+});
+
+// Run once on startup (after 10s) to catch any missed triggers
+setTimeout(() => {
+  processDriftScheduledTriggers(db).catch(e => console.error('Startup DRIFT proactive check error:', e));
+  processLunaScheduledTriggers(db).catch(e => console.error('Startup LUNA proactive check error:', e));
+  processBondScheduledTriggers(db).catch(e => console.error('Startup BOND proactive check error:', e));
+  processVitaScheduledTriggers(db).catch(e => console.error('Startup VITA proactive check error:', e));
+}, 10000);
+
 // ============================================
 // ROUTES
 // ============================================
@@ -615,7 +693,7 @@ app.get('/health', (req, res) => {
     features: {
       emailAlerts: true,
       cronJob: true,
-      cronInterval: '1 hour',
+      cronInterval: '1 minute',
       deviceIdAuth: true,
       firebaseFromEnv: true,
       totalCheckIns: true,
