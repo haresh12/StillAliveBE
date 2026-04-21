@@ -75,6 +75,10 @@ app.use(express.json());
 // REMOVED: Referral routes — referral feature removed
 // app.use('/api/referrals', referralRoutes);
 app.use('/api/alive-check', aliveCheckRoutes);
+app.use('/api/mind',      require('./mind.agent'));
+app.use('/api/sleep',     require('./sleep.agent'));
+app.use('/api/nutrition', require('./nutrition.agent'));
+app.use('/api/water',     require('./water.agent'));
 
 // ============================================
 // CONSTANTS
@@ -660,6 +664,20 @@ const getDeviceId = async (req, res, next) => {
   }
 };
 
+const getWellnessDeviceId = (req, res, next) => {
+  const deviceId = req.body?.deviceId;
+
+  if (!deviceId || typeof deviceId !== 'string' || !deviceId.trim()) {
+    return res.status(400).json({
+      success: false,
+      error: 'Device ID required'
+    });
+  }
+
+  req.deviceId = deviceId.trim();
+  next();
+};
+
 // ============================================
 // USER ROUTES
 // ============================================
@@ -694,6 +712,82 @@ app.post('/api/users/me', getDeviceId, async (req, res) => {
   } catch (error) {
     console.error('Get user error:', error);
     res.status(500).json({ success: false, error: 'Failed to get user' });
+  }
+});
+
+app.post('/api/wellness/signup', getWellnessDeviceId, async (req, res) => {
+  try {
+    const {
+      name = '',
+      ageGroup = '',
+      gender = '',
+      termsAccepted = false,
+    } = req.body || {};
+
+    const trimmedName = String(name).trim();
+    const trimmedAgeGroup = String(ageGroup).trim();
+    const trimmedGender = String(gender).trim();
+
+    if (trimmedName.length < 2) {
+      return res.status(400).json({ success: false, error: 'Name is required' });
+    }
+
+    if (!trimmedAgeGroup) {
+      return res.status(400).json({ success: false, error: 'Age group is required' });
+    }
+
+    if (!trimmedGender) {
+      return res.status(400).json({ success: false, error: 'Gender is required' });
+    }
+
+    if (termsAccepted !== true) {
+      return res.status(400).json({ success: false, error: 'Terms must be accepted' });
+    }
+
+    const userRef = db.collection('wellness_users').doc(req.deviceId);
+    const existingDoc = await userRef.get();
+    const existingData = existingDoc.exists ? existingDoc.data() : null;
+
+    const payload = {
+      userId: req.deviceId,
+      deviceId: req.deviceId,
+      name: trimmedName,
+      displayName: trimmedName,
+      ageGroup: trimmedAgeGroup,
+      gender: trimmedGender,
+      termsAccepted: true,
+      onboardingCompleted: true,
+      profileCompleted: true,
+      appSection: 'wellness',
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      ...(existingDoc.exists
+        ? {}
+        : {
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            joinedAt: admin.firestore.FieldValue.serverTimestamp(),
+          }),
+    };
+
+    await userRef.set(payload, { merge: true });
+
+    res.json({
+      success: true,
+      isNewUser: !existingData,
+      user: {
+        userId: req.deviceId,
+        deviceId: req.deviceId,
+        name: trimmedName,
+        displayName: trimmedName,
+        ageGroup: trimmedAgeGroup,
+        gender: trimmedGender,
+        onboardingCompleted: true,
+        profileCompleted: true,
+        appSection: 'wellness',
+      },
+    });
+  } catch (error) {
+    console.error('Wellness signup error:', error);
+    res.status(500).json({ success: false, error: 'Failed to create wellness account' });
   }
 });
 
@@ -2551,6 +2645,35 @@ app.use((err, req, res, next) => {
     error: 'Internal server error',
     message: process.env.NODE_ENV === 'development' ? err.message : undefined
   });
+});
+
+// ============================================
+// WELLNESS ROUTES — wellness_ prefix collections
+// ============================================
+
+// POST /api/wellness/register — called on onboarding completion
+// Creates or updates a wellness_users document with deviceId as document ID
+app.post('/api/wellness/register', async (req, res) => {
+  try {
+    const { deviceId, name, age, gender, selectedCoaches } = req.body;
+    if (!deviceId) return res.status(400).json({ success: false, error: 'deviceId required' });
+
+    await db.collection('wellness_users').doc(deviceId).set({
+      device_id: deviceId,
+      name: (name || '').trim(),
+      age: age ? Number(age) : null,
+      gender: gender || '',
+      selected_coaches: Array.isArray(selectedCoaches) ? selectedCoaches : [],
+      created_at: admin.firestore.FieldValue.serverTimestamp(),
+      onboarding_completed: true,
+    }, { merge: true });
+
+    console.log(`✅ wellness_users registered: ${deviceId}`);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('wellness/register error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
 // ============================================

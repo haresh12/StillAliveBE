@@ -1,0 +1,2187 @@
+'use strict';
+
+// ═══════════════════════════════════════════════════════════════
+// NUTRITION AGENT — Pulse Backend
+// All routes, AI food recognition, chat, proactive cron.
+// Mounted at /api/nutrition in server.js
+// ═══════════════════════════════════════════════════════════════
+
+const express = require('express');
+const router  = express.Router();
+const admin   = require('firebase-admin');
+const { OpenAI } = require('openai');
+const cron    = require('node-cron');
+
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const db = () => admin.firestore();
+
+// ─── Firestore path helpers ───────────────────────────────────
+const userDoc  = (id) => db().collection('wellness_users').doc(id);
+const nutDoc   = (id) => userDoc(id).collection('agents').doc('nutrition');
+const logsCol  = (id) => nutDoc(id).collection('food_logs');
+const chatsCol = (id) => nutDoc(id).collection('nutrition_chats');
+
+// ─── Helpers ──────────────────────────────────────────────────
+const dateStr = (d = new Date()) => {
+  const y  = d.getFullYear();
+  const mo = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${y}-${mo}-${dd}`;
+};
+
+const getWeekKey = (d = new Date()) => {
+  const diff = (d.getDay() + 6) % 7;
+  const mon  = new Date(d);
+  mon.setDate(d.getDate() - diff);
+  return dateStr(mon);
+};
+
+const mapSnapDoc = (doc) => ({ id: doc.id, ...doc.data() });
+
+const toIsoString = (value) => {
+  if (!value) return null;
+  if (typeof value.toDate === 'function') return value.toDate().toISOString();
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+};
+
+// ─── Macro target calculator (Mifflin-St Jeor, graceful fallback) ───────────
+function calcTargets(setup) {
+  const {
+    goal = 'maintain', activity_level = 'moderate',
+    weight_kg, height_cm, age_years, gender = 'other',
+  } = setup;
+
+  const w = parseFloat(weight_kg)  || null;
+  const h = parseFloat(height_cm)  || null;
+  const a = parseFloat(age_years)  || null;
+  const g = gender || 'other';
+
+  // Gender-based average heights used when height not entered
+  const avgH = g === 'female' ? 163 : 175;
+  // Gender-based fallback body weights for protein calc
+  const fallbackW = g === 'female' ? 62 : 78;
+
+  let bmr;
+  if (w && h && a) {
+    // Full Mifflin-St Jeor
+    if (g === 'male')        bmr = 10*w + 6.25*h - 5*a + 5;
+    else if (g === 'female') bmr = 10*w + 6.25*h - 5*a - 161;
+    else                     bmr = 10*w + 6.25*h - 5*a - 78;
+  } else if (w && a) {
+    // Weight + age, assume average height
+    if (g === 'male')        bmr = 10*w + 6.25*avgH - 5*a + 5;
+    else if (g === 'female') bmr = 10*w + 6.25*avgH - 5*a - 161;
+    else                     bmr = 10*w + 6.25*avgH - 5*a - 78;
+  } else if (w) {
+    // Weight only — Katch-McArdle simplified (assumes 20% body fat)
+    bmr = 370 + 17.5 * w;
+  } else if (a) {
+    // Age + gender only — population average adjusted for age
+    const base = g === 'female' ? 1480 : 1780;
+    bmr = base - Math.max(0, (a - 30) * 7);
+  } else {
+    bmr = g === 'female' ? 1550 : 1800;
+  }
+
+  const actMult  = { sedentary: 1.2, light: 1.375, moderate: 1.55, active: 1.725, very_active: 1.9 };
+  const tdee     = bmr * (actMult[activity_level] || 1.55);
+  const goalAdj  = { lose: -500, gain: 300, maintain: 0, healthier: 0, energy: 0 };
+  const calTarget = Math.round(tdee + (goalAdj[goal] || 0));
+
+  // Evidence-based protein targets (g/kg body weight)
+  // lose: 2.0 — preserves muscle in deficit (Helms et al. 2014)
+  // gain: 2.2 — maximises MPS (Morton et al. 2018)
+  // healthier/energy: 1.6 — ISSN position stand minimum for active adults
+  // maintain: 1.5
+  const protPerKg = { lose: 2.0, gain: 2.2, healthier: 1.6, energy: 1.6, maintain: 1.5 };
+  const bodyW     = w || fallbackW;
+  const protTarget = Math.round(bodyW * (protPerKg[goal] || 1.6));
+  const fatTarget  = Math.round((calTarget * 0.28) / 9);
+  const carbTarget = Math.round((calTarget - protTarget * 4 - fatTarget * 9) / 4);
+
+  return {
+    calorie_target: Math.max(calTarget, 1200),
+    protein_target: protTarget,
+    carb_target:    Math.max(carbTarget, 50),
+    fat_target:     Math.max(fatTarget, 30),
+    water_target_cups: 8,
+  };
+}
+
+// ─── USDA FoodData Central search ────────────────────────────
+// "Apples, fuji, with skin, raw" → { name: "Apples", preparation: "raw" }
+// Extracts only the most useful single-word preparation tag
+const PREP_KEYWORDS = ['raw', 'cooked', 'dried', 'dehydrated', 'frozen', 'baked',
+  'boiled', 'roasted', 'grilled', 'steamed', 'fried', 'smoked', 'canned', 'fresh'];
+
+function splitUSDADescription(description) {
+  const idx = description.indexOf(',');
+  if (idx === -1) return { name: description, preparation: null };
+
+  const name    = description.slice(0, idx).trim();
+  const rest    = description.slice(idx + 1).toLowerCase();
+
+  // Find first matching keyword in the preparation text
+  const prep = PREP_KEYWORDS.find(k => rest.includes(k)) || null;
+
+  return { name, preparation: prep };
+}
+
+function parseUSDAFoods(foods, dataTypeRank) {
+  return (foods || []).map(f => {
+    const getNutrient = (id) => (f.foodNutrients || []).find(n => n.nutrientId === id)?.value || 0;
+    const calories    = getNutrient(1008) || getNutrient(2047);
+    const { name, preparation } = splitUSDADescription(f.description);
+    return {
+      id:           `usda_${f.fdcId}`,
+      name,
+      preparation,                      // e.g. "raw", "cooked", "dehydrated"
+      brand:        f.brandOwner || null,
+      dataTypeRank,
+      serving_size: 100,
+      serving_unit: 'g',
+      calories:     Math.round(calories),
+      protein:      Math.round(getNutrient(1003) * 10) / 10,
+      carbs:        Math.round(getNutrient(1005) * 10) / 10,
+      fat:          Math.round(getNutrient(1004) * 10) / 10,
+      source:       'usda',
+    };
+  }).filter(f => f.calories > 0);
+}
+
+async function searchUSDA(query) {
+  try {
+    const apiKey = process.env.USDA_API_KEY || 'DEMO_KEY';
+    const q      = query.trim();
+    const base   = `https://api.nal.usda.gov/fdc/v1/foods/search?api_key=${apiKey}`;
+    const whole  = `&dataType=Foundation,SR%20Legacy`;
+    const signal = AbortSignal.timeout(7000);
+
+    // Three parallel calls:
+    // 1. Exact query in Foundation/SR Legacy
+    // 2. "{query}s, raw" — catches "Apples, raw" for query "apple"
+    // 3. Branded/Survey for variety
+    const qRaw   = `${q}s, raw`;
+    const qSingle = `${q}, raw`;
+
+    const [r1, r2, r3, r4] = await Promise.all([
+      fetch(`${base}&query=${encodeURIComponent(q)}${whole}&pageSize=10`, { signal }),
+      fetch(`${base}&query=${encodeURIComponent(qRaw)}${whole}&pageSize=5`, { signal }),
+      fetch(`${base}&query=${encodeURIComponent(qSingle)}${whole}&pageSize=5`, { signal }),
+      fetch(`${base}&query=${encodeURIComponent(q)}&dataType=Survey%20(FNDDS),Branded&pageSize=15`, { signal }),
+    ]);
+
+    const [d1, d2, d3, d4] = await Promise.all([
+      r1.ok ? r1.json() : {},
+      r2.ok ? r2.json() : {},
+      r3.ok ? r3.json() : {},
+      r4.ok ? r4.json() : {},
+    ]);
+
+    return [
+      ...parseUSDAFoods(d2.foods, 0), // "{q}s, raw" results first — highest priority whole food
+      ...parseUSDAFoods(d3.foods, 0), // "{q}, raw" results
+      ...parseUSDAFoods(d1.foods, 0), // general Foundation/SR Legacy
+      ...parseUSDAFoods(d4.foods, 2), // Branded/Survey last
+    ];
+  } catch { return []; }
+}
+
+// ─── FatSecret API (10/10 search — activate with API keys) ───
+// Sign up free at: https://platform.fatsecret.com/api/Default.aspx?screen=r
+// Add to .env: FATSECRET_CLIENT_ID=xxx  FATSECRET_CLIENT_SECRET=xxx
+let _fsToken = null;
+let _fsTokenExp = 0;
+
+async function getFatSecretToken() {
+  if (_fsToken && Date.now() < _fsTokenExp) return _fsToken;
+  const id  = process.env.FATSECRET_CLIENT_ID;
+  const sec = process.env.FATSECRET_CLIENT_SECRET;
+  if (!id || !sec) return null;
+  try {
+    const creds = Buffer.from(`${id}:${sec}`).toString('base64');
+    const res   = await fetch('https://oauth.fatsecret.com/connect/token', {
+      method: 'POST',
+      headers: { Authorization: `Basic ${creds}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'grant_type=client_credentials&scope=basic',
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    _fsToken    = data.access_token;
+    _fsTokenExp = Date.now() + (data.expires_in - 60) * 1000;
+    return _fsToken;
+  } catch { return null; }
+}
+
+async function searchFatSecret(query) {
+  const token = await getFatSecretToken();
+  if (!token) return [];
+  try {
+    const params = new URLSearchParams({
+      method: 'foods.search', search_expression: query,
+      format: 'json', max_results: '10', page_number: '0',
+    });
+    const res = await fetch(`https://platform.fatsecret.com/rest/server.api?${params}`, {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) return [];
+    const data  = await res.json();
+    const foods = Array.isArray(data.foods?.food) ? data.foods.food : (data.foods?.food ? [data.foods.food] : []);
+    return foods.map(f => {
+      // Parse: "Per 1 medium (182g) - Calories: 95kcal | Fat: 0.3g | Carbs: 25.0g | Protein: 0.5g"
+      const desc    = f.food_description || '';
+      const serving = desc.match(/Per (.+?) - /)?.[1] || '100g';
+      const cal     = parseFloat(desc.match(/Calories: ([\d.]+)kcal/)?.[1] || 0);
+      const fat     = parseFloat(desc.match(/Fat: ([\d.]+)g/)?.[1]      || 0);
+      const carbs   = parseFloat(desc.match(/Carbs: ([\d.]+)g/)?.[1]    || 0);
+      const protein = parseFloat(desc.match(/Protein: ([\d.]+)g/)?.[1]  || 0);
+      // Extract serving weight from "1 medium (182g)" → 182
+      const wMatch   = serving.match(/\((\d+(?:\.\d+)?)g\)/);
+      const servingG = wMatch ? parseFloat(wMatch[1]) : 100;
+      return {
+        id:                  `fs_${f.food_id}`,
+        name:                f.food_name,
+        preparation:         null,
+        brand:               f.brand_name || null,
+        serving_description: serving,       // "1 medium (182g)"
+        serving_size:        servingG,
+        serving_unit:        'g',
+        calories:            cal,
+        protein,
+        carbs,
+        fat,
+        source:              'fatsecret',
+        dataTypeRank:        f.food_type === 'Generic' ? 0 : 2,
+      };
+    }).filter(f => f.calories > 0);
+  } catch { return []; }
+}
+
+// ─── Re-rank: name-match quality + whole-food preference ─────
+function rankSearchResults(results, query) {
+  const q     = query.toLowerCase().trim();
+  const words = q.split(/\s+/).filter(w => w.length >= 3);
+  const escQ  = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+  const scored = results.map(item => {
+    const name = (item.name || '').toLowerCase();
+
+    // Discard if query doesn't appear anywhere in the food name
+    const nameContains = name.includes(q) ||
+      name.includes(q + 's') ||                                              // plural
+      (words.length > 1 && words.every(w => name.includes(w))) ||
+      (q.length >= 5 && name.includes(q.slice(0, Math.floor(q.length * 0.75))));
+    if (!nameContains) return null;
+
+    let score = 0;
+
+    // ── Name match quality ──
+    const firstName = name.split(/[\s,]/)[0]; // e.g. "bananas" from "Bananas, raw"
+    if (name === q)                                                    score += 500;
+    else if (firstName === q || firstName === q + 's')                score += 450; // "Bananas" for "banana"
+    else if (name.startsWith(q + ',') || name.startsWith(q + ' '))   score += 380;
+    else if (name.startsWith(q))                                      score += 340;
+    else if (new RegExp(`\\b${escQ}s?\\b`).test(name))               score += 220; // whole word (plural ok)
+    else if (name.includes(q))                                        score += 120;
+    else                                                               score += 40;
+
+    // ── Whole food bonus (Foundation/SR Legacy) ──
+    score -= (item.dataTypeRank ?? 2) * 60; // Foundation=0pts lost, Branded=120pts lost
+
+    // ── Short clean name bonus (raw foods have short names) ──
+    score -= Math.min(60, Math.floor(name.length / 5));
+
+    // ── No brand = unprocessed whole food ──
+    if (!item.brand) score += 40;
+
+    return { item, score };
+  }).filter(Boolean);
+
+  scored.sort((a, b) => b.score - a.score);
+  return scored.map(s => {
+    // eslint-disable-next-line no-unused-vars
+    const { dataTypeRank, ...rest } = s.item;
+    return rest;
+  });
+}
+
+// ─── Open Food Facts search ───────────────────────────────────
+async function searchOpenFoodFacts(query) {
+  try {
+    const url = `https://world.openfoodfacts.org/cgi/search.pl?action=process&json=1&search_terms=${encodeURIComponent(query)}&page_size=6&fields=product_name,brands,nutriments,serving_size,serving_quantity`;
+    const res  = await fetch(url, { signal: AbortSignal.timeout(4000) });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return (data.products || [])
+      .filter(p => p.product_name && p.nutriments?.['energy-kcal_100g'])
+      .map(p => ({
+        id:           `off_${p.code || Math.random()}`,
+        name:         p.product_name,
+        brand:        p.brands || null,
+        serving_size: parseFloat(p.serving_quantity) || 100,
+        serving_unit: 'g',
+        calories:     Math.round(p.nutriments['energy-kcal_100g'] || 0),
+        protein:      Math.round((p.nutriments['proteins_100g'] || 0) * 10) / 10,
+        carbs:        Math.round((p.nutriments['carbohydrates_100g'] || 0) * 10) / 10,
+        fat:          Math.round((p.nutriments['fat_100g'] || 0) * 10) / 10,
+        source:       'openfoodfacts',
+      }));
+  } catch { return []; }
+}
+
+// ─── Barcode lookup (Open Food Facts) ────────────────────────
+async function lookupBarcode(barcode) {
+  try {
+    const url = `https://world.openfoodfacts.org/api/v0/product/${barcode}.json`;
+    const res  = await fetch(url, { signal: AbortSignal.timeout(5000) });
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data.status !== 1 || !data.product) return null;
+    const p = data.product;
+    const n = p.nutriments || {};
+    return {
+      id:           `off_${barcode}`,
+      name:         p.product_name || p.product_name_en || 'Unknown product',
+      brand:        p.brands || null,
+      serving_size: parseFloat(p.serving_quantity) || 100,
+      serving_unit: 'g',
+      calories:     Math.round(n['energy-kcal_100g'] || n['energy-kcal'] || 0),
+      protein:      Math.round((n['proteins_100g'] || 0) * 10) / 10,
+      carbs:        Math.round((n['carbohydrates_100g'] || 0) * 10) / 10,
+      fat:          Math.round((n['fat_100g'] || 0) * 10) / 10,
+      source:       'barcode',
+    };
+  } catch { return null; }
+}
+
+// ─── GPT-4o Vision food recognition ──────────────────────────
+async function recognizeFood(imageBase64) {
+  const prompt = `You are a precision nutrition AI analyzing a food photo.
+
+RULES:
+- List EACH food item SEPARATELY (not as one combined plate)
+- Use specific names: "basmati rice" not "rice", "roti" not "bread", "dal tadka" not "soup"
+- Estimate portions from visual cues: plate/bowl size, depth, density
+- Standard references: medium roti ≈ 40g/120kcal, cup of cooked rice ≈ 180g/240kcal, medium banana ≈ 120g/107kcal, glass milk ≈ 240ml/150kcal
+- For drinks/liquids use ml; for whole pieces use "piece"; for everything else use "g"
+- confidence: "high" = clearly visible, "medium" = partially visible/obscured, "low" = guessing
+
+Return ONLY valid JSON, no markdown:
+{
+  "items": [
+    {"name":"grilled chicken breast","quantity":150,"unit":"g","emoji":"🍗","confidence":"high","calories":247,"protein":46,"carbs":0,"fat":5}
+  ]
+}`;
+
+  const completion = await openai.chat.completions.create({
+    model: 'gpt-4o',
+    max_tokens: 600,
+    temperature: 0.2,
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${imageBase64}`, detail: 'high' } },
+        { type: 'text', text: prompt },
+      ],
+    }],
+  });
+
+  const raw     = completion.choices[0].message.content.trim();
+  const cleaned = raw.replace(/^```(?:json)?\n?/i, '').replace(/\n?```$/i, '').trim();
+  return JSON.parse(cleaned);
+}
+
+// ─── GPT-4o Vision nutrition label scanner ────────────────────
+async function scanNutritionLabel(imageBase64) {
+  const prompt = `You are reading a nutrition facts label on food packaging. Extract the EXACT printed numbers — do not estimate.
+
+Return ONLY valid JSON, no markdown:
+{
+  "food_name": "Product name from packaging, or 'Scanned food'",
+  "serving_description": "exactly as printed e.g. '1 cup (240ml)' or '30g'",
+  "serving_size_g": 240,
+  "calories": 150,
+  "protein": 8.0,
+  "carbs": 12.0,
+  "fat": 5.0,
+  "confidence": "high"
+}
+
+If this is NOT a nutrition label or numbers are unreadable, return:
+{"error": "No readable nutrition label found"}`;
+
+  const completion = await openai.chat.completions.create({
+    model: 'gpt-4o',
+    max_tokens: 300,
+    temperature: 0,
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${imageBase64}`, detail: 'high' } },
+        { type: 'text', text: prompt },
+      ],
+    }],
+  });
+
+  const raw     = completion.choices[0].message.content.trim();
+  const cleaned = raw.replace(/^```(?:json)?\n?/i, '').replace(/\n?```$/i, '').trim();
+  return JSON.parse(cleaned);
+}
+
+// ─── Cross-agent data reader ──────────────────────────────────
+async function getCrossAgentData(deviceId) {
+  const today     = dateStr();
+  const yesterday = dateStr(new Date(Date.now() - 86400000));
+
+  try {
+    const [sleepSnap, mindSnap] = await Promise.allSettled([
+      userDoc(deviceId).collection('agents').doc('sleep')
+        .collection('sleep_logs').orderBy('date_str', 'desc').limit(1).get(),
+      userDoc(deviceId).collection('agents').doc('mind')
+        .collection('mind_checkins').where('date_str', '==', today).get(),
+    ]);
+
+    let lastSleepHours = null;
+    let lastSleepDate  = null;
+    if (sleepSnap.status === 'fulfilled' && !sleepSnap.value.empty) {
+      const s = sleepSnap.value.docs[0].data();
+      lastSleepHours = s.total_sleep_hours || null;
+      lastSleepDate  = s.date_str || null;
+    }
+
+    let todayMoodAvg   = null;
+    let todayMaxAnxiety = null;
+    if (mindSnap.status === 'fulfilled' && !mindSnap.value.empty) {
+      const checkins = mindSnap.value.docs.map(d => d.data());
+      todayMoodAvg    = checkins.reduce((s, c) => s + (c.mood_score || 2), 0) / checkins.length;
+      todayMaxAnxiety = Math.max(...checkins.map(c => c.anxiety || 1));
+    }
+
+    return { lastSleepHours, lastSleepDate, todayMoodAvg, todayMaxAnxiety };
+  } catch { return {}; }
+}
+
+// ─── Nutrition LLM context builder ───────────────────────────
+async function buildNutritionContext(deviceId) {
+  const today = dateStr();
+  const [nutSnap, profileSnap, todayLogsSnap, recentLogsSnap] = await Promise.all([
+    nutDoc(deviceId).get(),
+    userDoc(deviceId).get(),
+    logsCol(deviceId).where('date_str', '==', today).get(),
+    logsCol(deviceId).orderBy('logged_at', 'desc').limit(50).get(),
+  ]);
+
+  const setup   = nutSnap.exists ? nutSnap.data() : {};
+  const profile = profileSnap.exists ? profileSnap.data() : {};
+  const name    = profile.name || 'there';
+
+  const todayLogs   = todayLogsSnap.docs.map(mapSnapDoc);
+  const recentLogs  = recentLogsSnap.docs.map(mapSnapDoc);
+
+  const calsToday  = todayLogs.reduce((s, l) => s + (l.calories || 0), 0);
+  const protToday  = todayLogs.reduce((s, l) => s + (l.protein || 0), 0);
+  const carbsToday = todayLogs.reduce((s, l) => s + (l.carbs || 0), 0);
+  const fatToday   = todayLogs.reduce((s, l) => s + (l.fat || 0), 0);
+  const waterToday = setup.water_today === today ? (setup.water_cups_today || 0) : 0;
+
+  const calTarget  = setup.calorie_target || 2000;
+  const protTarget = setup.protein_target || 140;
+  const carbTarget = setup.carb_target    || 220;
+  const fatTarget  = setup.fat_target     || 65;
+
+  const todayLogStr = todayLogs.length
+    ? todayLogs.map(l => `  • ${l.food_name} (${l.meal_type}): ${l.calories}kcal P${Math.round(l.protein||0)}g C${Math.round(l.carbs||0)}g F${Math.round(l.fat||0)}g`).join('\n')
+    : '  Nothing logged yet today';
+
+  // 7-day pattern
+  const last7Days = {};
+  recentLogs.forEach(l => {
+    if (!last7Days[l.date_str]) last7Days[l.date_str] = { cals: 0, prot: 0, days: 1 };
+    last7Days[l.date_str].cals += l.calories || 0;
+    last7Days[l.date_str].prot += l.protein  || 0;
+  });
+  const daysLogged = Object.keys(last7Days).filter(d => d >= dateStr(new Date(Date.now() - 7 * 86400000)));
+  const avgCals7d  = daysLogged.length ? Math.round(daysLogged.reduce((s, d) => s + last7Days[d].cals, 0) / daysLogged.length) : null;
+  const protHitDays = daysLogged.filter(d => last7Days[d].prot >= protTarget * 0.9).length;
+
+  // Cross-agent data
+  const { lastSleepHours, lastSleepDate, todayMoodAvg, todayMaxAnxiety } = await getCrossAgentData(deviceId);
+
+  const sleepLine = lastSleepHours
+    ? `Last logged sleep (${lastSleepDate}): ${lastSleepHours.toFixed(1)}h${lastSleepHours < 6 ? ' — ELEVATED CORTISOL RISK: short sleep drives higher calorie intake and sugar cravings today' : ''}`
+    : 'No sleep data available';
+
+  const mindLine = todayMaxAnxiety && todayMaxAnxiety >= 4
+    ? `TODAY: Anxiety spiked to ${todayMaxAnxiety}/5 — STRESS-EATING RISK elevated. Cortisol drives cravings for fat/sugar.`
+    : todayMoodAvg
+    ? `Today's mood average: ${todayMoodAvg.toFixed(1)}/4 — no elevated stress signals`
+    : 'No Mind Coach data today';
+
+  return `You are the Nutrition Coach in Pulse — a deeply personal AI nutrition coach. You are not ChatGPT. You have been privately observing ${name}'s eating patterns and you know their data in detail.
+
+Your rule: if you say something a stranger could have said, you have failed. Every sentence must reflect their specific data, their specific goals, their specific patterns.
+
+━━━ WHO THEY ARE ━━━
+Name: ${name}
+Goal: ${setup.goal || 'eat healthier'}
+Dietary style: ${Array.isArray(setup.dietary_style) ? setup.dietary_style.join(', ') : (setup.dietary_style || 'no restrictions')}
+Biggest challenge: ${Array.isArray(setup.biggest_challenge) ? setup.biggest_challenge.join(', ') : (setup.biggest_challenge || 'general nutrition')}
+Allergies: ${(setup.allergies || []).join(', ') || 'none'}
+Eating pattern: ${setup.eating_pattern || '3 meals a day'}
+
+━━━ TODAY'S LOG ━━━
+Calories: ${Math.round(calsToday)} / ${calTarget} kcal (${Math.round(calsToday/calTarget*100)}% of target)
+Protein:  ${Math.round(protToday)}g / ${protTarget}g
+Carbs:    ${Math.round(carbsToday)}g / ${carbTarget}g
+Fat:      ${Math.round(fatToday)}g / ${fatTarget}g
+Water:    ${waterToday}/${setup.water_target_cups || 8} cups
+Remaining: ${Math.max(0, calTarget - Math.round(calsToday))} kcal | ${Math.max(0, protTarget - Math.round(protToday))}g protein
+
+Today's food log:
+${todayLogStr}
+
+━━━ DAILY TARGETS ━━━
+Calories: ${calTarget} kcal
+Protein: ${protTarget}g | Carbs: ${carbTarget}g | Fat: ${fatTarget}g
+
+━━━ LAST 7 DAYS PATTERN ━━━
+Days logged: ${daysLogged.length}/7
+Average calories: ${avgCals7d ? `${avgCals7d} kcal/day` : 'not enough data'}
+Protein goal hit: ${protHitDays}/${daysLogged.length} days
+
+━━━ CROSS-AGENT INTELLIGENCE (your superpower — use it explicitly) ━━━
+SLEEP: ${sleepLine}
+MIND:  ${mindLine}
+
+━━━ COACHING RULES ━━━
+1. NEVER use: bad, cheat, guilty, indulge, allowed, naughty, treat, slip, fail
+2. Never imply they've failed. Going over target = "adjust tomorrow" not "you blew it"
+3. Reference exact numbers from their log. A stranger could never say what you say.
+4. Cross-agent connections are your superpower — if sleep was short or anxiety was high today, address it directly and proactively
+5. Protein is the most important macro — prioritize it in suggestions
+6. Keep responses tight: 2-4 sentences + 1 actionable suggestion unless they want a full plan
+7. If they ask what to eat next, check remaining macros and give specific suggestions that fit exactly
+8. Be warm and direct. Not clinical. Not fake-cheerful.`;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// POST /setup
+// ═══════════════════════════════════════════════════════════════
+// Convert onboarding ageGroup ("25-34") to midpoint age for BMR
+function ageGroupToYears(ageGroup) {
+  const map = { '18-24': 21, '25-34': 29, '35-44': 39, '45-54': 49, '55-64': 59, '65+': 68 };
+  return map[ageGroup] || 30;
+}
+
+// Normalise onboarding gender ("Male"/"Female") → BMR key
+function normaliseGender(g) {
+  if (!g) return 'other';
+  const v = g.toLowerCase();
+  if (v === 'male')   return 'male';
+  if (v === 'female') return 'female';
+  return 'other';
+}
+
+router.post('/setup', async (req, res) => {
+  try {
+    const {
+      deviceId, goal, dietary_style, biggest_challenge,
+      activity_level, eating_pattern, allergies,
+      weight_kg, height_cm,
+    } = req.body;
+
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+
+    // Read existing profile — name, ageGroup, gender already collected at onboarding
+    const profileSnap = await userDoc(deviceId).get();
+    const profile     = profileSnap.exists ? profileSnap.data() : {};
+    const firstName   = (profile.name || profile.displayName || '').split(' ')[0];
+    const age_years   = ageGroupToYears(profile.ageGroup || profile.age_group);
+    const gender      = normaliseGender(profile.gender);
+
+    const targets = calcTargets({ goal, activity_level, weight_kg, height_cm, age_years, gender });
+
+    const setupData = {
+      setup_completed:       true,
+      goal:                  goal                || 'healthier',
+      dietary_style:         dietary_style       || 'no_restrictions',
+      biggest_challenge:     biggest_challenge   || '',
+      activity_level:        activity_level      || 'moderate',
+      eating_pattern:        eating_pattern      || '3_meals',
+      allergies:             allergies           || [],
+      weight_kg:             weight_kg           || null,
+      height_cm:             height_cm           || null,
+      age_years,
+      gender,
+      ...targets,
+      streak:                0,
+      last_log_date:         null,
+      last_proactive_date:   null,
+      proactive_topic_week:  null,
+      proactive_topic_week_count: 0,
+      created_at:            admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    await nutDoc(deviceId).set(setupData, { merge: true });
+    await userDoc(deviceId).set({
+      nutrition_setup_complete: true,
+      nutrition_setup_at: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    // Opening chat message — uses real name from profile
+    const greeting    = firstName ? `Hey ${firstName} 👋` : 'Hey';
+    const openingMsg  = `${greeting} — your Nutrition Coach is ready. I've pulled in your profile so we're already calibrated to your body. Your daily target is ${targets.calorie_target} kcal with ${targets.protein_target}g protein — built for you, not a generic template. Log your first meal and I'll start reading your patterns. What did you eat last?`;
+
+    await chatsCol(deviceId).add({
+      role:           'assistant',
+      content:        openingMsg,
+      is_proactive:   false,
+      proactive_type: null,
+      is_read:        true,
+      created_at:     admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    res.json({ success: true, targets });
+  } catch (err) {
+    console.error('[nutrition] /setup error:', err);
+    res.status(500).json({ error: 'Setup failed' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// GET /setup-status
+// ═══════════════════════════════════════════════════════════════
+router.get('/setup-status', async (req, res) => {
+  try {
+    const { deviceId } = req.query;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+    const snap = await nutDoc(deviceId).get();
+    if (!snap.exists) return res.json({ setup_completed: false });
+    res.json({ setup_completed: !!snap.data().setup_completed, setup: snap.data() });
+  } catch (err) {
+    console.error('[nutrition] /setup-status error:', err);
+    res.status(500).json({ error: 'Status check failed' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// POST /log — add a food item
+// ═══════════════════════════════════════════════════════════════
+router.post('/log', async (req, res) => {
+  try {
+    const {
+      deviceId, calories, protein, carbs, fat,
+      quantity, unit, food_id, source, date_str: logDate, emoji,
+    } = req.body;
+    const food_name = req.body.food_name || req.body.name;
+    const meal_type = req.body.meal_type || req.body.meal || 'snack';
+
+    if (!deviceId || !food_name) return res.status(400).json({ error: 'deviceId and food_name required' });
+
+    const today = logDate || dateStr();
+    const ref = await logsCol(deviceId).add({
+      food_name,
+      emoji:     emoji || '🍽️',
+      meal_type: meal_type || 'snack',
+      calories:  Math.round(calories || 0),
+      protein:   Math.round((protein || 0) * 10) / 10,
+      carbs:     Math.round((carbs || 0) * 10) / 10,
+      fat:       Math.round((fat || 0) * 10) / 10,
+      quantity:  quantity || 100,
+      unit:      unit || 'g',
+      food_id:   food_id || null,
+      source:    source || 'manual',
+      date_str:  today,
+      logged_at: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    // Update streak
+    const nutSnap = await nutDoc(deviceId).get();
+    const nutData = nutSnap.data() || {};
+    const lastLog = nutData.last_log_date;
+    const yesterday = dateStr(new Date(Date.now() - 86400000));
+    const newStreak = (lastLog === yesterday || lastLog === today)
+      ? (lastLog === today ? (nutData.streak || 1) : (nutData.streak || 0) + 1)
+      : 1;
+
+    await nutDoc(deviceId).update({
+      last_log_date: today,
+      streak:        newStreak,
+    });
+
+    // Low calorie safety check — 3+ days under 800 kcal
+    const recentDaysSnap = await logsCol(deviceId)
+      .where('date_str', '>=', dateStr(new Date(Date.now() - 3 * 86400000)))
+      .get();
+    const byDay = {};
+    recentDaysSnap.docs.forEach(d => {
+      const data = d.data();
+      if (!byDay[data.date_str]) byDay[data.date_str] = 0;
+      byDay[data.date_str] += data.calories || 0;
+    });
+    const lowDays = Object.values(byDay).filter(c => c < 800 && c > 0).length;
+    if (lowDays >= 3) {
+      const lowMsg = "I've noticed you've been eating quite lightly the last few days. How are you feeling energy-wise? I want to make sure your targets are set right for your goals — nothing to fix, just want to check in.";
+      const existing = await chatsCol(deviceId)
+        .where('proactive_type', '==', 'low_intake_check')
+        .where('date_str', '==', today)
+        .limit(1).get();
+      if (existing.empty) {
+        await chatsCol(deviceId).add({
+          role: 'assistant', content: lowMsg, is_proactive: true,
+          proactive_type: 'low_intake_check', is_read: false, date_str: today,
+          created_at: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      }
+    }
+
+    res.json({ success: true, id: ref.id, streak: newStreak });
+  } catch (err) {
+    console.error('[nutrition] /log error:', err);
+    res.status(500).json({ error: 'Log failed' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// GET /logs — get logs for a date
+// ═══════════════════════════════════════════════════════════════
+router.get('/logs', async (req, res) => {
+  try {
+    const { deviceId, date } = req.query;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+
+    const targetDate = date || dateStr();
+    const snap = await logsCol(deviceId).where('date_str', '==', targetDate).get();
+
+    const logs = snap.docs.map(d => ({
+      ...mapSnapDoc(d),
+      logged_at: toIsoString(d.data().logged_at),
+    })).sort((a, b) => (a.logged_at || '') > (b.logged_at || '') ? 1 : -1);
+
+    // Fetch targets + water
+    const nutSnap = await nutDoc(deviceId).get();
+    const nutData = nutSnap.data() || {};
+    const waterCups = nutData.water_today === targetDate ? (nutData.water_cups_today || 0) : 0;
+
+    const totals = logs.reduce((acc, l) => ({
+      calories: acc.calories + (l.calories || 0),
+      protein:  acc.protein  + (l.protein  || 0),
+      carbs:    acc.carbs    + (l.carbs    || 0),
+      fat:      acc.fat      + (l.fat      || 0),
+    }), { calories: 0, protein: 0, carbs: 0, fat: 0 });
+
+    res.json({
+      logs,
+      totals: {
+        calories: Math.round(totals.calories),
+        protein:  Math.round(totals.protein * 10) / 10,
+        carbs:    Math.round(totals.carbs * 10) / 10,
+        fat:      Math.round(totals.fat * 10) / 10,
+      },
+      water_cups: waterCups,
+      targets: {
+        calorie_target: nutData.calorie_target || 2000,
+        protein_target: nutData.protein_target || 140,
+        carb_target:    nutData.carb_target    || 220,
+        fat_target:     nutData.fat_target     || 65,
+        water_target_cups: nutData.water_target_cups || 8,
+      },
+      streak: nutData.streak || 0,
+    });
+  } catch (err) {
+    console.error('[nutrition] /logs error:', err);
+    res.status(500).json({ error: 'Failed to get logs' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// PATCH /log/:id — edit portion/quantity
+// ═══════════════════════════════════════════════════════════════
+router.patch('/log/:id', async (req, res) => {
+  try {
+    const { deviceId, quantity, calories, protein, carbs, fat } = req.body;
+    const { id } = req.params;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+
+    const updates = {};
+    if (quantity !== undefined) updates.quantity  = quantity;
+    if (calories !== undefined) updates.calories  = Math.round(calories);
+    if (protein  !== undefined) updates.protein   = Math.round(protein  * 10) / 10;
+    if (carbs    !== undefined) updates.carbs     = Math.round(carbs    * 10) / 10;
+    if (fat      !== undefined) updates.fat       = Math.round(fat      * 10) / 10;
+
+    await logsCol(deviceId).doc(id).update(updates);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[nutrition] PATCH /log error:', err);
+    res.status(500).json({ error: 'Update failed' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// DELETE /log/:id
+// ═══════════════════════════════════════════════════════════════
+router.delete('/log/:id', async (req, res) => {
+  try {
+    const { deviceId } = req.query;
+    const { id } = req.params;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+    await logsCol(deviceId).doc(id).delete();
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[nutrition] DELETE /log error:', err);
+    res.status(500).json({ error: 'Delete failed' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// POST /water — log a cup of water
+// ═══════════════════════════════════════════════════════════════
+router.post('/water', async (req, res) => {
+  try {
+    const { deviceId } = req.body;
+    const cups_delta = req.body.cups_delta ?? req.body.delta ?? 1;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+
+    const today   = dateStr();
+    const nutSnap = await nutDoc(deviceId).get();
+    const nutData = nutSnap.data() || {};
+    const existing = nutData.water_today === today ? (nutData.water_cups_today || 0) : 0;
+    const newCups  = Math.max(0, existing + cups_delta);
+
+    await nutDoc(deviceId).update({
+      water_today:      today,
+      water_cups_today: newCups,
+    });
+
+    res.json({ success: true, cups: newCups });
+  } catch (err) {
+    console.error('[nutrition] /water error:', err);
+    res.status(500).json({ error: 'Water log failed' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// GET /analysis
+// ═══════════════════════════════════════════════════════════════
+router.get('/analysis', async (req, res) => {
+  try {
+    const { deviceId, range = 'all' } = req.query;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+
+    const [nutSnap, allLogsSnap] = await Promise.all([
+      nutDoc(deviceId).get(),
+      logsCol(deviceId).orderBy('date_str', 'asc').limit(500).get(),
+    ]);
+
+    if (!nutSnap.exists) return res.json({ stage: 0 });
+
+    const nutData = nutSnap.data();
+    const allLogs = allLogsSnap.docs.map(mapSnapDoc);
+
+    if (allLogs.length === 0) return res.json({ stage: 0, setup: nutData });
+
+    // Range filter
+    const RANGE_DAYS = { '7': 7, '30': 30, '90': 90, '365': 365, 'all': null };
+    const days = RANGE_DAYS[range];
+    const cutoff = days ? dateStr(new Date(Date.now() - days * 86400000)) : null;
+    const filteredLogs = cutoff ? allLogs.filter(l => l.date_str >= cutoff) : allLogs;
+
+    if (filteredLogs.length === 0) return res.json({ stage: 0, setup: nutData, empty_range: true });
+
+    // Group by date
+    const byDate = {};
+    filteredLogs.forEach(l => {
+      if (!byDate[l.date_str]) byDate[l.date_str] = { cals: 0, protein: 0, carbs: 0, fat: 0, items: 0 };
+      byDate[l.date_str].cals    += l.calories || 0;
+      byDate[l.date_str].protein += l.protein  || 0;
+      byDate[l.date_str].carbs   += l.carbs    || 0;
+      byDate[l.date_str].fat     += l.fat      || 0;
+      byDate[l.date_str].items   += 1;
+    });
+    const dates = Object.keys(byDate).sort();
+    const daysWithLogs = dates.length;
+
+    // Stats
+    const calTarget  = nutData.calorie_target || 2000;
+    const protTarget = nutData.protein_target || 140;
+    const avgCals    = Math.round(dates.reduce((s, d) => s + byDate[d].cals, 0) / daysWithLogs);
+    const avgProt    = Math.round(dates.reduce((s, d) => s + byDate[d].protein, 0) / daysWithLogs * 10) / 10;
+    const avgCarbs   = Math.round(dates.reduce((s, d) => s + byDate[d].carbs, 0) / daysWithLogs * 10) / 10;
+    const avgFat     = Math.round(dates.reduce((s, d) => s + byDate[d].fat, 0) / daysWithLogs * 10) / 10;
+    const maxCals    = Math.round(Math.max(...dates.map(d => byDate[d].cals)));
+    const minCals    = Math.round(Math.min(...dates.map(d => byDate[d].cals)));
+    const protHitDays = dates.filter(d => byDate[d].protein >= protTarget * 0.9).length;
+    const calsOnTargetDays = dates.filter(d => {
+      const c = byDate[d].cals;
+      return c >= calTarget * 0.85 && c <= calTarget * 1.15;
+    }).length;
+
+    // Signal points for charts
+    const signalPoints = buildSignalPoints(byDate, dates, range);
+
+    // Streak
+    const streak = nutData.streak || 0;
+
+    // Most logged foods
+    const foodCounts = {};
+    filteredLogs.forEach(l => {
+      const key = l.food_name?.toLowerCase() || 'unknown';
+      foodCounts[key] = (foodCounts[key] || 0) + 1;
+    });
+    const topFoods = Object.entries(foodCounts)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([name, count]) => ({ name, count }));
+
+    // Cross-agent insights (only when range includes enough data)
+    let crossAgentInsights = null;
+    if (range === 'all' || range === '30') {
+      crossAgentInsights = await buildCrossAgentInsights(deviceId, allLogs, nutData);
+    }
+
+    // AI insight (cached, only for 'all' range with enough data)
+    let ai_insight = null;
+    if (range === 'all' && daysWithLogs >= 5) {
+      const cacheKey = `${daysWithLogs}_${Math.round(avgCals)}`;
+      const cached   = nutData.analysis_cache;
+      if (cached && cached.key === cacheKey) {
+        ai_insight = cached.insight;
+      } else {
+        ai_insight = await generateAnalysisInsight(nutData, { avgCals, avgProt, calTarget, protTarget, daysWithLogs, protHitDays, calsOnTargetDays, topFoods });
+        await nutDoc(deviceId).update({
+          analysis_cache: { key: cacheKey, insight: ai_insight, generated_at: new Date().toISOString() },
+        });
+      }
+    }
+
+    // ── Nutrition Score (0-100) ──────────────────────────────────
+    const scoreDays     = Math.min(daysWithLogs, 7);
+    const recentDates   = dates.slice(-scoreDays);
+    const calHitDays    = recentDates.filter(d => { const r = byDate[d].cals / calTarget; return r >= 0.9 && r <= 1.1; }).length;
+    const calScore      = scoreDays > 0 ? (calHitDays / scoreDays) * 35 : 0;
+    const protHitRecent = recentDates.filter(d => byDate[d].protein >= protTarget * 0.9).length;
+    const protScore     = scoreDays > 0 ? (protHitRecent / scoreDays) * 35 : 0;
+    const streakScore   = Math.min((nutData.streak || 0) / 14, 1) * 20;
+    const totalMacroCal = avgProt * 4 + avgCarbs * 4 + avgFat * 9;
+    const balanceScore  = totalMacroCal > 100 ? Math.min((Math.min(avgProt * 4, avgCarbs * 4, avgFat * 9) / totalMacroCal) / 0.2, 1) * 10 : 0;
+    const rawScore      = Math.min(100, Math.round(calScore + protScore + streakScore + balanceScore));
+    const nutrition_score = {
+      score: rawScore,
+      label: rawScore >= 85 ? 'Excellent' : rawScore >= 70 ? 'Strong' : rawScore >= 55 ? 'Good' : rawScore >= 35 ? 'Building' : 'Starting',
+      components: {
+        calorie_adherence: Math.round(scoreDays > 0 ? (calHitDays / scoreDays) * 100 : 0),
+        protein_adherence: Math.round(scoreDays > 0 ? (protHitRecent / scoreDays) * 100 : 0),
+        consistency:       Math.min(100, Math.round((nutData.streak || 0) / 14 * 100)),
+        macro_balance:     Math.round(Math.min(balanceScore / 10, 1) * 100),
+      },
+    };
+
+    // ── 28-day heatmap (always from allLogs, range-independent) ──
+    const heatmap_days = [];
+    for (let i = 27; i >= 0; i--) {
+      const ds      = dateStr(new Date(Date.now() - i * 86400000));
+      const dayCals = allLogs.filter(l => l.date_str === ds).reduce((s, l) => s + (l.calories || 0), 0);
+      heatmap_days.push({
+        date_str: ds,
+        calories: Math.round(dayCals),
+        adherence: calTarget > 0 ? Math.round((dayCals / calTarget) * 100) / 100 : 0,
+        logged: dayCals > 0,
+      });
+    }
+
+    // ── Meal timing breakdown ─────────────────────────────────────
+    const mealTotals = {}, mealDaySets = {};
+    allLogs.forEach(l => {
+      const m = (l.meal_type || 'snacks').toLowerCase();
+      mealTotals[m]  = (mealTotals[m]  || 0) + (l.calories || 0);
+      if (!mealDaySets[m]) mealDaySets[m] = new Set();
+      mealDaySets[m].add(l.date_str);
+    });
+    const meal_timing = Object.keys(mealTotals)
+      .map(m => ({ meal: m, avg_calories: Math.round(mealTotals[m] / (mealDaySets[m].size || 1)) }))
+      .sort((a, b) => b.avg_calories - a.avg_calories);
+
+    const stage = daysWithLogs >= 14 ? 3 : daysWithLogs >= 5 ? 2 : 1;
+
+    res.json({
+      stage,
+      stats: {
+        days_logged: daysWithLogs,
+        avg_calories: avgCals,
+        avg_protein: avgProt,
+        avg_carbs: avgCarbs,
+        avg_fat: avgFat,
+        max_calories: maxCals,
+        min_calories: minCals,
+        calorie_target: calTarget,
+        protein_target: protTarget,
+        protein_hit_days: protHitDays,
+        on_target_days: calsOnTargetDays,
+        streak,
+        top_foods: topFoods,
+      },
+      nutrition_score,
+      heatmap_days,
+      meal_timing,
+      signal_points: signalPoints,
+      cross_agent_insights: crossAgentInsights,
+      ai_insight,
+      setup: nutData,
+    });
+  } catch (err) {
+    console.error('[nutrition] /analysis error:', err);
+    res.status(500).json({ error: 'Analysis failed' });
+  }
+});
+
+function buildSignalPoints(byDate, dates, range) {
+  if (range === '7' || range === '30') {
+    // Daily points
+    return dates.map(ds => {
+      const d = new Date(ds + 'T12:00:00');
+      return {
+        date_str: ds,
+        label:    d.toLocaleDateString('en', { month: 'short', day: 'numeric' }),
+        calories: Math.round(byDate[ds].cals),
+        protein:  Math.round(byDate[ds].protein * 10) / 10,
+      };
+    });
+  } else if (range === '90') {
+    // Weekly buckets
+    const weeks = {};
+    dates.forEach(ds => {
+      const d    = new Date(ds + 'T12:00:00');
+      const diff = (d.getDay() + 6) % 7;
+      const mon  = new Date(d); mon.setDate(d.getDate() - diff);
+      const key  = `${mon.getFullYear()}-${String(mon.getMonth()+1).padStart(2,'0')}-${String(mon.getDate()).padStart(2,'0')}`;
+      if (!weeks[key]) weeks[key] = { cals: 0, protein: 0, days: 0 };
+      weeks[key].cals    += byDate[ds].cals;
+      weeks[key].protein += byDate[ds].protein;
+      weeks[key].days    += 1;
+    });
+    return Object.keys(weeks).sort().map(wk => {
+      const d = new Date(wk + 'T12:00:00');
+      return {
+        date_str: wk,
+        label:    d.toLocaleDateString('en', { month: 'short', day: 'numeric' }),
+        calories: Math.round(weeks[wk].cals / weeks[wk].days),
+        protein:  Math.round(weeks[wk].protein / weeks[wk].days * 10) / 10,
+      };
+    });
+  } else {
+    // Monthly buckets
+    const months = {};
+    dates.forEach(ds => {
+      const key = ds.substring(0, 7);
+      if (!months[key]) months[key] = { cals: 0, protein: 0, days: 0 };
+      months[key].cals    += byDate[ds].cals;
+      months[key].protein += byDate[ds].protein;
+      months[key].days    += 1;
+    });
+    return Object.keys(months).sort().map(mk => {
+      const d = new Date(mk + '-01T12:00:00');
+      return {
+        date_str: mk,
+        label:    d.toLocaleDateString('en', { month: 'short', year: '2-digit' }),
+        calories: Math.round(months[mk].cals / months[mk].days),
+        protein:  Math.round(months[mk].protein / months[mk].days * 10) / 10,
+      };
+    });
+  }
+}
+
+async function buildCrossAgentInsights(deviceId, allLogs, nutData) {
+  try {
+    const insights = [];
+
+    // Sleep-nutrition correlation
+    const sleepLogsSnap = await userDoc(deviceId)
+      .collection('agents').doc('sleep')
+      .collection('sleep_logs').orderBy('date_str', 'desc').limit(30).get();
+
+    if (!sleepLogsSnap.empty) {
+      const sleepByDate = {};
+      sleepLogsSnap.docs.forEach(d => {
+        const s = d.data();
+        if (s.date_str) sleepByDate[s.date_str] = s.total_sleep_hours || 0;
+      });
+
+      const nutritionByDate = {};
+      allLogs.forEach(l => {
+        if (!nutritionByDate[l.date_str]) nutritionByDate[l.date_str] = 0;
+        nutritionByDate[l.date_str] += l.calories || 0;
+      });
+
+      const matched = Object.keys(sleepByDate).filter(d => nutritionByDate[d]);
+      const shortSleep = matched.filter(d => sleepByDate[d] < 6);
+      const normalSleep = matched.filter(d => sleepByDate[d] >= 7);
+
+      if (shortSleep.length >= 3 && normalSleep.length >= 3) {
+        const shortAvg  = Math.round(shortSleep.reduce((s, d) => s + nutritionByDate[d], 0) / shortSleep.length);
+        const normalAvg = Math.round(normalSleep.reduce((s, d) => s + nutritionByDate[d], 0) / normalSleep.length);
+        const diff = shortAvg - normalAvg;
+        if (Math.abs(diff) > 100) {
+          insights.push({
+            type:  'sleep_nutrition',
+            icon:  '💤',
+            title: 'Sleep affects your eating',
+            body:  `On nights you slept under 6 hours, you ate an average ${Math.abs(diff)} kcal more the next day vs. well-rested nights. That's cortisol — not willpower.`,
+            color: '#60A5FA',
+          });
+        }
+      }
+    }
+
+    // Mind-nutrition correlation (stress eating)
+    const mindLogsSnap = await userDoc(deviceId)
+      .collection('agents').doc('mind')
+      .collection('mind_checkins').orderBy('date_str', 'desc').limit(60).get();
+
+    if (!mindLogsSnap.empty) {
+      const highAnxDates = new Set();
+      const normalDates  = new Set();
+      mindLogsSnap.docs.forEach(d => {
+        const c = d.data();
+        if (c.anxiety >= 4) highAnxDates.add(c.date_str);
+        else if (c.anxiety <= 2) normalDates.add(c.date_str);
+      });
+
+      const nutritionByDate = {};
+      allLogs.forEach(l => {
+        if (!nutritionByDate[l.date_str]) nutritionByDate[l.date_str] = 0;
+        nutritionByDate[l.date_str] += l.calories || 0;
+      });
+
+      const stressDays  = [...highAnxDates].filter(d => nutritionByDate[d]);
+      const calmDays    = [...normalDates].filter(d => nutritionByDate[d]);
+
+      if (stressDays.length >= 3 && calmDays.length >= 3) {
+        const stressAvg = Math.round(stressDays.reduce((s, d) => s + nutritionByDate[d], 0) / stressDays.length);
+        const calmAvg   = Math.round(calmDays.reduce((s, d) => s + nutritionByDate[d], 0) / calmDays.length);
+        const diff = stressAvg - calmAvg;
+        if (diff > 150) {
+          insights.push({
+            type:  'stress_eating',
+            icon:  '🧠',
+            title: 'Stress drives your intake',
+            body:  `On high-anxiety days logged in your Mind Coach, you average ${diff} more calories than on calm days. Knowing the pattern is the first step to planning around it.`,
+            color: '#F59E0B',
+          });
+        }
+      }
+    }
+
+    return insights.length ? insights : null;
+  } catch { return null; }
+}
+
+async function generateAnalysisInsight(setup, stats) {
+  const { avgCals, avgProt, calTarget, protTarget, daysWithLogs, protHitDays, calsOnTargetDays, topFoods } = stats;
+  const protAdherence = daysWithLogs > 0 ? Math.round(protHitDays / daysWithLogs * 100) : 0;
+  const calAdherence  = daysWithLogs > 0 ? Math.round(calsOnTargetDays / daysWithLogs * 100) : 0;
+  const topFood       = topFoods[0]?.name || 'nothing yet';
+
+  const prompt = `Generate a personal nutrition insight for someone's nutrition tracking app analysis page.
+
+Data:
+- Days logged: ${daysWithLogs}
+- Average calories: ${avgCals} kcal (target: ${calTarget})
+- Average protein: ${avgProt}g/day (target: ${protTarget}g)
+- Protein goal adherence: ${protAdherence}%
+- Calories on target: ${calAdherence}%
+- Most logged food: ${topFood}
+- Goal: ${setup.goal || 'eat healthier'}
+
+Write 2-3 sentences. Be direct and specific. Reference the actual numbers. Sound like a coach who has been watching their data, not a generic app. No platitudes, no "keep it up", no empty encouragement.
+
+Return ONLY the insight text, nothing else.`;
+
+  try {
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o', temperature: 0.55, max_tokens: 180,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    return completion.choices[0].message.content.trim();
+  } catch { return null; }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// POST /food/recognize — camera photo → GPT-4o Vision → per-item macros
+// ═══════════════════════════════════════════════════════════════
+router.post('/food/recognize', async (req, res) => {
+  try {
+    const { deviceId, imageBase64 } = req.body;
+    if (!deviceId || !imageBase64) return res.status(400).json({ error: 'deviceId and imageBase64 required' });
+
+    const result = await recognizeFood(imageBase64);
+    const items  = (result.items || []).map(item => ({
+      ...item,
+      calories: Math.round(item.calories || 0),
+      protein:  Math.round((item.protein || 0) * 10) / 10,
+      carbs:    Math.round((item.carbs   || 0) * 10) / 10,
+      fat:      Math.round((item.fat     || 0) * 10) / 10,
+    }));
+
+    res.json({ items, confidence_note: result.confidence_note || null });
+  } catch (err) {
+    console.error('[nutrition] /food/recognize error:', err);
+    res.status(500).json({ error: 'Food recognition failed' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// POST /food/scan-label — nutrition label photo → exact macros
+// ═══════════════════════════════════════════════════════════════
+router.post('/food/scan-label', async (req, res) => {
+  try {
+    const { deviceId, imageBase64 } = req.body;
+    if (!deviceId || !imageBase64) return res.status(400).json({ error: 'deviceId and imageBase64 required' });
+
+    const result = await scanNutritionLabel(imageBase64);
+
+    if (result.error) return res.status(422).json({ error: result.error });
+
+    res.json({
+      food_name:           result.food_name        || 'Scanned food',
+      serving_description: result.serving_description || null,
+      serving_size_g:      result.serving_size_g   || 100,
+      calories:            Math.round(result.calories || 0),
+      protein:             Math.round((result.protein || 0) * 10) / 10,
+      carbs:               Math.round((result.carbs   || 0) * 10) / 10,
+      fat:                 Math.round((result.fat     || 0) * 10) / 10,
+      confidence:          result.confidence        || 'medium',
+    });
+  } catch (err) {
+    console.error('[nutrition] /food/scan-label error:', err);
+    res.status(500).json({ error: 'Label scan failed' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// GET /food/recent — recently logged foods for quick re-add
+// ═══════════════════════════════════════════════════════════════
+router.get('/food/recent', async (req, res) => {
+  try {
+    const { deviceId } = req.query;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+
+    const snap = await logsCol(deviceId).orderBy('logged_at', 'desc').limit(60).get();
+
+    const seen  = new Set();
+    const items = [];
+    snap.docs.forEach(d => {
+      const data = d.data();
+      const key  = (data.food_name || '').toLowerCase().trim();
+      if (!seen.has(key) && key) {
+        seen.add(key);
+        items.push({
+          id:           d.id,
+          food_name:    data.food_name,
+          name:         data.food_name,
+          emoji:        data.emoji        || '🍽️',
+          calories:     data.calories     || 0,
+          protein:      data.protein      || 0,
+          carbs:        data.carbs        || 0,
+          fat:          data.fat          || 0,
+          meal_type:    data.meal_type    || 'snack',
+          serving_size: 100,
+          serving_unit: 'g',
+          source:       'recent',
+        });
+      }
+    });
+
+    res.json({ items: items.slice(0, 10) });
+  } catch (err) {
+    console.error('[nutrition] /food/recent error:', err);
+    res.status(500).json({ error: 'Failed to get recent foods' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// GET /food/search — text search
+// ═══════════════════════════════════════════════════════════════
+router.get('/food/search', async (req, res) => {
+  try {
+    const { q, deviceId } = req.query;
+    if (!q || !deviceId) return res.status(400).json({ error: 'q and deviceId required' });
+
+    const hasFatSecret = !!(process.env.FATSECRET_CLIENT_ID && process.env.FATSECRET_CLIENT_SECRET);
+
+    const [fsResults, usdaResults, offResults] = await Promise.all([
+      hasFatSecret ? searchFatSecret(q) : Promise.resolve([]),
+      searchUSDA(q),
+      searchOpenFoodFacts(q),
+    ]);
+
+    // FatSecret first (best search quality), then USDA whole foods, then OFF branded
+    const ranked = rankSearchResults([...fsResults, ...usdaResults, ...offResults], q);
+
+    // De-duplicate by normalised name prefix
+    const seen   = new Set();
+    const deduped = ranked.filter(item => {
+      const key = (item.name || '').toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 22);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+    res.json({ results: deduped.slice(0, 10) });
+  } catch (err) {
+    console.error('[nutrition] /food/search error:', err);
+    res.status(500).json({ error: 'Search failed' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// GET /food/barcode/:code
+// ═══════════════════════════════════════════════════════════════
+router.get('/food/barcode/:code', async (req, res) => {
+  try {
+    const { deviceId } = req.query;
+    const { code }     = req.params;
+    if (!deviceId || !code) return res.status(400).json({ error: 'deviceId and barcode required' });
+
+    const result = await lookupBarcode(code);
+    if (!result) return res.status(404).json({ error: 'Product not found' });
+    res.json({ product: result });
+  } catch (err) {
+    console.error('[nutrition] /food/barcode error:', err);
+    res.status(500).json({ error: 'Barcode lookup failed' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// POST /cross-agent-trigger — receives signals from Mind agent
+// ═══════════════════════════════════════════════════════════════
+router.post('/cross-agent-trigger', async (req, res) => {
+  try {
+    const { deviceId, type, anxiety } = req.body;
+    if (!deviceId || !type) return res.status(400).json({ error: 'deviceId and type required' });
+
+    const today = dateStr();
+
+    if (type === 'stress_spike' && anxiety >= 4) {
+      const existing = await chatsCol(deviceId)
+        .where('proactive_type', '==', 'stress_eating_alert')
+        .where('date_str', '==', today)
+        .limit(1).get();
+
+      if (existing.empty) {
+        const nutSnap = await nutDoc(deviceId).get();
+        if (!nutSnap.exists || !nutSnap.data().setup_completed) return res.json({ skipped: true });
+
+        const msg = `Your stress levels just spiked (${anxiety}/5 logged in your Mind Coach). This is when cravings for high-fat, high-sugar foods are strongest — cortisol is doing its thing. Want me to help you plan your next meal before the craving hits? Or just log what you're feeling like eating right now and I'll work with it.`;
+
+        await chatsCol(deviceId).add({
+          role: 'assistant', content: msg, is_proactive: true,
+          proactive_type: 'stress_eating_alert', is_read: false, date_str: today,
+          created_at: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      }
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[nutrition] /cross-agent-trigger error:', err);
+    res.status(500).json({ error: 'Trigger failed' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// POST /chat
+// ═══════════════════════════════════════════════════════════════
+router.post('/chat', async (req, res) => {
+  try {
+    const { deviceId, message, imageBase64, proactive_context } = req.body;
+    if (!deviceId || (!message && !imageBase64)) return res.status(400).json({ error: 'deviceId and message or image required' });
+
+    await chatsCol(deviceId).add({
+      role: 'user', content: message, is_proactive: false,
+      proactive_type: null, is_read: true,
+      created_at: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    let systemContext = await buildNutritionContext(deviceId);
+
+    if (proactive_context) {
+      systemContext += `\n\n[THREAD CONTEXT: User is replying to a proactive message about: ${proactive_context}. Continue that thread naturally.]`;
+    }
+
+    const historySnap = await chatsCol(deviceId)
+      .orderBy('created_at', 'desc').limit(14).get();
+    const history = historySnap.docs.reverse().map(d => ({
+      role: d.data().role, content: d.data().content,
+    }));
+
+    // If user attached a photo, add vision analysis to message
+    let userContent = message;
+    let imageAnalysis = null;
+    if (imageBase64) {
+      try {
+        imageAnalysis = await recognizeFood(imageBase64);
+        const items = imageAnalysis.items || [];
+        const analysisStr = items.map(i => `${i.name} (~${i.quantity}${i.unit})`).join(', ');
+        const totalCals = items.reduce((s, i) => s + (i.calories || 0), 0);
+        const totalProt = items.reduce((s, i) => s + (i.protein  || 0), 0);
+        userContent = `${message || 'Analyze this food photo and tell me how it fits my macros today.'}\n[Photo: ${analysisStr || 'food item'}. Total: ~${totalCals} kcal, ~${Math.round(totalProt)}g protein]`;
+      } catch { /* vision failed, continue with text only */ }
+    }
+
+    const messages = [{ role: 'system', content: systemContext }, ...history];
+    if (imageBase64 && imageAnalysis) {
+      messages.push({
+        role: 'user',
+        content: [
+          { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${imageBase64}`, detail: 'low' } },
+          { type: 'text', text: userContent },
+        ],
+      });
+    }
+
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o', temperature: 0.72, max_tokens: 600,
+      messages,
+    });
+
+    const reply = completion.choices[0].message.content.trim();
+
+    const msgRef = await chatsCol(deviceId).add({
+      role: 'assistant', content: reply, is_proactive: false,
+      proactive_type: null, is_read: true,
+      created_at: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    res.json({ success: true, reply, message_id: msgRef.id, image_analysis: imageAnalysis });
+  } catch (err) {
+    console.error('[nutrition] /chat error:', err);
+    res.status(500).json({ error: 'Chat failed' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// GET /chat
+// ═══════════════════════════════════════════════════════════════
+router.get('/chat', async (req, res) => {
+  try {
+    const { deviceId } = req.query;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+
+    const snap = await chatsCol(deviceId).orderBy('created_at', 'asc').limit(80).get();
+    const messages = snap.docs.map(d => ({
+      id: d.id, ...d.data(),
+      created_at: d.data().created_at?.toDate?.()?.toISOString() || null,
+    }));
+
+    res.json({ messages });
+  } catch (err) {
+    console.error('[nutrition] GET /chat error:', err);
+    res.status(500).json({ error: 'Failed' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// GET /chat/unread
+// ═══════════════════════════════════════════════════════════════
+router.get('/chat/unread', async (req, res) => {
+  try {
+    const { deviceId } = req.query;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+
+    const snap = await chatsCol(deviceId).where('is_read', '==', false).limit(20).get();
+    const messages = snap.docs
+      .map(d => ({ id: d.id, ...d.data(), created_at: toIsoString(d.data().created_at) }))
+      .filter(m => m.is_proactive)
+      .sort((a, b) => (a.created_at || '') > (b.created_at || '') ? -1 : 1)
+      .slice(0, 5);
+
+    res.json({ messages });
+  } catch (err) {
+    console.error('[nutrition] /chat/unread error:', err);
+    res.status(500).json({ error: 'Failed' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// POST /chat/read
+// ═══════════════════════════════════════════════════════════════
+router.post('/chat/read', async (req, res) => {
+  try {
+    const { deviceId } = req.body;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+
+    const snap = await chatsCol(deviceId).where('is_read', '==', false).get();
+    if (snap.empty) return res.json({ success: true, marked: 0 });
+
+    const batch = db().batch();
+    snap.docs.forEach(d => batch.update(d.ref, { is_read: true }));
+    await batch.commit();
+
+    res.json({ success: true, marked: snap.size });
+  } catch (err) {
+    console.error('[nutrition] /chat/read error:', err);
+    res.status(500).json({ error: 'Failed' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// GET /today — today's log + totals + targets + water (convenience alias)
+// ═══════════════════════════════════════════════════════════════
+router.get('/today', async (req, res) => {
+  try {
+    const { deviceId, date } = req.query;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+
+    const targetDate = date || dateStr();
+    const weekAgoStr = dateStr(new Date(Date.now() - 7 * 86400000));
+    const [logsSnap, nutSnap, weekSnap] = await Promise.all([
+      logsCol(deviceId).where('date_str', '==', targetDate).get(),
+      nutDoc(deviceId).get(),
+      logsCol(deviceId).where('date_str', '>=', weekAgoStr).get(),
+    ]);
+
+    const nutData = nutSnap.exists ? nutSnap.data() : {};
+    const entries = logsSnap.docs.map(d => ({
+      ...mapSnapDoc(d),
+      logged_at: toIsoString(d.data().logged_at),
+    })).sort((a, b) => (a.logged_at || '') > (b.logged_at || '') ? 1 : -1);
+
+    const waterGlasses = nutData.water_today === targetDate ? (nutData.water_cups_today || 0) : 0;
+
+    const totals = entries.reduce((acc, l) => ({
+      calories: acc.calories + (l.calories || 0),
+      protein:  acc.protein  + (l.protein  || 0),
+      carbs:    acc.carbs    + (l.carbs    || 0),
+      fat:      acc.fat      + (l.fat      || 0),
+    }), { calories: 0, protein: 0, carbs: 0, fat: 0 });
+
+    // Weekly summary
+    const protTarget7d = nutData.protein_target || 140;
+    const weekByDay = {};
+    weekSnap.docs.forEach(d => {
+      const data = d.data();
+      const day  = data.date_str;
+      if (!day) return;
+      if (!weekByDay[day]) weekByDay[day] = { cals: 0, prot: 0 };
+      weekByDay[day].cals += data.calories || 0;
+      weekByDay[day].prot += data.protein  || 0;
+    });
+    const weekDays       = Object.keys(weekByDay).filter(d => d !== targetDate);
+    const avgCals7d      = weekDays.length ? Math.round(weekDays.reduce((s, d) => s + weekByDay[d].cals, 0) / weekDays.length) : null;
+    const protHitDays7d  = weekDays.filter(d => weekByDay[d].prot >= protTarget7d * 0.9).length;
+    const daysLogged7d   = weekDays.length;
+
+    res.json({
+      entries,
+      totals: {
+        calories: Math.round(totals.calories),
+        protein:  Math.round(totals.protein  * 10) / 10,
+        carbs:    Math.round(totals.carbs    * 10) / 10,
+        fat:      Math.round(totals.fat      * 10) / 10,
+      },
+      water_glasses: waterGlasses,
+      targets: {
+        calories: nutData.calorie_target      || 2000,
+        protein:  nutData.protein_target      || 140,
+        carbs:    nutData.carb_target         || 220,
+        fat:      nutData.fat_target          || 65,
+        water:    nutData.water_target_cups   || 8,
+      },
+      streak: nutData.streak || 0,
+      weekly: { avg_cals: avgCals7d, protein_hit_days: protHitDays7d, days_logged: daysLogged7d },
+    });
+  } catch (err) {
+    console.error('[nutrition] /today error:', err);
+    res.status(500).json({ error: 'Failed to load today' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// GET /actions — meal suggestions + habit + tips
+// ═══════════════════════════════════════════════════════════════
+router.get('/actions', async (req, res) => {
+  try {
+    const { deviceId } = req.query;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+
+    const [nutSnap, todaySnap] = await Promise.all([
+      nutDoc(deviceId).get(),
+      logsCol(deviceId).where('date_str', '==', dateStr()).get(),
+    ]);
+
+    if (!nutSnap.exists) return res.json({ meal_suggestions: [], habits: [], tips: [] });
+
+    const nut = nutSnap.data();
+    const todayLogs = todaySnap.docs.map(d => d.data());
+
+    const eaten = todayLogs.reduce((acc, l) => ({
+      calories: acc.calories + (l.calories || 0),
+      protein:  acc.protein  + (l.protein  || 0),
+      carbs:    acc.carbs    + (l.carbs    || 0),
+      fat:      acc.fat      + (l.fat      || 0),
+    }), { calories: 0, protein: 0, carbs: 0, fat: 0 });
+
+    const remaining = {
+      calories: Math.max(0, (nut.calorie_target || 2000) - Math.round(eaten.calories)),
+      protein:  Math.max(0, (nut.protein_target || 140)  - Math.round(eaten.protein)),
+      carbs:    Math.max(0, (nut.carb_target    || 220)  - Math.round(eaten.carbs)),
+      fat:      Math.max(0, (nut.fat_target     || 65)   - Math.round(eaten.fat)),
+    };
+
+    const goal      = nut.goal || 'eat_healthier';
+    const style     = Array.isArray(nut.dietary_style) ? nut.dietary_style.join(', ') : (nut.dietary_style || 'omnivore');
+    const challenge = Array.isArray(nut.biggest_challenge) ? nut.biggest_challenge.join(', ') : (nut.biggest_challenge || 'knowledge');
+    const allergies = (nut.allergies || []).filter(a => a !== 'None').join(', ') || 'none';
+
+    // Daily cache — avoid regenerating on every tab open
+    const today = dateStr();
+    const ac    = nut.actions_cache;
+    if (ac && ac.date === today && Math.abs((ac.remaining_cals || 0) - remaining.calories) < 150 && ac.meal_suggestions?.length) {
+      return res.json({ remaining, meal_suggestions: ac.meal_suggestions, habits: ac.habits || [], tips: ac.tips || [] });
+    }
+
+    const prompt = `You are a nutrition coach. Generate personalized actions for this user's remaining macros today.
+
+User's remaining macros for today:
+- Calories: ${remaining.calories} kcal
+- Protein: ${remaining.protein}g
+- Carbs: ${remaining.carbs}g
+- Fat: ${remaining.fat}g
+
+User profile:
+- Goal: ${goal}
+- Dietary style: ${style}
+- Biggest challenge: ${challenge}
+- Allergies/restrictions: ${allergies}
+
+Return ONLY valid JSON with exactly this structure:
+{
+  "meal_suggestions": [
+    {
+      "name": "Grilled Chicken & Rice Bowl",
+      "calories": 520,
+      "protein": 45,
+      "carbs": 52,
+      "fat": 12,
+      "reason": "Hits your remaining protein target almost exactly and keeps you on track for the day."
+    }
+  ],
+  "habits": [
+    {
+      "icon": "💪",
+      "title": "Protein at every meal",
+      "body": "Aim for at least 30g protein at breakfast, lunch, and dinner to hit your daily target without stress.",
+      "tip": "Greek yogurt, eggs, cottage cheese, or chicken are all quick wins."
+    }
+  ],
+  "tips": [
+    {
+      "icon": "💡",
+      "title": "Front-load your protein",
+      "body": "Eating most of your protein earlier in the day makes hitting the target 60% easier than leaving it all to dinner."
+    }
+  ]
+}
+
+Rules:
+- 3 meal suggestions exactly, realistic, matching dietary style and allergies
+- Each suggestion should fit the remaining macro budget approximately
+- 1 habit focused on biggest_challenge
+- 2 tips specific to the goal
+- Be specific and actionable, not generic`;
+
+    let parsed = { meal_suggestions: [], habits: [], tips: [] };
+    try {
+      const completion = await openai.chat.completions.create({
+        model: 'gpt-4o', temperature: 0.6, max_tokens: 700,
+        messages: [{ role: 'user', content: prompt }],
+        response_format: { type: 'json_object' },
+      });
+      parsed = JSON.parse(completion.choices[0].message.content);
+      // Save daily cache
+      await nutDoc(deviceId).update({
+        actions_cache: {
+          date: today,
+          remaining_cals: remaining.calories,
+          meal_suggestions: parsed.meal_suggestions || [],
+          habits: parsed.habits || [],
+          tips: parsed.tips || [],
+        },
+      });
+    } catch { /* return empty if AI fails */ }
+
+    res.json({
+      remaining,
+      meal_suggestions: parsed.meal_suggestions || [],
+      habits:           parsed.habits           || [],
+      tips:             parsed.tips             || [],
+    });
+  } catch (err) {
+    console.error('[nutrition] /actions error:', err);
+    res.status(500).json({ error: 'Actions failed' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// GET /logs/calendar — marked dates for calendar dots
+// ═══════════════════════════════════════════════════════════════
+router.get('/logs/calendar', async (req, res) => {
+  try {
+    const { deviceId, month } = req.query; // month = 'YYYY-MM'
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+    const prefix = month || dateStr().slice(0, 7);
+    const start  = `${prefix}-01`;
+    const end    = `${prefix}-31`;
+    const snap = await logsCol(deviceId)
+      .where('date_str', '>=', start)
+      .where('date_str', '<=', end)
+      .get();
+    const marked = {};
+    snap.docs.forEach(d => { const ds = d.data().date_str; if (ds) marked[ds] = true; });
+    // Also include last 60 days for the strip
+    const snap60 = await logsCol(deviceId)
+      .where('date_str', '>=', dateStr(new Date(Date.now() - 60 * 86400000)))
+      .get();
+    snap60.docs.forEach(d => { const ds = d.data().date_str; if (ds) marked[ds] = true; });
+    res.json({ marked });
+  } catch (err) {
+    console.error('[nutrition] /logs/calendar error:', err);
+    res.status(500).json({ error: 'Calendar fetch failed' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// POST /food/parse-text — natural language food parsing (GPT-4o)
+// ═══════════════════════════════════════════════════════════════
+router.post('/food/parse-text', async (req, res) => {
+  try {
+    const { deviceId, text } = req.body;
+    if (!deviceId || !text) return res.status(400).json({ error: 'deviceId and text required' });
+
+    const prompt = `You are a nutrition AI. Parse this natural language food description and return all food items with estimated macros.
+
+Input: "${text}"
+
+For EACH food item identified, estimate:
+- name: simple food name in English
+- quantity: estimated amount as number
+- unit: g | ml | piece | cup | tbsp | oz | slice | serving
+- emoji: single most relevant food emoji
+- confidence: "high" | "medium" | "low"
+- calories: estimated kcal for THIS specific quantity
+- protein: estimated grams of protein
+- carbs: estimated grams of carbohydrates
+- fat: estimated grams of fat
+
+Be realistic. Use standard portion sizes when not specified.
+
+Return ONLY valid JSON:
+{
+  "items": [
+    { "name": "scrambled eggs", "quantity": 2, "unit": "large", "emoji": "🥚", "confidence": "high", "calories": 182, "protein": 12, "carbs": 2, "fat": 14 }
+  ]
+}`;
+
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o', temperature: 0.3, max_tokens: 500,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    const raw     = completion.choices[0].message.content.trim();
+    const cleaned = raw.replace(/^```(?:json)?\n?/i, '').replace(/\n?```$/i, '').trim();
+    const parsed  = JSON.parse(cleaned);
+    res.json({ items: parsed.items || [] });
+  } catch (err) {
+    console.error('[nutrition] /food/parse-text error:', err);
+    res.status(500).json({ error: 'Text parsing failed' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// POST /templates — save a meal template
+// ═══════════════════════════════════════════════════════════════
+router.post('/templates', async (req, res) => {
+  try {
+    const { deviceId, name, emoji, items } = req.body;
+    if (!deviceId || !name || !items?.length) return res.status(400).json({ error: 'deviceId, name, items required' });
+    const totals = items.reduce((acc, i) => ({
+      calories: acc.calories + (i.calories || 0),
+      protein:  acc.protein  + (i.protein  || 0),
+      carbs:    acc.carbs    + (i.carbs    || 0),
+      fat:      acc.fat      + (i.fat      || 0),
+    }), { calories: 0, protein: 0, carbs: 0, fat: 0 });
+    const ref = await nutDoc(deviceId).collection('templates').add({
+      name, emoji: emoji || '🍽️', items,
+      total_calories: Math.round(totals.calories),
+      total_protein:  Math.round(totals.protein * 10) / 10,
+      total_carbs:    Math.round(totals.carbs   * 10) / 10,
+      total_fat:      Math.round(totals.fat     * 10) / 10,
+      created_at: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    res.json({ success: true, id: ref.id });
+  } catch (err) {
+    console.error('[nutrition] POST /templates error:', err);
+    res.status(500).json({ error: 'Failed to save template' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// GET /templates — list saved templates
+// ═══════════════════════════════════════════════════════════════
+router.get('/templates', async (req, res) => {
+  try {
+    const { deviceId } = req.query;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+    const snap = await nutDoc(deviceId).collection('templates').orderBy('created_at', 'desc').limit(20).get();
+    const templates = snap.docs.map(d => ({ id: d.id, ...d.data(), created_at: d.data().created_at?.toDate?.()?.toISOString() || null }));
+    res.json({ templates });
+  } catch (err) {
+    console.error('[nutrition] GET /templates error:', err);
+    res.status(500).json({ error: 'Failed to fetch templates' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// DELETE /templates/:id — remove a template
+// ═══════════════════════════════════════════════════════════════
+router.delete('/templates/:id', async (req, res) => {
+  try {
+    const { deviceId } = req.query;
+    const { id }       = req.params;
+    if (!deviceId || !id) return res.status(400).json({ error: 'deviceId and id required' });
+    await nutDoc(deviceId).collection('templates').doc(id).delete();
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[nutrition] DELETE /templates error:', err);
+    res.status(500).json({ error: 'Failed to delete template' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// GET /ai-insights — weekly GPT-4o generated insights
+// ═══════════════════════════════════════════════════════════════
+router.get('/ai-insights', async (req, res) => {
+  try {
+    const { deviceId } = req.query;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+
+    const [nutSnap, profileSnap] = await Promise.all([
+      nutDoc(deviceId).get(),
+      userDoc(deviceId).get(),
+    ]);
+    if (!nutSnap.exists) return res.json({ insights: [] });
+
+    const nutData  = nutSnap.data();
+    const name     = profileSnap.exists ? (profileSnap.data().name || '') : '';
+    const firstName = name.trim().split(' ')[0];
+
+    // Fetch last 7 days of logs
+    const weekAgo = dateStr(new Date(Date.now() - 7 * 86400000));
+    const snap = await logsCol(deviceId).where('date_str', '>=', weekAgo).get();
+    if (snap.empty) return res.json({ insights: [], reason: 'not_enough_data' });
+
+    const byDay = {};
+    snap.docs.forEach(d => {
+      const data = d.data();
+      if (!byDay[data.date_str]) byDay[data.date_str] = { cals: 0, prot: 0, carbs: 0, fat: 0, meals: [], entries: 0 };
+      byDay[data.date_str].cals    += data.calories || 0;
+      byDay[data.date_str].prot    += data.protein  || 0;
+      byDay[data.date_str].carbs   += data.carbs    || 0;
+      byDay[data.date_str].fat     += data.fat      || 0;
+      byDay[data.date_str].entries += 1;
+      if (data.food_name) byDay[data.date_str].meals.push(data.food_name);
+    });
+
+    const days = Object.keys(byDay).sort();
+    const calTarget  = nutData.calorie_target || 2000;
+    const protTarget = nutData.protein_target || 140;
+
+    const daysSummary = days.map(d => {
+      const b = byDay[d];
+      return `${d}: ${Math.round(b.cals)}kcal / ${Math.round(b.prot)}g protein (${b.entries} entries)`;
+    }).join('\n');
+
+    const avgCals = Math.round(days.reduce((s, d) => s + byDay[d].cals, 0) / days.length);
+    const protHit = days.filter(d => byDay[d].prot >= protTarget * 0.9).length;
+
+    const prompt = `You are a precision nutrition coach analyzing a user's 7-day food log. Generate exactly 3 specific, data-driven insights that a stranger could NOT have said.
+
+USER:
+- Name: ${firstName || 'User'}
+- Goal: ${nutData.goal || 'healthier'}
+- Calorie target: ${calTarget} kcal/day
+- Protein target: ${protTarget}g/day
+
+7-DAY LOG:
+${daysSummary}
+
+Average calories: ${avgCals} kcal/day
+Protein goal hit: ${protHit}/${days.length} days
+
+Generate 3 insights. Rules:
+- Each insight must reference specific days, numbers, or patterns from THEIR data
+- Each must end with ONE concrete, actionable suggestion
+- Keep each insight under 40 words
+- Tone: direct coach, not cheerleader
+- Format: return JSON array of strings
+
+Return ONLY valid JSON: ["insight 1", "insight 2", "insight 3"]`;
+
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o', temperature: 0.5, max_tokens: 350,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    const raw     = completion.choices[0].message.content.trim();
+    const cleaned = raw.replace(/^```(?:json)?\n?/i, '').replace(/\n?```$/i, '').trim();
+    const insights = JSON.parse(cleaned);
+    res.json({ insights: Array.isArray(insights) ? insights : [], days_analyzed: days.length, avg_cals: avgCals, protein_hit_days: protHit });
+  } catch (err) {
+    console.error('[nutrition] /ai-insights error:', err);
+    res.status(500).json({ error: 'Insights failed' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// ─── PROACTIVE CHECKS — 7am ───────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+async function runProactiveChecks() {
+  console.log('[nutrition] running proactive checks');
+  try {
+    const usersSnap = await db()
+      .collection('wellness_users')
+      .where('nutrition_setup_complete', '==', true)
+      .get();
+
+    if (usersSnap.empty) return;
+
+    const today = dateStr();
+
+    for (const uDoc of usersSnap.docs) {
+      const deviceId = uDoc.id;
+      const userData = uDoc.data();
+
+      if (userData.last_nutrition_proactive_date === today) continue;
+
+      try {
+        const nutSnap = await nutDoc(deviceId).get();
+        if (!nutSnap.exists || !nutSnap.data().setup_completed) continue;
+
+        const nutData   = nutSnap.data();
+        const { lastSleepHours, lastSleepDate, todayMoodAvg, todayMaxAnxiety } = await getCrossAgentData(deviceId);
+
+        let msg  = null;
+        let type = null;
+
+        // Cross-agent morning brief (highest priority)
+        if (lastSleepHours && lastSleepHours < 6 && lastSleepDate === dateStr(new Date(Date.now() - 86400000))) {
+          const calTarget = nutData.calorie_target || 2000;
+          const firstName = (userData.name || '').split(' ')[0];
+          msg  = `${firstName ? firstName + ', ' : ''}your Sleep Coach shows you got ${lastSleepHours.toFixed(1)}h last night — under 6 hours triggers a cortisol response that drives sugar and fat cravings today. Your calorie budget is ${calTarget} kcal. Planning your meals now makes it 3× easier to stay on track. What's breakfast?`;
+          type = 'sleep_cross_agent';
+        }
+
+        // Weekly protein summary (Monday morning)
+        if (!msg && new Date().getDay() === 1) {
+          const weekStart = dateStr(new Date(Date.now() - 7 * 86400000));
+          const weekLogsSnap = await logsCol(deviceId)
+            .where('date_str', '>=', weekStart).get();
+          const weekLogs = weekLogsSnap.docs.map(d => d.data());
+          const weekDays = new Set(weekLogs.map(l => l.date_str)).size;
+          if (weekDays >= 4) {
+            const avgProt = Math.round(weekLogs.reduce((s, l) => s + (l.protein || 0), 0) / weekDays * 10) / 10;
+            const protTarget = nutData.protein_target || 140;
+            const hit = avgProt >= protTarget * 0.9;
+            msg  = `Last week: ${weekDays} days logged, ${avgProt}g avg protein${hit ? ` — protein goal hit, solid week` : ` — ${Math.round(protTarget - avgProt)}g short of your ${protTarget}g target daily`}. This week's focus: ${hit ? 'consistency' : 'protein at every meal'}.`;
+            type = 'weekly_protein_summary';
+          }
+        }
+
+        // Discussion topic (3x/week max, skip if already logged today)
+        if (!msg) {
+          const todayLogsSnap = await logsCol(deviceId).where('date_str', '==', today).limit(1).get();
+          const alreadyLogged = !todayLogsSnap.empty;
+
+          if (!alreadyLogged) {
+            const topics    = nutData.discussion_topics || [];
+            const weekKey   = getWeekKey();
+            const sameWeek  = nutData.proactive_topic_week === weekKey;
+            const weekCount = sameWeek ? (nutData.proactive_topic_week_count || 0) : 0;
+
+            if (topics.length > 0 && weekCount < 3) {
+              const topicIndex = nutData.proactive_topic_index || 0;
+              const topic      = topics[topicIndex % topics.length];
+              const firstName  = (userData.name || '').split(' ')[0];
+
+              msg  = await buildTopicProactive(topic, firstName, nutData);
+              type = 'discussion_topic';
+
+              await nutDoc(deviceId).update({
+                proactive_topic_index:      (topicIndex + 1) % topics.length,
+                proactive_topic_week:       weekKey,
+                proactive_topic_week_count: weekCount + 1,
+              });
+            }
+          }
+        }
+
+        if (msg) {
+          await chatsCol(deviceId).add({
+            role: 'assistant', content: msg, is_proactive: true,
+            proactive_type: type, is_read: false, date_str: today,
+            created_at: admin.firestore.FieldValue.serverTimestamp(),
+          });
+          await userDoc(deviceId).update({ last_nutrition_proactive_date: today });
+        }
+      } catch (uErr) {
+        console.error(`[nutrition] proactive failed for ${deviceId}:`, uErr.message);
+      }
+    }
+  } catch (err) {
+    console.error('[nutrition] proactive checks error:', err);
+  }
+}
+
+// ─── Evening streak reminders — 8pm ──────────────────────────
+async function runStreakReminders() {
+  console.log('[nutrition] running evening streak reminders');
+  try {
+    const usersSnap = await db()
+      .collection('wellness_users')
+      .where('nutrition_setup_complete', '==', true)
+      .get();
+
+    if (usersSnap.empty) return;
+
+    const today = dateStr();
+
+    for (const uDoc of usersSnap.docs) {
+      const deviceId = uDoc.id;
+      const userData = uDoc.data();
+
+      if (userData.last_nutrition_streak_reminder === today) continue;
+
+      try {
+        const nutSnap = await nutDoc(deviceId).get();
+        if (!nutSnap.exists) continue;
+        const nutData = nutSnap.data();
+
+        const todayLogsSnap = await logsCol(deviceId).where('date_str', '==', today).limit(1).get();
+        if (!todayLogsSnap.empty) continue;
+
+        const streak = nutData.streak || 0;
+        if (streak < 3) continue;
+
+        const firstName = (userData.name || '').split(' ')[0];
+        const msg = `Hey${firstName ? ' ' + firstName : ''} — no food logged today yet. Your ${streak}-day logging streak is at risk. Even logging one meal counts. What did you eat today?`;
+
+        await chatsCol(deviceId).add({
+          role: 'assistant', content: msg, is_proactive: true,
+          proactive_type: 'streak_at_risk', is_read: false, date_str: today,
+          created_at: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        await userDoc(deviceId).update({ last_nutrition_streak_reminder: today });
+      } catch (uErr) {
+        console.error(`[nutrition] streak reminder failed for ${deviceId}:`, uErr.message);
+      }
+    }
+  } catch (err) {
+    console.error('[nutrition] streak reminders error:', err);
+  }
+}
+
+async function buildTopicProactive(topic, firstName, nutData) {
+  const challenge = Array.isArray(nutData.biggest_challenge) ? nutData.biggest_challenge.join(', ') : (nutData.biggest_challenge || 'nutrition');
+  const prompt = `You are a warm, direct nutrition coach in a wellness app. Write ONE short message (2-3 sentences) to check in with a user about their nutrition topic.
+
+User's first name: ${firstName || 'not given'}
+Their biggest nutrition challenge: ${challenge}
+Today's topic: ${topic}
+
+Rules:
+- Start with the topic naturally
+- End with ONE specific question that invites them to respond
+- Tone: direct and warm, like a coach who knows them
+- Keep under 50 words
+- No emojis, no "Hey I wanted to check in about..."
+
+Return only the message text.`;
+
+  try {
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o', temperature: 0.7, max_tokens: 100,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    return completion.choices[0].message.content.trim();
+  } catch {
+    return `${firstName ? firstName + ', ' : ''}you flagged ${topic.toLowerCase()} as something you want to work on. What's been the hardest part of that lately?`;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// GET /habits — load this week's habit completion state
+// ═══════════════════════════════════════════════════════════════
+router.get('/habits', async (req, res) => {
+  try {
+    const { deviceId } = req.query;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+    const weekKey    = getWeekKey();
+    const habitsCol  = nutDoc(deviceId).collection('habits');
+    const snap       = await habitsCol.where('week_key', '==', weekKey).get();
+    const completions = {};
+    snap.docs.forEach(d => {
+      const data = d.data();
+      if (data.date_str) completions[data.date_str] = true;
+    });
+    res.json({ week_key: weekKey, completions });
+  } catch (err) {
+    console.error('[nutrition] GET /habits error:', err);
+    res.status(500).json({ error: 'Failed to load habits' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// POST /habits — mark today as done or undone
+// ═══════════════════════════════════════════════════════════════
+router.post('/habits', async (req, res) => {
+  try {
+    const { deviceId, done } = req.body;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+    const today     = dateStr();
+    const weekKey   = getWeekKey();
+    const habitsCol = nutDoc(deviceId).collection('habits');
+
+    if (done) {
+      const existing = await habitsCol.where('date_str', '==', today).limit(1).get();
+      if (existing.empty) {
+        await habitsCol.add({
+          date_str: today, week_key: weekKey,
+          created_at: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      }
+    } else {
+      const existing = await habitsCol.where('date_str', '==', today).limit(1).get();
+      if (!existing.empty) await existing.docs[0].ref.delete();
+    }
+
+    const snap = await habitsCol.where('week_key', '==', weekKey).get();
+    const completions = {};
+    snap.docs.forEach(d => { const data = d.data(); if (data.date_str) completions[data.date_str] = true; });
+    res.json({ success: true, completions });
+  } catch (err) {
+    console.error('[nutrition] POST /habits error:', err);
+    res.status(500).json({ error: 'Failed to update habit' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// ─── CRON ─────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+cron.schedule('0 7 * * *',  () => { runProactiveChecks(); });
+cron.schedule('0 20 * * *', () => { runStreakReminders(); });
+
+console.log('[nutrition] agent loaded ✓ — proactive cron active at 7am (full) / 8pm (streak)');
+
+module.exports = router;
