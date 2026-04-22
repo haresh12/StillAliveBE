@@ -24,6 +24,17 @@ const db     = () => admin.firestore();
 const _ctxCache = new Map();
 const CTX_TTL   = 5 * 60 * 1000;
 
+// ─── Chat rate limiter (20 req / 60s per device) ─────────────
+const _rateMap = new Map();
+function checkChatRate(deviceId) {
+  const now   = Date.now();
+  const entry = _rateMap.get(deviceId);
+  if (!entry || now - entry.t > 60_000) { _rateMap.set(deviceId, { t: now, n: 1 }); return true; }
+  if (entry.n >= 20) return false;
+  entry.n += 1;
+  return true;
+}
+
 async function getCachedContext(deviceId) {
   const cached = _ctxCache.get(deviceId);
   if (cached && Date.now() - cached.builtAt < CTX_TTL) return cached.context;
@@ -151,6 +162,156 @@ function calcDailyGoal(setup) {
   return Math.round(base / 50) * 50;
 }
 
+function sanitizeGoalMl(raw, fallback = null) {
+  const parsed = parseInt(raw, 10);
+  if (Number.isNaN(parsed)) return fallback;
+  return clamp(Math.round(parsed / 50) * 50, 1500, 6000);
+}
+
+function normalizeDateKey(value, fallback = null) {
+  if (!value) return fallback;
+  if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
+  if (typeof value.toDate === 'function') return dateStr(value.toDate());
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? fallback : dateStr(parsed);
+}
+
+function getGoalState(setup = {}) {
+  const recommendedGoalMl = sanitizeGoalMl(setup.recommended_goal_ml, calcDailyGoal(setup));
+  const manualGoalMl      = sanitizeGoalMl(setup.manual_goal_ml, null);
+  const storedGoalMl      = sanitizeGoalMl(setup.daily_goal_ml, null);
+  const goalMl            = manualGoalMl || storedGoalMl || recommendedGoalMl;
+  const goalSource        = manualGoalMl ? 'manual' : 'recommended';
+
+  return {
+    goalMl,
+    recommendedGoalMl,
+    manualGoalMl,
+    goalSource,
+  };
+}
+
+function getGoalHistory(setup = {}, anchorDate = null) {
+  const goalState = getGoalState(setup);
+  const baseDate = normalizeDateKey(anchorDate, dateStr());
+  const rawHistory = Array.isArray(setup.goal_history) && setup.goal_history.length
+    ? setup.goal_history
+    : [{
+      effective_from: baseDate,
+      goal_ml: goalState.goalMl,
+      source: goalState.goalSource,
+    }];
+
+  const normalized = rawHistory
+    .map(entry => {
+      const effectiveFrom = normalizeDateKey(entry.effective_from, null);
+      const goalMl = sanitizeGoalMl(entry.goal_ml, null);
+      if (!effectiveFrom || !goalMl) return null;
+      return {
+        effective_from: effectiveFrom,
+        goal_ml: goalMl,
+        source: entry.source === 'manual' ? 'manual' : 'recommended',
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.effective_from.localeCompare(b.effective_from));
+
+  if (!normalized.length) {
+    return [{
+      effective_from: baseDate,
+      goal_ml: goalState.goalMl,
+      source: goalState.goalSource,
+    }];
+  }
+
+  const deduped = [];
+  normalized.forEach(entry => {
+    const last = deduped[deduped.length - 1];
+    if (last && last.effective_from === entry.effective_from) {
+      deduped[deduped.length - 1] = entry;
+      return;
+    }
+    deduped.push(entry);
+  });
+
+  return deduped;
+}
+
+function resolveGoalForDate(goalHistory = [], ds, fallbackGoalMl = 2500) {
+  if (!ds) return fallbackGoalMl;
+  let active = sanitizeGoalMl(fallbackGoalMl, 2500);
+  for (const entry of goalHistory) {
+    if (entry.effective_from <= ds) active = entry.goal_ml;
+    else break;
+  }
+  return active;
+}
+
+function buildGoalMap(rangeKeys = [], goalHistory = [], fallbackGoalMl = 2500) {
+  return rangeKeys.reduce((acc, key) => {
+    acc[key] = resolveGoalForDate(goalHistory, key, fallbackGoalMl);
+    return acc;
+  }, {});
+}
+
+function buildGoalHistorySummary(goalHistory = [], rangeKeys = [], fallbackGoalMl = 2500) {
+  if (!goalHistory.length) return { changes: [], latest_change: null, avg_goal_ml: fallbackGoalMl };
+
+  const rangeStart = rangeKeys[0] || goalHistory[0].effective_from;
+  const rangeEnd = rangeKeys[rangeKeys.length - 1] || goalHistory[goalHistory.length - 1].effective_from;
+  const changes = [];
+
+  goalHistory.forEach((entry, index) => {
+    const previous = goalHistory[index - 1] || null;
+    if (entry.effective_from < rangeStart || entry.effective_from > rangeEnd) return;
+    if (!previous) return;
+    changes.push({
+      effective_from: entry.effective_from,
+      from_goal_ml: previous.goal_ml,
+      to_goal_ml: entry.goal_ml,
+      source: entry.source,
+    });
+  });
+
+  const goalMap = buildGoalMap(rangeKeys, goalHistory, fallbackGoalMl);
+  const avgGoalMl = rangeKeys.length
+    ? Math.round(avg(rangeKeys.map(key => goalMap[key] || fallbackGoalMl)))
+    : fallbackGoalMl;
+
+  return {
+    changes,
+    latest_change: changes[changes.length - 1] || null,
+    avg_goal_ml: avgGoalMl,
+  };
+}
+
+function upsertGoalHistoryEntry(goalHistory = [], entry) {
+  const normalizedEntry = {
+    effective_from: normalizeDateKey(entry.effective_from, dateStr()),
+    goal_ml: sanitizeGoalMl(entry.goal_ml, 2500),
+    source: entry.source === 'manual' ? 'manual' : 'recommended',
+  };
+
+  const next = goalHistory
+    .filter(item => item.effective_from !== normalizedEntry.effective_from)
+    .concat(normalizedEntry)
+    .sort((a, b) => a.effective_from.localeCompare(b.effective_from));
+
+  return next.filter((item, index) => {
+    const previous = next[index - 1];
+    if (!previous) return true;
+    return !(previous.goal_ml === item.goal_ml && previous.source === item.source);
+  });
+}
+
+// ─── Action card colors ───────────────────────────────────────
+const CBLUE   = '#38BDF8';
+const CTEAL   = '#22D3EE';
+const CPURPLE = '#C084FC';
+const CGREEN  = '#34D399';
+const CORANGE = '#F59E0B';
+const CWARN   = '#F59E0B';
+
 // ─── Hydration multipliers ────────────────────────────────────
 const BEV_MULT = {
   water:   1.0,
@@ -253,12 +414,13 @@ function buildDateRangeKeys(rangeDays) {
   return keys;
 }
 
-function computeCurrentStreak(byDate, goalMl) {
+function computeStreakFromOffset(byDate, goalForDate, daysBack = 0) {
   let streak = 0;
   const d = new Date();
+  d.setDate(d.getDate() - daysBack);
   while (true) {
     const key = dateStr(d);
-    if ((byDate[key]?.effective_ml || 0) >= goalMl) {
+    if ((byDate[key]?.effective_ml || 0) >= Math.max(goalForDate(key), 1)) {
       streak++;
       d.setDate(d.getDate() - 1);
     } else {
@@ -268,7 +430,11 @@ function computeCurrentStreak(byDate, goalMl) {
   return streak;
 }
 
-function computeLongestStreak(byDate, goalMl) {
+function computeCurrentStreak(byDate, goalForDate) {
+  return computeStreakFromOffset(byDate, goalForDate, 0);
+}
+
+function computeLongestStreak(byDate, goalForDate) {
   const dates = Object.keys(byDate).sort();
   if (!dates.length) return 0;
 
@@ -277,7 +443,7 @@ function computeLongestStreak(byDate, goalMl) {
   let prevDate = null;
 
   for (const ds of dates) {
-    if ((byDate[ds]?.effective_ml || 0) < goalMl) {
+    if ((byDate[ds]?.effective_ml || 0) < Math.max(goalForDate(ds), 1)) {
       current = 0;
       prevDate = null;
       continue;
@@ -297,19 +463,19 @@ function computeLongestStreak(byDate, goalMl) {
   return longest;
 }
 
-function computeHydrationScore(byDate, goalMl) {
+function computeHydrationScore(byDate, goalByDate) {
   const recentKeys = buildDateRangeKeys(7);
 
   const goalAdherence = Math.round(avg(recentKeys.map(key =>
-    clamp(((byDate[key]?.effective_ml || 0) / Math.max(goalMl, 1)) * 100, 0, 100)
+    clamp(((byDate[key]?.effective_ml || 0) / Math.max(goalByDate[key] || 2500, 1)) * 100, 0, 100)
   )));
 
   const consistency = Math.round(
-    (recentKeys.filter(key => (byDate[key]?.effective_ml || 0) >= goalMl * 0.8).length / recentKeys.length) * 100
+    (recentKeys.filter(key => (byDate[key]?.effective_ml || 0) >= (goalByDate[key] || 2500) * 0.8).length / recentKeys.length) * 100
   );
 
   const frontLoad = Math.round(
-    (recentKeys.filter(key => (byDate[key]?.parts?.morning || 0) >= Math.max(300, goalMl * 0.22)).length / recentKeys.length) * 100
+    (recentKeys.filter(key => (byDate[key]?.parts?.morning || 0) >= Math.max(300, (goalByDate[key] || 2500) * 0.22)).length / recentKeys.length) * 100
   );
 
   const timing = Math.round(
@@ -360,7 +526,7 @@ function determineStage(daysLogged) {
   return 3;
 }
 
-function buildDayPartBreakdown(byDate, rangeKeys, goalMl) {
+function buildDayPartBreakdown(byDate, rangeKeys, goalByDate) {
   const totals = DAY_PARTS.reduce((acc, key) => ({ ...acc, [key]: 0 }), {});
 
   for (const key of rangeKeys) {
@@ -370,12 +536,13 @@ function buildDayPartBreakdown(byDate, rangeKeys, goalMl) {
   }
 
   const divisor = Math.max(1, rangeKeys.length);
+  const avgGoalMl = Math.max(1, Math.round(avg(rangeKeys.map(key => goalByDate[key] || 2500))));
 
   return [
-    { key: 'morning',   label: 'Morning',   ml: Math.round(totals.morning / divisor),   pct: Math.round(clamp((totals.morning / divisor)   / Math.max(goalMl, 1) * 100, 0, 100)) },
-    { key: 'midday',    label: 'Midday',    ml: Math.round(totals.midday / divisor),    pct: Math.round(clamp((totals.midday / divisor)    / Math.max(goalMl, 1) * 100, 0, 100)) },
-    { key: 'afternoon', label: 'Afternoon', ml: Math.round(totals.afternoon / divisor), pct: Math.round(clamp((totals.afternoon / divisor) / Math.max(goalMl, 1) * 100, 0, 100)) },
-    { key: 'evening',   label: 'Evening',   ml: Math.round(totals.evening / divisor),   pct: Math.round(clamp((totals.evening / divisor)   / Math.max(goalMl, 1) * 100, 0, 100)) },
+    { key: 'morning',   label: 'Morning',   ml: Math.round(totals.morning / divisor),   pct: Math.round(clamp((totals.morning / divisor)   / avgGoalMl * 100, 0, 100)) },
+    { key: 'midday',    label: 'Midday',    ml: Math.round(totals.midday / divisor),    pct: Math.round(clamp((totals.midday / divisor)    / avgGoalMl * 100, 0, 100)) },
+    { key: 'afternoon', label: 'Afternoon', ml: Math.round(totals.afternoon / divisor), pct: Math.round(clamp((totals.afternoon / divisor) / avgGoalMl * 100, 0, 100)) },
+    { key: 'evening',   label: 'Evening',   ml: Math.round(totals.evening / divisor),   pct: Math.round(clamp((totals.evening / divisor)   / avgGoalMl * 100, 0, 100)) },
   ];
 }
 
@@ -395,27 +562,35 @@ function buildBeverageMix(beverageTotals) {
     .slice(0, 6);
 }
 
-function buildObservations({ goalMl, avg7d, streak, longestStreak, recentKeys, byDate, hydrationScore }) {
+function buildObservations({ goalMl, avg7d, streak, longestStreak, recentKeys, byDate, goalByDate, hydrationScore, goalHistorySummary }) {
   const observations = [];
-  const goalRatio    = avg7d / Math.max(goalMl, 1);
+  const avgRecentGoal = Math.max(1, Math.round(avg(recentKeys.map(key => goalByDate[key] || goalMl))));
+  const goalRatio    = avg7d / Math.max(avgRecentGoal, 1);
   const lateDays     = recentKeys.filter(key => (byDate[key]?.late_ml || 0) > 250).length;
-  const frontLoadDays = recentKeys.filter(key => (byDate[key]?.parts?.morning || 0) >= Math.max(300, goalMl * 0.22)).length;
+  const frontLoadDays = recentKeys.filter(key => (byDate[key]?.parts?.morning || 0) >= Math.max(300, (goalByDate[key] || goalMl) * 0.22)).length;
   const zeroDays     = recentKeys.filter(key => (byDate[key]?.effective_ml || 0) < 150).length;
+
+  if (goalHistorySummary?.latest_change) {
+    observations.push({
+      title: 'Your target changed and the analysis knows it',
+      body: `Your goal shifted from ${goalHistorySummary.latest_change.from_goal_ml} ml to ${goalHistorySummary.latest_change.to_goal_ml} ml on ${goalHistorySummary.latest_change.effective_from}. Earlier days keep the old target, and newer days are scored against the new one.`,
+    });
+  }
 
   if (goalRatio >= 0.9) {
     observations.push({
       title: 'You are close to automatic',
-      body: `Your 7-day average is ${Math.round(goalRatio * 100)}% of goal. The biggest opportunity now is preserving timing quality, not just drinking more.`,
+      body: `Your 7-day average is ${Math.round(goalRatio * 100)}% of the target active on those days. The biggest opportunity now is preserving timing quality, not just drinking more.`,
     });
   } else if (goalRatio >= 0.7) {
     observations.push({
       title: 'Consistency is the lever',
-      body: `You are averaging ${Math.round(goalRatio * 100)}% of goal. A single repeatable anchor habit would close most of the gap.`,
+      body: `You are averaging ${Math.round(goalRatio * 100)}% of the target active on those days. A single repeatable anchor habit would close most of the gap.`,
     });
   } else {
     observations.push({
       title: 'You are under-drinking on the calendar, not just the clock',
-      body: `Your 7-day average is only ${Math.round(goalRatio * 100)}% of goal, so the fix is more daily starts and fewer zero-intake days.`,
+      body: `Your 7-day average is only ${Math.round(goalRatio * 100)}% of the target active on those days, so the fix is more daily starts and fewer zero-intake days.`,
     });
   }
 
@@ -450,7 +625,7 @@ function buildObservations({ goalMl, avg7d, streak, longestStreak, recentKeys, b
   return observations.slice(0, hydrationScore.score >= 70 ? 4 : 3);
 }
 
-async function buildCrossAgentInsights(deviceId, byDate, goalMl, rangeKeys, streak) {
+async function buildCrossAgentInsights(deviceId, byDate, goalMl, goalByDate, rangeKeys, streak) {
   const insights = [];
   const rangeSet = new Set(rangeKeys);
 
@@ -476,12 +651,13 @@ async function buildCrossAgentInsights(deviceId, byDate, goalMl, rangeKeys, stre
 
         if (Math.abs(avgGood - avgLow) >= 250) {
           const better = avgGood > avgLow ? 'better' : 'worse';
+          const avgGoodGoal = Math.round(avg(good.map(d => goalByDate[d.date] || goalMl)));
           insights.push({
             type: 'sleep',
             emoji: '🌙',
             title: 'SLEEP CORRELATION',
             body: `On higher-quality sleep days, your average water intake is ${avgGood} ml versus ${avgLow} ml on lower-sleep days. Hydration appears ${better} when your recovery is better.`,
-            stat: `${Math.round(avgGood / Math.max(goalMl, 1) * 100)}% of goal on good-sleep days`,
+            stat: `${Math.round(avgGood / Math.max(avgGoodGoal, 1) * 100)}% of goal on good-sleep days`,
           });
         }
       }
@@ -502,18 +678,19 @@ async function buildCrossAgentInsights(deviceId, byDate, goalMl, rangeKeys, stre
 
     if (anxious.length >= 3) {
       const avgWater = Math.round(avg(anxious.map(d => byDate[d.date_str]?.effective_ml || 0)));
+      const avgGoalForAnxious = Math.round(avg(anxious.map(d => goalByDate[d.date_str] || goalMl)));
       insights.push({
         type: 'mind',
         emoji: '🧠',
         title: 'MOOD LINK',
         body: `On high-anxiety check-in days, your average intake is ${avgWater} ml. Thirst and agitation often stack together, so earlier hydration matters more than catch-up later.`,
-        stat: `${Math.round(avgWater / Math.max(goalMl, 1) * 100)}% of goal on high-anxiety days`,
+        stat: `${Math.round(avgWater / Math.max(avgGoalForAnxious, 1) * 100)}% of goal on high-anxiety days`,
       });
     }
   } catch { /* non-fatal */ }
 
   // Hunger / thirst confusion
-  const lowWaterDays = rangeKeys.filter(key => (byDate[key]?.effective_ml || 0) < goalMl * 0.7).length;
+  const lowWaterDays = rangeKeys.filter(key => (byDate[key]?.effective_ml || 0) < (goalByDate[key] || goalMl) * 0.7).length;
   if (lowWaterDays >= 4) {
     insights.push({
       type: 'hunger',
@@ -558,30 +735,83 @@ function fallbackAnalysisInsight(stats, hydrationScore) {
   };
 }
 
-async function generateAnalysisInsight(setup, stats, hydrationScore, crossAgentInsights) {
+function normaliseMessageText(text = '') {
+  return String(text)
+    .toLowerCase()
+    .replace(/[^a-z0-9\s%]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function buildMessageKey(text = '') {
+  return normaliseMessageText(text)
+    .replace(/\b\d+\b/g, '#')
+    .trim();
+}
+
+function dedupeProactiveList(messages = []) {
+  const seen = new Set();
+  const latestFirst = [...messages].sort((a, b) => getMillis(b.created_at) - getMillis(a.created_at));
+
+  const kept = latestFirst.filter(message => {
+    const key = `${message.date_str || dateStr(new Date(message.created_at || Date.now()))}|${message.proactive_type || 'check_in'}|${message.content_key || buildMessageKey(message.content || '')}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  return kept.sort((a, b) => getMillis(b.created_at) - getMillis(a.created_at));
+}
+
+function shouldSkipProactiveMessage({ recentMessages = [], proactiveType, content, today }) {
+  const contentKey = buildMessageKey(content);
+  const nowMs = Date.now();
+
+  for (const message of recentMessages) {
+    const sentAt = getMillis(message.created_at);
+    const hoursSince = sentAt ? (nowMs - sentAt) / 3600000 : 999;
+    const sameDay = (message.date_str || dateStr(new Date(sentAt || nowMs))) === today;
+    const sameType = (message.proactive_type || '') === proactiveType;
+    const sameContent = (message.content_key || buildMessageKey(message.content || '')) === contentKey;
+
+    if (!sameDay && hoursSince > 48) continue;
+    if (sameType && sameDay) return true;
+    if (sameContent && hoursSince < 36) return true;
+    if (message.is_read === false && hoursSince < 4) return true;
+  }
+
+  return false;
+}
+
+async function generateAnalysisInsight(setup, stats, hydrationScore, crossAgentInsights, dayParts, beverageMix) {
   const fallback = fallbackAnalysisInsight(stats, hydrationScore);
+
+  const dayPartSummary = (dayParts || []).map(p => `${p.label} ${p.ml}ml (${p.pct}%)`).join(', ') || 'no data';
+  const beverageSummary = (beverageMix || []).slice(0, 4).map(b => `${b.label} ${b.pct}%`).join(', ') || 'mostly water';
 
   try {
     const prompt = [
-      'You are a top-tier hydration strategist inside a premium wellness app.',
-      'Return valid JSON only with keys: insight, formula.',
-      'insight: 2-3 sentences, sharp, specific, numbers-driven, no fluff.',
-      'formula: one line, memorable, practical, not cheesy.',
-      'Do not use markdown.',
+      'You are a precision hydration analyst inside a premium wellness app.',
+      'Return valid JSON only — no markdown, no code fences, no explanation outside the JSON.',
+      'Keys: insight (string), formula (string).',
+      'insight: exactly 2 sentences. Declarative, numbers-driven. Reference at least 2 specific metrics. Banned starters: "Your", "You", "The data", "Looking at", "Based on", "With". Good openers: state a raw number, a ratio, a streak, a gap, or a pattern change — e.g. "Front-loading hit X/7 days..." or "Consistency at X% masks..." or "The X ml/day average hides...". Banned words: "may", "might", "could", "seems", "appears", "perhaps", "generally", "usually".',
+      'formula: one punchy action-line, specific to THIS user\'s pattern — not generic advice. Max 15 words.',
       '',
-      `Goal: ${stats.goal_ml} ml`,
-      `7-day average: ${stats.avg_7d} ml`,
+      `Goal: ${stats.goal_ml} ml/day`,
+      `Range avg target: ${stats.avg_goal_ml || stats.goal_ml} ml`,
+      `7-day average: ${stats.avg_7d} ml (${Math.round(((stats.avg_7d||0)/Math.max(stats.goal_ml,1))*100)}% of goal)`,
       `Best day: ${stats.best_day} ml`,
-      `Days logged in range: ${stats.days_logged}`,
-      `Goal days: ${stats.goal_days}`,
-      `Current streak: ${stats.streak}`,
-      `Longest streak: ${stats.longest_streak}`,
-      `Front-load days (last 7): ${stats.frontload_days}`,
-      `Late-cutoff misses (last 7): ${stats.late_cutoff_days}`,
+      `Days logged: ${stats.days_logged} | Goal days: ${stats.goal_days}`,
+      `Current streak: ${stats.streak} | Longest: ${stats.longest_streak}`,
+      `Front-load days (last 7): ${stats.frontload_days}/7`,
+      `Late-cutoff misses (last 7): ${stats.late_cutoff_days}/7`,
+      `Goal changes: ${stats.goal_changes || 'none'}`,
       `Hydration score: ${hydrationScore.score} (${hydrationScore.label})`,
-      `Score components: ${JSON.stringify(hydrationScore.components)}`,
-      `Setup: weight ${setup.weight_kg || '?'}kg, activity ${setup.activity_level || 'moderate'}, climate ${setup.climate || 'mild'}`,
-      `Cross-agent: ${crossAgentInsights.map(c => `${c.title}: ${c.stat || c.body}`).join(' | ') || 'none'}`,
+      `Score → goal adherence ${hydrationScore.components?.goal_adherence}%, consistency ${hydrationScore.components?.consistency}%, morning front-load ${hydrationScore.components?.front_load}%, late timing ${hydrationScore.components?.timing}%, beverage quality ${hydrationScore.components?.beverage_quality}%`,
+      `Day-part intake: ${dayPartSummary}`,
+      `Beverage mix: ${beverageSummary}`,
+      `Setup: ${setup.weight_kg || '?'}kg, ${setup.activity_level || 'moderate'} activity, ${setup.climate || 'mild'} climate`,
+      `Cross-agent: ${crossAgentInsights.map(c => `${c.title}: ${c.stat || c.body.slice(0, 80)}`).join(' | ') || 'none'}`,
     ].join('\n');
 
     const completion = await openai.chat.completions.create({
@@ -591,7 +821,8 @@ async function generateAnalysisInsight(setup, stats, hydrationScore, crossAgentI
       messages: [{ role: 'system', content: prompt }],
     });
 
-    const raw = completion.choices[0]?.message?.content?.trim() || '';
+    const rawContent = completion.choices[0]?.message?.content?.trim() || '';
+    const raw = rawContent.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
     const json = JSON.parse(raw);
 
     return {
@@ -618,12 +849,40 @@ function uniqueActions(actions) {
   });
 }
 
-function generateDailyActions({ setup, byDate, beverageTotals, goalMl, todayKey, crossAgentInsights = [] }) {
+function applyActionNovelty(actions = [], { skipHistory = [], recentActionTexts = [] } = {}) {
+  const skipSet = new Set(skipHistory.map(text => String(text).toLowerCase()));
+  const recentSet = new Set(recentActionTexts.map(text => String(text).toLowerCase()));
+
+  return actions.map(action => {
+    const textKey = action.text.toLowerCase();
+    let priority = action.priority || 50;
+
+    if (skipSet.has(textKey)) priority -= 14;
+    if (recentSet.has(textKey)) priority -= 8;
+    if (['NOW', 'NEXT 90 MIN'].includes(action.when_to_do)) priority += 4;
+
+    return { ...action, priority };
+  });
+}
+
+function generateDailyActions({
+  setup,
+  byDate,
+  beverageTotals,
+  goalMl,
+  goalByDate = {},
+  todayKey,
+  crossAgentInsights = [],
+  skipHistory = [],
+  recentActionTexts = [],
+}) {
   const actions = [];
   const today   = byDate[todayKey] || emptyDay();
   const recentKeys = buildDateRangeKeys(7);
+  const goalForDate = (ds) => goalByDate[ds] || goalMl;
   const avg7    = Math.round(avg(recentKeys.map(key => byDate[key]?.effective_ml || 0)));
-  const streak  = computeCurrentStreak(byDate, goalMl);
+  const avgRecentGoal = Math.round(avg(recentKeys.map(key => goalForDate(key))));
+  const streak  = computeCurrentStreak(byDate, goalForDate);
   const wake    = setup.wake_time_min ?? 420;
   const bed     = setup.bed_time_min ?? 1380;
   const now     = new Date();
@@ -631,10 +890,19 @@ function generateDailyActions({ setup, byDate, beverageTotals, goalMl, todayKey,
   const daySpan = Math.max(480, bed - wake);
   const expectedPct = clamp((nowMin - wake) / daySpan, 0, 1);
   const actualPct   = (today.effective_ml || 0) / Math.max(goalMl, 1);
-  const coffeeTea   = (beverageTotals.coffee || 0) + (beverageTotals.tea || 0);
-  const sodaAlcohol = (beverageTotals.soda || 0) + (beverageTotals.alcohol || 0);
+  // Use 7-day beverage totals (not lifetime) to avoid stale triggers
+  const recent7BevTotals = recentKeys.reduce((acc, key) => {
+    const day = byDate[key];
+    if (!day) return acc;
+    Object.entries(day.beverages || {}).forEach(([bev, ml]) => {
+      acc[bev] = (acc[bev] || 0) + ml;
+    });
+    return acc;
+  }, {});
+  const coffeeTea   = (recent7BevTotals.coffee || 0) + (recent7BevTotals.tea || 0);
+  const sodaAlcohol = (recent7BevTotals.soda || 0) + (recent7BevTotals.alcohol || 0);
   const lateDays    = recentKeys.filter(key => (byDate[key]?.late_ml || 0) > 250).length;
-  const frontLoadDays = recentKeys.filter(key => (byDate[key]?.parts?.morning || 0) >= Math.max(300, goalMl * 0.22)).length;
+  const frontLoadDays = recentKeys.filter(key => (byDate[key]?.parts?.morning || 0) >= Math.max(300, goalForDate(key) * 0.22)).length;
   const sleepInsight = crossAgentInsights.find(i => i.type === 'sleep');
 
   if (today.effective_ml === 0 && now.getHours() >= 11) {
@@ -698,7 +966,7 @@ function generateDailyActions({ setup, byDate, beverageTotals, goalMl, todayKey,
     }));
   }
 
-  if (['active', 'athlete'].includes(setup.activity_level) || avg7 < goalMl * 0.75) {
+  if (['active', 'athlete'].includes(setup.activity_level) || avg7 < avgRecentGoal * 0.75) {
     actions.push(makeAction({
       text: 'Use meal anchors: 250 ml before breakfast, lunch, and dinner',
       why: 'When total intake is lagging, meal anchors are the cleanest way to raise baseline hydration without relying on memory.',
@@ -767,42 +1035,66 @@ function generateDailyActions({ setup, byDate, beverageTotals, goalMl, todayKey,
     }),
   ];
 
-  const all = uniqueActions([...actions, ...defaults])
-    .sort((a, b) => b.priority - a.priority)
-    .slice(0, 3);
+  const ranked = applyActionNovelty(uniqueActions([...actions, ...defaults]), {
+    skipHistory,
+    recentActionTexts,
+  }).sort((a, b) => b.priority - a.priority);
+
+  const preferred = ranked.filter(action => action.priority >= 54).slice(0, 3);
+  const all = (preferred.length >= 2 ? preferred : ranked).slice(0, 3);
 
   return all;
 }
 
-const CBLUE   = '#38BDF8';
-const CTEAL   = '#22D3EE';
-const CPURPLE = '#C084FC';
-const CGREEN  = '#34D399';
-const CORANGE = '#F59E0B';
-const CWARN   = '#F59E0B';
-
 async function ensureTodayActions(deviceId, { force = false } = {}) {
   const today = dateStr();
 
-  const [waterSnap, activeSnap, recentLogsSnap] = await Promise.all([
+  const [waterSnap, activeSnap, recentLogsSnap, recentActionsSnap] = await Promise.all([
     waterDoc(deviceId).get(),
     actionsCol(deviceId).where('status', '==', 'active').get(),
     logsCol(deviceId).orderBy('logged_at', 'desc').limit(300).get(),
+    actionsCol(deviceId).orderBy('generated_at', 'desc').limit(12).get(),
   ]);
 
   const waterData     = waterSnap.data() || {};
   const setup         = waterData.setup || {};
   const activeActions = activeSnap.docs.map(mapDoc);
+  const goalHistory   = getGoalHistory(setup, waterData.setup_completed_at);
+  const goalForDate   = (ds) => resolveGoalForDate(goalHistory, ds, getGoalState(setup).goalMl);
 
-  if (!force && activeActions.some(a => a.date_str === today)) {
+  // Primary guard: already generated today (even if all actions are done/skipped)
+  if (!force && waterData.last_action_gen_date === today) {
     return;
   }
 
-  const goalMl = setup.daily_goal_ml || calcDailyGoal(setup);
+  const goalMl = goalForDate(today);
   const logs   = recentLogsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
   const { byDate, beverageTotals } = aggregateLogs(setup, logs);
-  const crossAgentInsights = await buildCrossAgentInsights(deviceId, byDate, goalMl, buildDateRangeKeys(14), computeCurrentStreak(byDate, goalMl));
-  const newActions         = generateDailyActions({ setup, byDate, beverageTotals, goalMl, todayKey: today, crossAgentInsights });
+  const recentKeys = buildDateRangeKeys(14);
+  const goalByDate = buildGoalMap(recentKeys, goalHistory, goalMl);
+  const recentActionTexts = recentActionsSnap.docs
+    .map(doc => doc.data()?.text)
+    .filter(Boolean)
+    .slice(0, 6);
+  const crossAgentInsights = await buildCrossAgentInsights(
+    deviceId,
+    byDate,
+    goalMl,
+    goalByDate,
+    recentKeys,
+    computeCurrentStreak(byDate, goalForDate)
+  );
+  const newActions         = generateDailyActions({
+    setup,
+    byDate,
+    beverageTotals,
+    goalMl,
+    goalByDate,
+    todayKey: today,
+    crossAgentInsights,
+    skipHistory: waterData.skip_history || [],
+    recentActionTexts,
+  });
   const nextGenIndex       = (waterData.last_action_gen_index || 0) + 1;
 
   const batch = db().batch();
@@ -835,48 +1127,97 @@ async function ensureTodayActions(deviceId, { force = false } = {}) {
 // ─── Context builder ─────────────────────────────────────────
 async function buildWaterContext(deviceId) {
   try {
-    const [wRef, logsSnap, activeSnap] = await Promise.all([
+    const [wRef, logsSnap, activeSnap, recentChatSnap] = await Promise.all([
       waterDoc(deviceId).get(),
       logsCol(deviceId).orderBy('logged_at', 'desc').limit(150).get(),
       actionsCol(deviceId).where('status', '==', 'active').get(),
+      chatsCol(deviceId).orderBy('created_at', 'desc').limit(6).get(),
     ]);
 
     if (!wRef.exists) return 'No setup data found.';
 
-    const setup         = wRef.data()?.setup || {};
-    const goal          = setup.daily_goal_ml || calcDailyGoal(setup);
+    const waterData     = wRef.data() || {};
+    const setup         = waterData.setup || {};
+    const goalHistory   = getGoalHistory(setup, waterData.setup_completed_at);
+    const goalForDate   = (ds) => resolveGoalForDate(goalHistory, ds, getGoalState(setup).goalMl);
+    const goalToday     = goalForDate(dateStr());
+    const goalSource    = getGoalState(setup).goalSource;
     const logs          = logsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
     const { byDate, beverageTotals } = aggregateLogs(setup, logs);
     const todayKey      = dateStr();
     const today         = byDate[todayKey] || emptyDay();
     const recentKeys    = buildDateRangeKeys(7);
     const avg7          = Math.round(avg(recentKeys.map(key => byDate[key]?.effective_ml || 0)));
-    const streak        = computeCurrentStreak(byDate, goal);
+    const streak        = computeCurrentStreak(byDate, goalForDate);
+    const goalSummary   = buildGoalHistorySummary(goalHistory, buildDateRangeKeys(30), goalToday);
     const beverageMix   = buildBeverageMix(beverageTotals).slice(0, 3).map(item => `${item.label} ${item.pct}%`).join(', ') || 'mostly water';
     const activeActions = sortByTimestampField(activeSnap.docs.map(mapDoc), 'generated_at', 'asc')
       .slice(0, 3)
-      .map(a => `- ${a.text}`)
+      .map(a => `- ${a.text} [${a.when_to_do || 'anytime'}]`)
       .join('\n') || '- none';
+
+    // Current schedule window
+    const wake   = setup.wake_time_min ?? 420;
+    const bed    = setup.bed_time_min  ?? 1380;
+    const nowMin = new Date().getHours() * 60 + new Date().getMinutes();
+    const schedule = buildSchedule(wake, bed, goalToday);
+    const awakeSpan = Math.max(480, bed - wake);
+    const expectedPct = clamp((nowMin - wake) / awakeSpan, 0, 1);
+    const paceGapMl = Math.round(today.effective_ml - goalToday * expectedPct);
+    const nextBlock = schedule.find(b => b.startMin > nowMin);
+    const scheduleNote = nextBlock
+      ? `Next schedule block: ${nextBlock.label} (${nextBlock.ml} ml target). Pace gap: ${paceGapMl >= 0 ? '+' : ''}${paceGapMl} ml.`
+      : `In the final taper window. Pace gap: ${paceGapMl >= 0 ? '+' : ''}${paceGapMl} ml.`;
+
+    // Recent proactive messages sent to user (last 2)
+    const recentProactives = recentChatSnap.docs
+      .map(d => d.data())
+      .filter(m => m.is_proactive && m.content)
+      .slice(0, 2)
+      .map(m => `[${m.proactive_type || 'check_in'} at ${toIso(m.created_at)?.slice(11,16) || '?'}]: ${m.content.slice(0, 100)}`)
+      .join('\n');
 
     let sleepNote = '';
     try {
       const sleepSnap = await userDoc(deviceId).collection('agents').doc('sleep')
         .collection('sleep_logs').orderBy('date', 'desc').limit(3).get();
       if (!sleepSnap.empty) {
-        const scores = sleepSnap.docs.map(d => d.data()?.quality_score || 0).filter(Boolean);
-        if (scores.length) sleepNote = `Recent sleep quality scores: ${scores.join(', ')} / 100.`;
+        const entries = sleepSnap.docs.map(d => d.data()).filter(d => d.quality_score);
+        if (entries.length) {
+          sleepNote = `Recent sleep quality (last ${entries.length} nights): ${entries.map(d => `${d.quality_score}/100 on ${d.date}`).join(', ')}.`;
+        }
       }
     } catch { /* non-fatal */ }
 
+    const nowHour   = new Date().getHours();
+    const nowMinute = new Date().getMinutes();
+    const timeLabel = nowHour < 6 ? 'night' : nowHour < 12 ? 'morning' : nowHour < 17 ? 'afternoon' : nowHour < 21 ? 'evening' : 'night';
+    const logs150   = await logsCol(deviceId).orderBy('logged_at', 'desc').limit(1).get();
+    const lastLogDoc = logs150.docs[0];
+    const lastLogMins = lastLogDoc
+      ? Math.round((Date.now() - getMillis(lastLogDoc.data().logged_at)) / 60000)
+      : null;
+    const lastLogNote = lastLogMins === null
+      ? 'No logs yet today.'
+      : lastLogMins < 5 ? 'Last logged: just now.'
+      : lastLogMins < 60 ? `Last logged: ${lastLogMins} min ago.`
+      : `Last logged: ${Math.round(lastLogMins / 60)}h ago.`;
+
     return [
-      `Setup: ${setup.weight_kg || '?'}kg, activity ${setup.activity_level || 'moderate'}, climate ${setup.climate || 'mild'}, wake ${minsToLabel(setup.wake_time_min ?? 420)}, bed ${minsToLabel(setup.bed_time_min ?? 1380)}.`,
-      `Goal: ${goal} ml/day.`,
-      `Today: ${today.effective_ml} ml (${Math.round(today.effective_ml / Math.max(goal, 1) * 100)}% of goal), ${today.log_count} logs, morning ${today.parts.morning || 0} ml, late ${today.late_ml || 0} ml.`,
-      `7-day average: ${avg7} ml/day.`,
-      `Current streak: ${streak} days.`,
-      `Recent beverage mix: ${beverageMix}.`,
+      `Current time: ${minsToLabel(nowHour * 60 + nowMinute)} (${timeLabel}).`,
+      `Setup: ${setup.weight_kg || '?'}kg, ${setup.activity_level || 'moderate'} activity, ${setup.climate || 'mild'} climate, wake ${minsToLabel(wake)}, bed ${minsToLabel(bed)}.`,
+      `Goal: ${goalToday} ml/day${goalSource === 'manual' ? ' (user-set custom target)' : ' (coach-calculated)'}.`,
+      goalSummary.latest_change
+        ? `Goal changed ${goalSummary.latest_change.from_goal_ml} -> ${goalSummary.latest_change.to_goal_ml} ml on ${goalSummary.latest_change.effective_from}.`
+        : '',
+      `Today: ${today.effective_ml} ml logged (${Math.round(today.effective_ml / Math.max(goalToday, 1) * 100)}% of goal), ${today.log_count} entries. Morning: ${today.parts.morning || 0} ml | Afternoon: ${today.parts.afternoon || 0} ml | Evening: ${today.parts.evening || 0} ml. Late intake: ${today.late_ml || 0} ml.`,
+      lastLogNote,
+      scheduleNote,
+      `7-day average: ${avg7} ml/day. Current streak: ${streak} days.`,
+      `Beverage mix: ${beverageMix}.`,
       sleepNote,
-      'Current coach actions:',
+      recentProactives ? `Recent coach notifications:\n${recentProactives}` : '',
+      'Active coach priorities:',
       activeActions,
     ].filter(Boolean).join('\n');
   } catch (e) {
@@ -888,16 +1229,28 @@ async function buildWaterContext(deviceId) {
 // ─── POST /setup ──────────────────────────────────────────────
 router.post('/setup', async (req, res) => {
   try {
-    const { deviceId, ...setupFields } = req.body;
+    const { deviceId, utc_offset_minutes, ...setupFields } = req.body;
     if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
 
     const goal  = calcDailyGoal(setupFields);
-    const setup = { ...setupFields, daily_goal_ml: goal };
+    const setup = {
+      ...setupFields,
+      recommended_goal_ml: goal,
+      manual_goal_ml: null,
+      daily_goal_ml: goal,
+      goal_source: 'recommended',
+      goal_history: [{
+        effective_from: dateStr(),
+        goal_ml: goal,
+        source: 'recommended',
+      }],
+    };
 
     await waterDoc(deviceId).set({
       setup,
       setup_completed: true,
       setup_completed_at: admin.firestore.FieldValue.serverTimestamp(),
+      utc_offset_minutes: (typeof utc_offset_minutes === 'number') ? utc_offset_minutes : null,
       analysis_cache: null,
       proactive_count_date: '',
       proactive_count_today: 0,
@@ -911,7 +1264,7 @@ router.post('/setup', async (req, res) => {
     await ensureTodayActions(deviceId, { force: true });
     invalidateCtx(deviceId);
 
-    res.json({ ok: true, daily_goal_ml: goal });
+    res.json({ ok: true, daily_goal_ml: goal, recommended_goal_ml: goal, manual_goal_ml: null, goal_source: 'recommended', setup });
   } catch (e) {
     console.error('[water] POST /setup:', e);
     res.status(500).json({ error: e.message });
@@ -929,9 +1282,81 @@ router.get('/setup-status', async (req, res) => {
       return res.json({ setup_completed: false });
     }
 
-    res.json({ setup_completed: true, setup: snap.data().setup });
+    const setup = snap.data().setup || {};
+    const goalState = getGoalState(setup);
+    res.json({
+      setup_completed: true,
+      setup: {
+        ...setup,
+        daily_goal_ml: goalState.goalMl,
+        recommended_goal_ml: goalState.recommendedGoalMl,
+        manual_goal_ml: goalState.manualGoalMl,
+        goal_source: goalState.goalSource,
+      },
+    });
   } catch (e) {
     console.error('[water] GET /setup-status:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── POST /goal ───────────────────────────────────────────────
+router.post('/goal', async (req, res) => {
+  try {
+    const { deviceId, goal_ml: rawGoalMl, use_recommended: useRecommended = false } = req.body;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+
+    const snap = await waterDoc(deviceId).get();
+    if (!snap.exists || !snap.data()?.setup_completed) {
+      return res.status(404).json({ error: 'Water setup not found' });
+    }
+
+    const waterData = snap.data() || {};
+    const setup = waterData.setup || {};
+    const recommendedGoalMl = calcDailyGoal(setup);
+    const manualGoalMl = useRecommended ? null : sanitizeGoalMl(rawGoalMl, null);
+    const today = dateStr();
+
+    if (!useRecommended && !manualGoalMl) {
+      return res.status(400).json({ error: 'goal_ml must be between 1500 and 6000' });
+    }
+
+    const dailyGoalMl = manualGoalMl || recommendedGoalMl;
+    const goalSource = manualGoalMl ? 'manual' : 'recommended';
+    const goalHistory = getGoalHistory(setup, waterData.setup_completed_at);
+    const nextGoalHistory = upsertGoalHistoryEntry(goalHistory, {
+      effective_from: today,
+      goal_ml: dailyGoalMl,
+      source: goalSource,
+    });
+    const nextSetup = {
+      ...setup,
+      recommended_goal_ml: recommendedGoalMl,
+      manual_goal_ml: manualGoalMl,
+      daily_goal_ml: dailyGoalMl,
+      goal_source: goalSource,
+      goal_history: nextGoalHistory,
+    };
+
+    await waterDoc(deviceId).set({
+      setup: nextSetup,
+      analysis_cache: null,
+      last_goal_reached_date: null,
+    }, { merge: true });
+
+    invalidateCtx(deviceId);
+    await ensureTodayActions(deviceId, { force: true });
+
+    res.json({
+      ok: true,
+      daily_goal_ml: dailyGoalMl,
+      recommended_goal_ml: recommendedGoalMl,
+      manual_goal_ml: manualGoalMl,
+      goal_source: goalSource,
+      setup: nextSetup,
+    });
+  } catch (e) {
+    console.error('[water] POST /goal:', e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -940,16 +1365,21 @@ router.get('/setup-status', async (req, res) => {
 router.post('/log', async (req, res) => {
   try {
     const { deviceId, ml, beverage_type = 'water', date } = req.body;
-    if (!deviceId || !ml) return res.status(400).json({ error: 'deviceId + ml required' });
+    if (!deviceId || ml == null) return res.status(400).json({ error: 'deviceId + ml required' });
 
-    const multiplier  = BEV_MULT[beverage_type] || 1;
-    const effectiveMl = Math.round(ml * multiplier);
-    const logDate     = date || dateStr();
+    const parsedMl = parseFloat(ml);
+    if (!Number.isFinite(parsedMl) || parsedMl < 1 || parsedMl > 5000) {
+      return res.status(400).json({ error: 'ml must be between 1 and 5000' });
+    }
+    const safeBev     = Object.prototype.hasOwnProperty.call(BEV_MULT, beverage_type) ? beverage_type : 'water';
+    const multiplier  = BEV_MULT[safeBev];
+    const effectiveMl = Math.round(parsedMl * multiplier);
+    const logDate     = (typeof date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(date)) ? date : dateStr();
 
     const ref = await logsCol(deviceId).add({
-      ml,
+      ml: parsedMl,
       effective_ml: effectiveMl,
-      beverage_type,
+      beverage_type: safeBev,
       date: logDate,
       logged_at: admin.firestore.FieldValue.serverTimestamp(),
     });
@@ -976,8 +1406,12 @@ router.get('/today', async (req, res) => {
       logsCol(deviceId).orderBy('logged_at', 'desc').limit(400).get(),
     ]);
 
-    const setup  = wSnap.exists ? (wSnap.data()?.setup || {}) : {};
-    const goalMl = setup.daily_goal_ml || calcDailyGoal(setup);
+    const waterData = wSnap.exists ? (wSnap.data() || {}) : {};
+    const setup  = waterData.setup || {};
+    const goalState = getGoalState(setup);
+    const goalHistory = getGoalHistory(setup, waterData.setup_completed_at);
+    const goalForDate = (ds) => resolveGoalForDate(goalHistory, ds, goalState.goalMl);
+    const goalMl = goalForDate(today);
 
     const logs = logsSnap.docs
       .map(mapDoc)
@@ -989,7 +1423,7 @@ router.get('/today', async (req, res) => {
 
     const allLogs = allLogsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
     const { byDate } = aggregateLogs(setup, allLogs);
-    const streak = computeCurrentStreak(byDate, goalMl);
+    const streak = computeCurrentStreak(byDate, goalForDate);
 
     res.json({
       logs,
@@ -997,6 +1431,9 @@ router.get('/today', async (req, res) => {
       logged_ml: loggedMl,
       remaining_ml: Math.max(0, goalMl - loggedMl),
       goal_ml: goalMl,
+      recommended_goal_ml: goalState.recommendedGoalMl,
+      manual_goal_ml: goalState.manualGoalMl,
+      goal_source: goalState.goalSource,
       streak,
     });
   } catch (e) {
@@ -1033,8 +1470,11 @@ router.get('/logs', async (req, res) => {
       logsCol(deviceId).where('date', '==', date).get(),
     ]);
 
-    const setup  = wSnap.exists ? (wSnap.data()?.setup || {}) : {};
-    const goalMl = setup.daily_goal_ml || calcDailyGoal(setup);
+    const waterData = wSnap.exists ? (wSnap.data() || {}) : {};
+    const setup  = waterData.setup || {};
+    const goalState = getGoalState(setup);
+    const goalHistory = getGoalHistory(setup, waterData.setup_completed_at);
+    const goalMl = resolveGoalForDate(goalHistory, date, goalState.goalMl);
     const logs   = logsSnap.docs
       .map(mapDoc)
       .map(log => ({ ...log, logged_at: toIso(log.logged_at) }))
@@ -1047,6 +1487,9 @@ router.get('/logs', async (req, res) => {
       entry_count: logs.length,
       logged_ml: loggedMl,
       goal_ml: goalMl,
+      recommended_goal_ml: goalState.recommendedGoalMl,
+      manual_goal_ml: goalState.manualGoalMl,
+      goal_source: goalState.goalSource,
     });
   } catch (e) {
     console.error('[water] GET /logs:', e);
@@ -1072,24 +1515,30 @@ router.get('/analysis', async (req, res) => {
 
     const waterData = wSnap.data() || {};
     const setup     = waterData.setup || {};
-    const goalMl    = setup.daily_goal_ml || calcDailyGoal(setup);
+    const goalState = getGoalState(setup);
+    const goalHistory = getGoalHistory(setup, waterData.setup_completed_at);
+    const goalForDate = (ds) => resolveGoalForDate(goalHistory, ds, goalState.goalMl);
+    const goalMl    = goalForDate(dateStr());
     const logs      = logsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
     const { byDate, beverageTotals } = aggregateLogs(setup, logs);
 
     const rangeKeys     = buildDateRangeKeys(rangeDays);
-    const daysLogged    = rangeKeys.filter(key => (byDate[key]?.log_count || 0) > 0).length;
-    const streak        = computeCurrentStreak(byDate, goalMl);
-    const longestStreak = computeLongestStreak(byDate, goalMl);
+    const goalByDate    = buildGoalMap(rangeKeys, goalHistory, goalMl);
     const recent7Keys   = buildDateRangeKeys(7);
+    const recentGoalByDate = buildGoalMap(recent7Keys, goalHistory, goalMl);
+    const goalHistorySummary = buildGoalHistorySummary(goalHistory, rangeKeys, goalMl);
+    const daysLogged    = rangeKeys.filter(key => (byDate[key]?.log_count || 0) > 0).length;
+    const streak        = computeCurrentStreak(byDate, goalForDate);
+    const longestStreak = computeLongestStreak(byDate, goalForDate);
     const avg7d         = Math.round(avg(recent7Keys.map(key => byDate[key]?.effective_ml || 0)));
     const bestDay       = Math.max(0, ...rangeKeys.map(key => byDate[key]?.effective_ml || 0));
-    const goalDays      = rangeKeys.filter(key => (byDate[key]?.effective_ml || 0) >= goalMl).length;
+    const goalDays      = rangeKeys.filter(key => (byDate[key]?.effective_ml || 0) >= (goalByDate[key] || goalMl)).length;
     const avgLoggedDay  = Math.round(avg(rangeKeys.filter(key => byDate[key]?.log_count > 0).map(key => byDate[key].effective_ml)));
-    const frontloadDays = recent7Keys.filter(key => (byDate[key]?.parts?.morning || 0) >= Math.max(300, goalMl * 0.22)).length;
+    const frontloadDays = recent7Keys.filter(key => (byDate[key]?.parts?.morning || 0) >= Math.max(300, (recentGoalByDate[key] || goalMl) * 0.22)).length;
     const lateCutoffDays = recent7Keys.filter(key => (byDate[key]?.late_ml || 0) > 250).length;
-    const hydrationScore = computeHydrationScore(byDate, goalMl);
+    const hydrationScore = computeHydrationScore(byDate, recentGoalByDate);
     const stage          = determineStage(daysLogged);
-    const dayParts       = buildDayPartBreakdown(byDate, rangeKeys, goalMl);
+    const dayParts       = buildDayPartBreakdown(byDate, rangeKeys, goalByDate);
     const beverageMix    = buildBeverageMix(beverageTotals);
     const observations   = buildObservations({
       goalMl,
@@ -1098,33 +1547,49 @@ router.get('/analysis', async (req, res) => {
       longestStreak,
       recentKeys: recent7Keys,
       byDate,
+      goalByDate: recentGoalByDate,
       hydrationScore,
+      goalHistorySummary,
     });
 
     const heatmap = buildDateRangeKeys(28).map(key => ({
       date: key,
       ml: byDate[key]?.effective_ml || 0,
-      pct: clamp((byDate[key]?.effective_ml || 0) / Math.max(goalMl, 1), 0, 1),
+      goal_ml: resolveGoalForDate(goalHistory, key, goalMl),
+      pct: clamp((byDate[key]?.effective_ml || 0) / Math.max(resolveGoalForDate(goalHistory, key, goalMl), 1), 0, 1),
       logged: !!byDate[key]?.log_count,
     }));
 
-    const chart = rangeKeys.map(key => {
+    const chart = rangeKeys.map((key, index) => {
       const d = new Date(`${key}T12:00:00`);
       const label = `${d.getDate()} ${['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][d.getMonth()]}`;
+      const dayGoalMl = goalByDate[key] || goalMl;
+      const previousHistoryGoalMl = goalHistory
+        .filter(entry => entry.effective_from < key)
+        .slice(-1)[0]?.goal_ml;
+      const previousGoalMl = index > 0
+        ? (goalByDate[rangeKeys[index - 1]] || goalMl)
+        : (previousHistoryGoalMl || dayGoalMl);
       return {
         date: key,
         ml: byDate[key]?.effective_ml || 0,
+        goal_ml: dayGoalMl,
+        hit_goal: (byDate[key]?.effective_ml || 0) >= dayGoalMl,
+        goal_changed: index > 0 && previousGoalMl !== dayGoalMl,
         label,
       };
     });
 
-    const crossAgent = await buildCrossAgentInsights(deviceId, byDate, goalMl, rangeKeys, streak);
+    const crossAgent = await buildCrossAgentInsights(deviceId, byDate, goalMl, goalByDate, rangeKeys, streak);
 
     let aiInsight = null;
     let personalFormula = null;
 
-    if ((range === '30' || range === 'all') && daysLogged >= 3) {
-      const cacheKey = `${range}_${daysLogged}_${avg7d}_${streak}_${lateCutoffDays}`;
+    if ((range === '7' || range === '30' || range === 'all') && daysLogged >= 3) {
+      const latestGoalChangeKey = goalHistorySummary.latest_change
+        ? `${goalHistorySummary.latest_change.effective_from}_${goalHistorySummary.latest_change.to_goal_ml}`
+        : 'steady';
+      const cacheKey = `${range}_${daysLogged}_${avg7d}_${streak}_${lateCutoffDays}_${latestGoalChangeKey}`;
       const cached = waterData.analysis_cache;
 
       if (cached && cached.key === cacheKey) {
@@ -1135,6 +1600,7 @@ router.get('/analysis', async (req, res) => {
           setup,
           {
             goal_ml: goalMl,
+            avg_goal_ml: goalHistorySummary.avg_goal_ml,
             avg_7d: avg7d,
             best_day: bestDay,
             days_logged: daysLogged,
@@ -1143,9 +1609,14 @@ router.get('/analysis', async (req, res) => {
             longest_streak: longestStreak,
             frontload_days: frontloadDays,
             late_cutoff_days: lateCutoffDays,
+            goal_changes: goalHistorySummary.changes.map(change =>
+              `${change.effective_from}: ${change.from_goal_ml} -> ${change.to_goal_ml}`
+            ).join(', ') || 'none',
           },
           hydrationScore,
-          crossAgent
+          crossAgent,
+          dayParts,
+          beverageMix
         );
 
         aiInsight       = generated.insight;
@@ -1165,9 +1636,15 @@ router.get('/analysis', async (req, res) => {
     res.json({
       stage,
       goal_ml: goalMl,
+      recommended_goal_ml: goalState.recommendedGoalMl,
+      manual_goal_ml: goalState.manualGoalMl,
+      goal_source: goalState.goalSource,
+      goal_history: goalHistory,
+      goal_changes: goalHistorySummary.changes,
       stats: {
         days_logged: daysLogged,
         avg_7d: avg7d,
+        avg_goal_ml: goalHistorySummary.avg_goal_ml,
         avg_logged_day: avgLoggedDay || 0,
         best_day: bestDay,
         streak,
@@ -1186,7 +1663,13 @@ router.get('/analysis', async (req, res) => {
       heatmap,
       chart,
       cross_agent: crossAgent,
-      setup,
+      setup: {
+        ...setup,
+        daily_goal_ml: goalMl,
+        recommended_goal_ml: goalState.recommendedGoalMl,
+        manual_goal_ml: goalState.manualGoalMl,
+        goal_source: goalState.goalSource,
+      },
     });
   } catch (e) {
     console.error('[water] GET /analysis:', e);
@@ -1210,7 +1693,8 @@ router.get('/actions', async (req, res) => {
 
     const waterData = waterSnap.data() || {};
     const setup     = waterData.setup || {};
-    const goalMl    = setup.daily_goal_ml || calcDailyGoal(setup);
+    const goalState = getGoalState(setup);
+    const goalMl    = goalState.goalMl;
     const wake      = setup.wake_time_min ?? 420;
     const bed       = setup.bed_time_min ?? 1380;
     const schedule  = buildSchedule(wake, bed, goalMl);
@@ -1241,7 +1725,16 @@ router.get('/actions', async (req, res) => {
       ? recent.filter(a => a.status === 'past' && (a.gen_index || 0) === prevGenIndex)
       : [];
 
-    res.json({ active, completed, past, schedule, goal_ml: goalMl });
+    res.json({
+      active,
+      completed,
+      past,
+      schedule,
+      goal_ml: goalMl,
+      recommended_goal_ml: goalState.recommendedGoalMl,
+      manual_goal_ml: goalState.manualGoalMl,
+      goal_source: goalState.goalSource,
+    });
   } catch (e) {
     console.error('[water] GET /actions:', e);
     res.status(500).json({ error: e.message });
@@ -1298,62 +1791,72 @@ router.post('/chat', async (req, res) => {
   try {
     const { deviceId, message, proactive_context } = req.body;
     if (!deviceId || !message) return res.status(400).json({ error: 'deviceId + message required' });
+    if (!checkChatRate(deviceId)) return res.status(429).json({ error: 'Too many messages. Wait a moment.' });
+    const safeMessage = String(message).trim().slice(0, 600);
+    if (!safeMessage) return res.status(400).json({ error: 'message required' });
 
     const context  = await getCachedContext(deviceId);
     const histSnap = await chatsCol(deviceId)
-      .where('is_proactive', '==', false)
-      .limit(14)
+      .orderBy('created_at', 'desc')
+      .limit(24)
       .get();
 
     const history = histSnap.docs
       .map(mapDoc)
+      .filter(m => !m.is_proactive)
       .sort((a, b) => (a.created_at?.toMillis?.() || 0) - (b.created_at?.toMillis?.() || 0))
+      .slice(-8)
       .flatMap(m => [
         { role: 'user',      content: m.user_message || '' },
         { role: 'assistant', content: m.ai_response || '' },
       ]);
 
     const threadNotes = {
-      goal_reached:    'The user is responding to a success/progress message. Build on momentum.',
-      behind_pace:     'The user is responding because they are behind pace. Be concrete and non-judgmental.',
-      low_water:       'The user is responding because intake is low. Prioritise the next 1-2 actions, not theory.',
-      streak_at_risk:  'The user is responding to a streak-at-risk reminder. Make protecting momentum feel achievable.',
-      streak_milestone:'The user is responding to a streak celebration. Acknowledge consistency and turn it into the next small win.',
+      goal_reached:    'User responded after hitting goal. Do NOT congratulate again. Focus on what to protect now — timing quality, not volume.',
+      behind_pace:     'User is behind pace responding to a pace alert. One instruction: exact ml to drink, exact timeframe. No theory, no softening.',
+      low_start:       'User has not started drinking yet today. One move: give the exact amount to drink right now and why it matters. No recap.',
+      low_water:       'Low water, late in the day. Give the 1-2 most achievable moves. No catch-up sermon.',
+      streak_at_risk:  'Streak at risk. One concrete move to protect it. Calm and matter-of-fact.',
+      streak_milestone:'User just hit a streak milestone. Acknowledge in one sentence — no more. Then redirect to the next move.',
     };
 
     const systemPrompt = [
-      'You are the Water Coach inside a premium wellness app.',
-      'You are precise, warm, and data-driven. You coach behavior change, not just hydration trivia.',
-      'Use hydration science: body-weight goals, beverage multipliers, pacing across waking hours, front-loading early, tapering late, workout rehydration, and cross-agent links with sleep and mood.',
+      'You are the Water Coach inside Pulse — a precision wellness app.',
+      'You coach behavior change using the user\'s actual numbers. You know IOM weight-based goals, beverage hydration multipliers, cortisol-window front-loading, taper timing, pace-gap math, sweat-rate recovery, and cross-agent links with sleep and mood.',
       '',
-      'STYLE RULES:',
-      '- Lead with the single most useful insight.',
-      '- If they need a plan, give max 3 numbered steps.',
-      '- If they are behind today, give exact ml and timing.',
-      '- Mention cross-agent patterns only when the context supports them.',
-      '- Never invent numbers not present in context.',
-      '- Keep normal replies under 140 words unless the user asks for depth.',
+      'RULES:',
+      '- NEVER open with praise, validation, or agreement. Banned first words: "Great", "Nice", "Good", "Amazing", "Congrats", "Well done", "Awesome", "You\'re", "Absolutely", "Sure", "Of course", "Exactly". Start with a data observation, a number, or a direct instruction.',
+      '- VERIFY CLAIMS: if the user says they hit their goal but context shows < 95%, correct that in the first sentence (state actual % and ml remaining), then answer their question. Never validate a false claim.',
+      '- Use the exact numbers from context: logged ml, goal ml, streak, pace gap, schedule window, time of day.',
+      '- If behind pace: give the exact ml gap and the deadline (next block or taper window).',
+      '- If goal is genuinely hit: tell them one thing to protect now — not to drink more.',
+      '- Max 3 numbered steps when a plan is needed. No more.',
+      '- Use sleep/mood data once if relevant. Never repeat it.',
+      '- Banned phrases: "overall", "it\'s important to", "you may be experiencing", "stay hydrated", "make sure to", "remember to", "keep in mind", "don\'t forget".',
+      '- Never invent numbers absent from context.',
+      '- Under 100 words unless user explicitly asks for depth. No filler sentences.',
+      '- Tone: sharp performance coach. Not a wellness blog. Not a cheerleader.',
       '',
-      'USER CONTEXT:',
+      'USER DATA:',
       context,
-      proactive_context ? `\nTHREAD NOTE: ${threadNotes[proactive_context] || `The user is replying to a proactive message about ${proactive_context}.`}` : '',
+      proactive_context ? `\nTHREAD: ${threadNotes[proactive_context] || `User is replying to a proactive message (type: ${proactive_context}).`}` : '',
     ].filter(Boolean).join('\n');
 
     const completion = await openai.chat.completions.create({
       model: 'gpt-4.1-mini',
-      temperature: 0.55,
-      max_tokens: 280,
+      temperature: 0.3,
+      max_tokens: 175,
       messages: [
         { role: 'system', content: systemPrompt },
         ...history,
-        { role: 'user', content: message },
+        { role: 'user', content: safeMessage },
       ],
     });
 
     const reply = completion.choices[0]?.message?.content?.trim() || 'I could not generate a response. Try again.';
 
     const ref = await chatsCol(deviceId).add({
-      user_message: message,
+      user_message: safeMessage,
       ai_response: reply,
       is_proactive: false,
       is_read: true,
@@ -1370,16 +1873,28 @@ router.post('/chat', async (req, res) => {
 // ─── GET /chat/messages ───────────────────────────────────────
 router.get('/chat/messages', async (req, res) => {
   try {
-    const { deviceId } = req.query;
+    const { deviceId, before, limit: limitParam } = req.query;
     if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
 
-    const snap = await chatsCol(deviceId)
-      .orderBy('created_at', 'asc')
-      .limit(120)
-      .get();
+    const pageSize = Math.min(parseInt(limitParam, 10) || 60, 120);
+
+    let query = chatsCol(deviceId)
+      .orderBy('created_at', 'desc')
+      .limit(pageSize + 1);
+
+    if (before) {
+      const cursorDoc = await chatsCol(deviceId).doc(before).get();
+      if (cursorDoc.exists) query = query.startAfter(cursorDoc);
+    }
+
+    const snap = await query.get();
+    const hasMore = snap.docs.length > pageSize;
+    const docs = hasMore ? snap.docs.slice(0, pageSize) : snap.docs;
+    // Reverse to chronological order for rendering
+    docs.reverse();
 
     const messages = [];
-    for (const doc of snap.docs) {
+    for (const doc of docs) {
       const data = doc.data();
 
       if (data.is_proactive) {
@@ -1418,7 +1933,7 @@ router.get('/chat/messages', async (req, res) => {
       }
     }
 
-    res.json({ messages });
+    res.json({ messages, has_more: hasMore, oldest_id: docs[0]?.id || null });
   } catch (e) {
     console.error('[water] GET /chat/messages:', e);
     res.status(500).json({ error: e.message });
@@ -1437,14 +1952,17 @@ router.get('/chat/unread', async (req, res) => {
       .limit(10)
       .get();
 
-    const messages = snap.docs
+    const messages = dedupeProactiveList(snap.docs
       .map(doc => ({
         id: doc.id,
         content: doc.data().content || '',
         proactive_type: doc.data().proactive_type || 'check_in',
+        content_key: doc.data().content_key || buildMessageKey(doc.data().content || ''),
+        date_str: doc.data().date_str || null,
+        is_read: doc.data().is_read || false,
         created_at: toIso(doc.data().created_at),
       }))
-      .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+    );
 
     res.json({ messages });
   } catch (e) {
@@ -1478,11 +1996,26 @@ router.post('/chat/read', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 // PROACTIVE CRON — every hour, capped, lower-spam decision rules
 // ═══════════════════════════════════════════════════════════════
+// ─── Local-time helpers for cron ─────────────────────────────
+function getUserLocalNow(utcOffsetMinutes) {
+  const serverNow = new Date();
+  if (typeof utcOffsetMinutes !== 'number' || Number.isNaN(utcOffsetMinutes)) return serverNow;
+  return new Date(serverNow.getTime() + utcOffsetMinutes * 60 * 1000);
+}
+
+function dateStrLocal(localNow) {
+  const y  = localNow.getUTCFullYear();
+  const mo = String(localNow.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(localNow.getUTCDate()).padStart(2, '0');
+  return `${y}-${mo}-${dd}`;
+}
+
 cron.schedule('0 * * * *', async () => {
   try {
-    const now = new Date();
-    const hour = now.getHours();
-    if (hour < 8 || hour > 21) return;
+    const serverNow = new Date();
+    const serverHour = serverNow.getHours();
+    // Quick pre-filter: skip if server is way outside any reasonable window
+    if (serverHour < 0 || serverHour > 23) return;
 
     const usersSnap = await db().collection('wellness_users').get();
 
@@ -1490,20 +2023,28 @@ cron.schedule('0 * * * *', async () => {
       const deviceId = user.id;
 
       try {
-        const [waterSnap, logsSnap] = await Promise.all([
-          waterDoc(deviceId).get(),
-          logsCol(deviceId).where('date', '==', dateStr()).get(),
-        ]);
-
+        const waterSnap = await waterDoc(deviceId).get();
         if (!waterSnap.exists || !waterSnap.data()?.setup_completed) continue;
 
         const waterData  = waterSnap.data() || {};
+        // Use stored UTC offset for accurate local-time gating
+        const localNow   = getUserLocalNow(waterData.utc_offset_minutes ?? null);
+        const hour       = localNow.getUTCHours();
+        if (hour < 8 || hour > 21) continue;
+
+        const today      = dateStrLocal(localNow);
+        const [logsSnap, recentChatSnap] = await Promise.all([
+          logsCol(deviceId).where('date', '==', today).get(),
+          chatsCol(deviceId).orderBy('created_at', 'desc').limit(16).get(),
+        ]);
+
         const setup      = waterData.setup || {};
-        const goalMl     = setup.daily_goal_ml || calcDailyGoal(setup);
+        const goalHistory = getGoalHistory(setup, waterData.setup_completed_at);
+        const goalForDate = (ds) => resolveGoalForDate(goalHistory, ds, getGoalState(setup).goalMl);
+        const goalMl = goalForDate(today);
         const wake       = setup.wake_time_min ?? 420;
         const bed        = setup.bed_time_min ?? 1380;
-        const today      = dateStr();
-        const currentMin = hour * 60 + now.getMinutes();
+        const currentMin = hour * 60 + localNow.getUTCMinutes();
         const awakeSpan  = Math.max(480, bed - wake);
         const expectedPct = clamp((currentMin - wake) / awakeSpan, 0, 1);
         const loggedMl = logsSnap.docs.reduce((sum, doc) => {
@@ -1511,6 +2052,10 @@ cron.schedule('0 * * * *', async () => {
           return sum + (data.effective_ml || Math.round((data.ml || 0) * (BEV_MULT[data.beverage_type] || 1)));
         }, 0);
         const pct = loggedMl / Math.max(goalMl, 1);
+        const recentProactives = recentChatSnap.docs
+          .map(doc => ({ id: doc.id, ...doc.data() }))
+          .filter(message => message.is_proactive)
+          .slice(0, 8);
 
         const storedCountDate = waterData.proactive_count_date || '';
         const storedCount     = storedCountDate === today ? (waterData.proactive_count_today || 0) : 0;
@@ -1525,33 +2070,58 @@ cron.schedule('0 * * * *', async () => {
 
         if (pct >= 1 && hour >= 12 && waterData.last_goal_reached_date !== today) {
           proactiveType = 'goal_reached';
-          content = `🎉 Goal hit. You have already reached ${Math.round(goalMl / 100) / 10}L today. The move now is simple: coast, don’t flood the evening.`;
+          content = `🎉 Goal hit — ${Math.round(loggedMl / 100) / 10}L locked in today. Coast now: protect timing quality, not volume.`;
           updates.last_goal_reached_date = today;
+        } else if (logsSnap.empty && hour >= 8 && hour < 11 && currentMin >= wake + 90 && waterData.last_morning_nudge_date !== today) {
+          // Morning nudge: awake 90+ min, nothing logged yet
+          proactiveType = 'low_start';
+          content = `🌅 You have been up for over an hour and the tank is still empty. 500 ml now sets the whole day up.`;
+          updates.last_morning_nudge_date = today;
         } else if (logsSnap.empty && hour >= 20) {
           const allLogsSnap = await logsCol(deviceId).orderBy('logged_at', 'desc').limit(300).get();
           const allLogs = allLogsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
           const { byDate } = aggregateLogs(setup, allLogs);
-          const streak = computeCurrentStreak(byDate, goalMl);
+          const streak = computeStreakFromOffset(byDate, goalForDate, 1);
           if (streak >= 3 && waterData.last_streak_reminder_date !== today) {
             proactiveType = 'streak_at_risk';
             content = `🔥 No water logged yet today and your ${streak}-day streak is still alive. One meaningful drink now protects the run.`;
             updates.last_streak_reminder_date = today;
           }
-        } else if (pct < expectedPct - 0.28 && currentMin > wake + 180 && currentMin < bed - 180) {
+        } else if (pct < expectedPct - 0.25 && currentMin > wake + 180 && currentMin < Math.min(bed - 210, wake + 10 * 60)) {
           proactiveType = 'behind_pace';
           const gapMl = Math.max(200, Math.round((goalMl * expectedPct - loggedMl) / 50) * 50);
-          content = `💧 You are behind pace by about ${gapMl} ml for this time of day. Fix the gap before dinner and the rest of tonight gets easier.`;
-        } else if (pct < 0.75 && hour >= 18 && hour <= 20) {
+          content = `💧 ${gapMl} ml behind pace right now. Close that before dinner and tonight stays clean.`;
+        } else if (pct < 0.75 && hour >= 18 && hour <= 21) {
           proactiveType = 'low_water';
           const remaining = Math.max(200, Math.round((goalMl - loggedMl) / 50) * 50);
-          content = `⚠️ You are still only at ${Math.round(pct * 100)}% of goal with the day closing. Prioritise ${remaining} ml before your final 2-hour taper window.`;
+          content = `⚠️ ${Math.round(pct * 100)}% of goal with the day closing — ${remaining} ml left before your 2-hour taper window.`;
+        } else if (pct >= 1 && hour >= 10 && hour <= 18 && !String(waterData.last_streak_celebrated || '').startsWith(today)) {
+          // Streak milestone check — only when goal is met today and milestone not yet celebrated
+          const allStreakSnap = await logsCol(deviceId).orderBy('logged_at', 'desc').limit(300).get();
+          const allStreakLogs = allStreakSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+          const { byDate: streakByDate } = aggregateLogs(setup, allStreakLogs);
+          const currentStreak = computeCurrentStreak(streakByDate, goalForDate);
+          const milestoneKey  = `${today}_${currentStreak}`;
+          if (STREAK_MILESTONES.includes(currentStreak) && waterData.last_streak_celebrated !== milestoneKey) {
+            proactiveType = 'streak_milestone';
+            content = `🔥 ${currentStreak}-day streak. That is not luck — it is a system working. Same moves tomorrow.`;
+            updates.last_streak_celebrated = milestoneKey;
+          }
         }
 
         if (!proactiveType || !content) continue;
+        if (shouldSkipProactiveMessage({
+          recentMessages: recentProactives,
+          proactiveType,
+          content,
+          today,
+        })) continue;
 
         await chatsCol(deviceId).add({
           content,
           proactive_type: proactiveType,
+          content_key: buildMessageKey(content),
+          date_str: today,
           is_proactive: true,
           is_read: false,
           created_at: admin.firestore.FieldValue.serverTimestamp(),
