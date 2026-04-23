@@ -79,6 +79,7 @@ app.use('/api/mind',      require('./mind.agent'));
 app.use('/api/sleep',     require('./sleep.agent'));
 app.use('/api/nutrition', require('./nutrition.agent'));
 app.use('/api/water',     require('./water.agent'));
+app.use('/api/fasting',   require('./fasting.agent'));
 
 // ============================================
 // CONSTANTS
