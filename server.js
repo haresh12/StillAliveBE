@@ -80,6 +80,9 @@ app.use('/api/sleep',     require('./sleep.agent'));
 app.use('/api/nutrition', require('./nutrition.agent'));
 app.use('/api/water',     require('./water.agent'));
 app.use('/api/fasting',   require('./fasting.agent'));
+app.use('/api/fitness',   require('./fitness.agent'));
+app.use('/api/community', require('./community'));
+app.use('/api/wellness',  require('./wellness.cross'));
 
 // ============================================
 // CONSTANTS
