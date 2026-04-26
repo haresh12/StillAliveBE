@@ -62,6 +62,34 @@ const sessionsCol  = (id) => fastingDoc(id).collection('fasting_sessions');
 const chatsCol     = (id) => fastingDoc(id).collection('fasting_chats');
 const actionsCol   = (id) => fastingDoc(id).collection('fasting_actions');
 
+// ════════════════════════════════════════════════════════════════
+// ACTIONS v2 — shared engine
+// ════════════════════════════════════════════════════════════════
+const { mountActionRoutes, gradeActions: _gradeActionsShared } = require('./lib/actions-engine');
+const { computeFastingCandidates, fastingGraders } = require('./lib/candidates/fasting');
+const { assertNoCrossAgent } = require('./lib/sandbox');
+assertNoCrossAgent('fasting', computeFastingCandidates);
+const _v2Hooks = mountActionRoutes(router, {
+  agentName: 'fasting',
+  agentDocRef: fastingDoc,
+  actionsCol, logsCol: sessionsCol,
+  computeCandidates: computeFastingCandidates,
+  graders: fastingGraders,
+  openai, admin, db,
+});
+function _onFastingLog(deviceId) {
+  fastingDoc(deviceId).update({
+    log_count_since_last_batch: admin.firestore.FieldValue.increment(1),
+  }).catch(() => {});
+  _v2Hooks.queueGeneration(deviceId);
+  _gradeActionsShared({
+    agentName: 'fasting', deviceId, actionsCol, logsCol: sessionsCol,
+    graders: fastingGraders, admin, db,
+  }).catch(() => {});
+  try { require('./wellness.cross').invalidateWellnessCache?.(deviceId); } catch {}
+}
+// ════════════════════════════════════════════════════════════════
+
 // ----------------------------------------------------------------
 // Helpers
 // ----------------------------------------------------------------
@@ -622,6 +650,9 @@ router.post('/setup', async (req, res) => {
       console.error('[fasting] setup actions gen:', e);
     }
 
+    // Queue v2 welcome action batch (shared engine — runs in addition to legacy)
+    try { _v2Hooks.queueGeneration(deviceId, { generationKind: 'setup' }); } catch {}
+
     return res.json({ success: true, setup, windowStart, windowEnd });
   } catch (e) {
     console.error('[fasting] setup:', e);
@@ -892,6 +923,9 @@ router.post('/session/end', async (req, res) => {
     // Recompute stats
     const allSessions = (await sessionsCol(deviceId).orderBy('started_at', 'desc').limit(100).get())
       .docs.map(mapDoc);
+
+    // v2 Actions hook (fires on every session end)
+    _onFastingLog(deviceId);
 
     const {
       currentStreak,
@@ -2178,7 +2212,7 @@ async function buildActionsPayload(deviceId, { allowGeneration = true } = {}) {
 // ================================================================
 // GET /actions -- setup batch, then only every 3 completed fasts
 // ================================================================
-router.get('/actions', async (req, res) => {
+router.get('/_legacy/actions', async (req, res) => {
   try {
     const { deviceId } = req.query;
     if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
@@ -2196,7 +2230,7 @@ router.get('/actions', async (req, res) => {
 // ================================================================
 // POST /actions/refresh -- reload only, no forced generation
 // ================================================================
-router.post('/actions/refresh', async (req, res) => {
+router.post('/_legacy/actions/refresh', async (req, res) => {
   try {
     const { deviceId } = req.body;
     if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
@@ -2214,7 +2248,7 @@ router.post('/actions/refresh', async (req, res) => {
 // ================================================================
 // POST /action/:id/complete
 // ================================================================
-router.post('/action/:id/complete', async (req, res) => {
+router.post('/_legacy/action/:id/complete', async (req, res) => {
   try {
     const { deviceId } = req.body;
     const { id }       = req.params;
@@ -2234,7 +2268,7 @@ router.post('/action/:id/complete', async (req, res) => {
 // ================================================================
 // POST /action/:id/skip
 // ================================================================
-router.post('/action/:id/skip', async (req, res) => {
+router.post('/_legacy/action/:id/skip', async (req, res) => {
   try {
     const { deviceId } = req.body;
     const { id }       = req.params;
@@ -2381,6 +2415,28 @@ router.post('/chat', async (req, res) => {
     console.error('[fasting] chat:', e);
     return res.status(500).json({ error: 'Chat failed' });
   }
+});
+
+// ─────────────────────────────────────────────────────────────────
+// POST /chat/stream — SSE streaming
+// ─────────────────────────────────────────────────────────────────
+const { mountChatStream: _mountChatStreamFasting } = require('./lib/chat-stream');
+_mountChatStreamFasting(router, {
+  agentName: 'fasting',
+  openai, admin, chatsCol,
+  rateLimitCheck: checkChatRate,
+  model: 'gpt-4o', maxTokens: 220, temperature: 0.35,
+  buildPrompt: async (deviceId /* , message, opts */) => {
+    const context = await getCachedContext(deviceId);
+    const systemPrompt = `CONTEXT:\n${context}\n\nYou are the Pulse Fasting Coach. Tight, precise, max 140 words. Reference exact hours/streak/water/sleep numbers. Sound human, never robotic.`;
+    const histSnap = await chatsCol(deviceId).orderBy('created_at', 'desc').limit(12).get();
+    const history = histSnap.docs
+      .map(d => d.data()).reverse()
+      .filter(m => m.role === 'assistant' || m.role === 'user')
+      .map(m => ({ role: m.role, content: m.content }))
+      .slice(-10);
+    return { systemPrompt, history };
+  },
 });
 
 // ================================================================

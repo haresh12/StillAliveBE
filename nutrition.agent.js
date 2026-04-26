@@ -20,6 +20,35 @@ const userDoc  = (id) => db().collection('wellness_users').doc(id);
 const nutDoc   = (id) => userDoc(id).collection('agents').doc('nutrition');
 const logsCol  = (id) => nutDoc(id).collection('food_logs');
 const chatsCol = (id) => nutDoc(id).collection('nutrition_chats');
+const actionsCol = (id) => nutDoc(id).collection('nutrition_actions');
+
+// ════════════════════════════════════════════════════════════════
+// ACTIONS v2 — shared engine
+// ════════════════════════════════════════════════════════════════
+const { mountActionRoutes, gradeActions: _gradeActionsShared } = require('./lib/actions-engine');
+const { computeNutritionCandidates, nutritionGraders } = require('./lib/candidates/nutrition');
+const { assertNoCrossAgent } = require('./lib/sandbox');
+assertNoCrossAgent('nutrition', computeNutritionCandidates);
+const _v2Hooks = mountActionRoutes(router, {
+  agentName: 'nutrition',
+  agentDocRef: nutDoc,
+  actionsCol, logsCol,
+  computeCandidates: computeNutritionCandidates,
+  graders: nutritionGraders,
+  openai, admin, db,
+});
+function _onNutritionLog(deviceId) {
+  nutDoc(deviceId).update({
+    log_count_since_last_batch: admin.firestore.FieldValue.increment(1),
+  }).catch(() => {});
+  _v2Hooks.queueGeneration(deviceId);
+  _gradeActionsShared({
+    agentName: 'nutrition', deviceId, actionsCol, logsCol,
+    graders: nutritionGraders, admin, db,
+  }).catch(() => {});
+  try { require('./wellness.cross').invalidateWellnessCache?.(deviceId); } catch {}
+}
+// ════════════════════════════════════════════════════════════════
 
 // ─── Helpers ──────────────────────────────────────────────────
 const dateStr = (d = new Date()) => {
@@ -644,6 +673,9 @@ router.post('/setup', async (req, res) => {
       created_at:     admin.firestore.FieldValue.serverTimestamp(),
     });
 
+    // Queue v2 welcome action batch (shared engine)
+    try { _v2Hooks.queueGeneration(deviceId, { generationKind: 'setup' }); } catch {}
+
     res.json({ success: true, targets });
   } catch (err) {
     console.error('[nutrition] /setup error:', err);
@@ -738,6 +770,7 @@ router.post('/log', async (req, res) => {
       }
     }
 
+    _onNutritionLog(deviceId);  // v2 Actions hook
     res.json({ success: true, id: ref.id, streak: newStreak });
   } catch (err) {
     console.error('[nutrition] /log error:', err);
@@ -1463,6 +1496,25 @@ router.post('/chat', async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────────
+// POST /chat/stream — SSE streaming (text-only; image upload uses POST /chat)
+// ─────────────────────────────────────────────────────────────────
+const { mountChatStream: _mountChatStreamNutrition } = require('./lib/chat-stream');
+_mountChatStreamNutrition(router, {
+  agentName: 'nutrition',
+  openai, admin, chatsCol,
+  model: 'gpt-4o', maxTokens: 600, temperature: 0.72,
+  buildPrompt: async (deviceId /* , message */) => {
+    const systemPrompt = await buildNutritionContext(deviceId);
+    const historySnap = await chatsCol(deviceId).orderBy('created_at', 'desc').limit(14).get();
+    const history = historySnap.docs.reverse()
+      .map(d => d.data())
+      .filter(m => m.role === 'assistant' || m.role === 'user')
+      .map(m => ({ role: m.role, content: m.content }));
+    return { systemPrompt, history };
+  },
+});
+
 // ═══════════════════════════════════════════════════════════════
 // GET /chat
 // ═══════════════════════════════════════════════════════════════
@@ -1603,7 +1655,7 @@ router.get('/today', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 // GET /actions — meal suggestions + habit + tips
 // ═══════════════════════════════════════════════════════════════
-router.get('/actions', async (req, res) => {
+router.get('/_legacy/actions', async (req, res) => {
   try {
     const { deviceId } = req.query;
     if (!deviceId) return res.status(400).json({ error: 'deviceId required' });

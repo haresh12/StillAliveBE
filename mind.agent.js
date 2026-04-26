@@ -22,6 +22,40 @@ const checkinsCol = (id) => mindDoc(id).collection('mind_checkins');
 const actionsCol  = (id) => mindDoc(id).collection('mind_actions');
 const chatsCol    = (id) => mindDoc(id).collection('mind_chats');
 
+// ════════════════════════════════════════════════════════════════
+// ACTIONS v2 — shared engine. MUST be mounted BEFORE legacy routes
+// (Express first-match wins). Legacy /actions code below is dead.
+// ════════════════════════════════════════════════════════════════
+const { mountActionRoutes, gradeActions: _gradeActionsShared } = require('./lib/actions-engine');
+const { computeMindCandidates, mindGraders } = require('./lib/candidates/mind');
+const { assertNoCrossAgent } = require('./lib/sandbox');
+assertNoCrossAgent('mind', computeMindCandidates);
+const _v2Hooks = mountActionRoutes(router, {
+  agentName: 'mind',
+  agentDocRef: mindDoc,
+  actionsCol,
+  logsCol: checkinsCol,
+  computeCandidates: computeMindCandidates,
+  graders: mindGraders,
+  openai,
+  admin,
+  db,
+});
+function _onMindLog(deviceId) {
+  // Increment log counter; when it reaches BATCH_SIZE the engine cooldown
+  // gates regeneration. Also grades any active actions in case criterion is met.
+  mindDoc(deviceId).update({
+    log_count_since_last_batch: admin.firestore.FieldValue.increment(1),
+  }).catch(() => {});
+  _v2Hooks.queueGeneration(deviceId);
+  _gradeActionsShared({
+    agentName: 'mind', deviceId, actionsCol, logsCol: checkinsCol,
+    graders: mindGraders, admin, db,
+  }).catch(() => {});
+  try { require('./wellness.cross').invalidateWellnessCache?.(deviceId); } catch {}
+}
+// ════════════════════════════════════════════════════════════════
+
 // ─── Constants ────────────────────────────────────────────────
 const MOOD_SCORE     = { low: 1, okay: 2, good: 3, great: 4 };
 
@@ -158,6 +192,9 @@ router.post('/setup', async (req, res) => {
       created_at:     admin.firestore.FieldValue.serverTimestamp(),
     });
 
+    // Queue v2 welcome action batch (shared engine — fires asynchronously)
+    try { _v2Hooks.queueGeneration(deviceId, { generationKind: 'setup' }); } catch {}
+
     res.json({ success: true, actions: firstActions });
   } catch (err) {
     console.error('[mind] /setup error:', err);
@@ -239,6 +276,9 @@ router.post('/checkin', async (req, res) => {
       checkin_count:     admin.firestore.FieldValue.increment(1),
       last_checkin_date: actionDate,
     });
+
+    // v2 Actions hook — fires regeneration + grading (cooldown-gated)
+    _onMindLog(deviceId);
 
     const totalCount    = prevCount + 1;
     const mindData      = mindDataBefore;
@@ -442,7 +482,7 @@ router.patch('/checkin/:id', async (req, res) => {
 // Returns today's AI-generated actions, user intentions,
 // and yesterday's completed/skipped actions for the review card.
 // ═══════════════════════════════════════════════════════════════
-router.get('/actions', async (req, res) => {
+router.get('/_legacy/actions', async (req, res) => {
   try {
     const { deviceId } = req.query;
     if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
@@ -513,7 +553,7 @@ router.get('/actions', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 // POST /action/:id/complete  |  POST /action/:id/skip
 // ═══════════════════════════════════════════════════════════════
-router.post('/action/:id/complete', async (req, res) => {
+router.post('/_legacy/action/:id/complete', async (req, res) => {
   try {
     const { deviceId } = req.body;
     const { id }       = req.params;
@@ -529,7 +569,7 @@ router.post('/action/:id/complete', async (req, res) => {
   }
 });
 
-router.post('/action/:id/skip', async (req, res) => {
+router.post('/_legacy/action/:id/skip', async (req, res) => {
   try {
     const { deviceId } = req.body;
     const { id }       = req.params;
@@ -729,6 +769,27 @@ router.post('/chat', async (req, res) => {
     console.error('[mind] /chat error:', err);
     res.status(500).json({ error: 'Chat failed' });
   }
+});
+
+// ─────────────────────────────────────────────────────────────────
+// POST /chat/stream — SSE streaming
+// ─────────────────────────────────────────────────────────────────
+const { mountChatStream: _mountChatStreamMind } = require('./lib/chat-stream');
+_mountChatStreamMind(router, {
+  agentName: 'mind',
+  openai, admin, chatsCol,
+  model: 'gpt-4o',
+  maxTokens: 650,
+  temperature: 0.72,
+  buildPrompt: async (deviceId /* , message */) => {
+    const systemPrompt = await buildContext(deviceId);
+    const historySnap = await chatsCol(deviceId).orderBy('created_at', 'desc').limit(14).get();
+    const history = historySnap.docs.reverse()
+      .map(d => d.data())
+      .filter(m => m.role === 'assistant' || m.role === 'user')
+      .map(m => ({ role: m.role, content: m.content }));
+    return { systemPrompt, history };
+  },
 });
 
 // ═══════════════════════════════════════════════════════════════

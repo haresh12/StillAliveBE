@@ -54,6 +54,34 @@ const logsCol    = (id) => waterDoc(id).collection('water_logs');
 const chatsCol   = (id) => waterDoc(id).collection('water_chats');
 const actionsCol = (id) => waterDoc(id).collection('water_actions');
 
+// ════════════════════════════════════════════════════════════════
+// ACTIONS v2 — shared engine
+// ════════════════════════════════════════════════════════════════
+const { mountActionRoutes, gradeActions: _gradeActionsShared } = require('./lib/actions-engine');
+const { computeWaterCandidates, waterGraders } = require('./lib/candidates/water');
+const { assertNoCrossAgent } = require('./lib/sandbox');
+assertNoCrossAgent('water', computeWaterCandidates);
+const _v2Hooks = mountActionRoutes(router, {
+  agentName: 'water',
+  agentDocRef: waterDoc,
+  actionsCol, logsCol,
+  computeCandidates: computeWaterCandidates,
+  graders: waterGraders,
+  openai, admin, db,
+});
+function _onWaterLog(deviceId) {
+  waterDoc(deviceId).update({
+    log_count_since_last_batch: admin.firestore.FieldValue.increment(1),
+  }).catch(() => {});
+  _v2Hooks.queueGeneration(deviceId);
+  _gradeActionsShared({
+    agentName: 'water', deviceId, actionsCol, logsCol,
+    graders: waterGraders, admin, db,
+  }).catch(() => {});
+  try { require('./wellness.cross').invalidateWellnessCache?.(deviceId); } catch {}
+}
+// ════════════════════════════════════════════════════════════════
+
 // ─── Helpers ──────────────────────────────────────────────────
 const DAY_PARTS = ['morning', 'midday', 'afternoon', 'evening', 'night'];
 const STREAK_MILESTONES = [3, 7, 14, 30];
@@ -1264,6 +1292,9 @@ router.post('/setup', async (req, res) => {
     await ensureTodayActions(deviceId, { force: true });
     invalidateCtx(deviceId);
 
+    // Queue v2 welcome action batch (shared engine)
+    try { _v2Hooks.queueGeneration(deviceId, { generationKind: 'setup' }); } catch {}
+
     res.json({ ok: true, daily_goal_ml: goal, recommended_goal_ml: goal, manual_goal_ml: null, goal_source: 'recommended', setup });
   } catch (e) {
     console.error('[water] POST /setup:', e);
@@ -1385,6 +1416,7 @@ router.post('/log', async (req, res) => {
     });
 
     invalidateCtx(deviceId);
+    _onWaterLog(deviceId);  // v2 Actions hook
     res.json({ ok: true, id: ref.id, effective_ml: effectiveMl });
   } catch (e) {
     console.error('[water] POST /log:', e);
@@ -1678,7 +1710,7 @@ router.get('/analysis', async (req, res) => {
 });
 
 // ─── GET /actions ─────────────────────────────────────────────
-router.get('/actions', async (req, res) => {
+router.get('/_legacy/actions', async (req, res) => {
   try {
     const { deviceId } = req.query;
     if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
@@ -1742,7 +1774,7 @@ router.get('/actions', async (req, res) => {
 });
 
 // ─── POST /action/:id/complete ───────────────────────────────
-router.post('/action/:id/complete', async (req, res) => {
+router.post('/_legacy/action/:id/complete', async (req, res) => {
   try {
     const { deviceId } = req.body;
     const { id } = req.params;
@@ -1761,7 +1793,7 @@ router.post('/action/:id/complete', async (req, res) => {
 });
 
 // ─── POST /action/:id/skip ───────────────────────────────────
-router.post('/action/:id/skip', async (req, res) => {
+router.post('/_legacy/action/:id/skip', async (req, res) => {
   try {
     const { deviceId } = req.body;
     const { id } = req.params;
@@ -1868,6 +1900,36 @@ router.post('/chat', async (req, res) => {
     console.error('[water] POST /chat:', e);
     res.status(500).json({ error: e.message });
   }
+});
+
+// ─────────────────────────────────────────────────────────────────
+// POST /chat/stream — SSE streaming
+// ─────────────────────────────────────────────────────────────────
+const { mountChatStream: _mountChatStreamWater } = require('./lib/chat-stream');
+_mountChatStreamWater(router, {
+  agentName: 'water',
+  openai, admin, chatsCol,
+  rateLimitCheck: checkChatRate,
+  model: 'gpt-4.1-mini', maxTokens: 175, temperature: 0.3,
+  buildPrompt: async (deviceId /* , message */) => {
+    const context = await getCachedContext(deviceId);
+    const systemPrompt = `You are the Water Coach inside Pulse. Use exact numbers from context. Under 100 words. Sharp performance coach. Banned openings: praise/validation.\n\nUSER DATA:\n${context}`;
+    const histSnap = await chatsCol(deviceId).orderBy('created_at', 'desc').limit(24).get();
+    const history = histSnap.docs.map(d => d.data())
+      .filter(m => !m.is_proactive)
+      .reverse()
+      .slice(-8)
+      .flatMap(m => {
+        // Water uses both shapes — handle both
+        if (m.role && m.content) return [{ role: m.role, content: m.content }];
+        return [
+          { role: 'user',      content: m.user_message || '' },
+          { role: 'assistant', content: m.ai_response  || '' },
+        ];
+      })
+      .filter(m => m.content);
+    return { systemPrompt, history };
+  },
 });
 
 // ─── GET /chat/messages ───────────────────────────────────────

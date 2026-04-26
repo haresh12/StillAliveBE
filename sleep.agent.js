@@ -47,6 +47,34 @@ const logsCol     = (id) => sleepDoc(id).collection('sleep_logs');
 const actionsCol  = (id) => sleepDoc(id).collection('sleep_actions');
 const chatsCol    = (id) => sleepDoc(id).collection('sleep_chats');
 
+// ════════════════════════════════════════════════════════════════
+// ACTIONS v2 — shared engine (mounts BEFORE legacy routes; first-match wins)
+// ════════════════════════════════════════════════════════════════
+const { mountActionRoutes, gradeActions: _gradeActionsShared } = require('./lib/actions-engine');
+const { computeSleepCandidates, sleepGraders } = require('./lib/candidates/sleep');
+const { assertNoCrossAgent } = require('./lib/sandbox');
+assertNoCrossAgent('sleep', computeSleepCandidates);
+const _v2Hooks = mountActionRoutes(router, {
+  agentName: 'sleep',
+  agentDocRef: sleepDoc,
+  actionsCol, logsCol,
+  computeCandidates: computeSleepCandidates,
+  graders: sleepGraders,
+  openai, admin, db,
+});
+function _onSleepLog(deviceId) {
+  sleepDoc(deviceId).update({
+    log_count_since_last_batch: admin.firestore.FieldValue.increment(1),
+  }).catch(() => {});
+  _v2Hooks.queueGeneration(deviceId);
+  _gradeActionsShared({
+    agentName: 'sleep', deviceId, actionsCol, logsCol,
+    graders: sleepGraders, admin, db,
+  }).catch(() => {});
+  try { require('./wellness.cross').invalidateWellnessCache?.(deviceId); } catch {}
+}
+// ════════════════════════════════════════════════════════════════
+
 // ─── Helpers ──────────────────────────────────────────────────
 const dateStr = (d = new Date()) => {
   const y  = d.getFullYear();
@@ -320,6 +348,9 @@ router.post('/setup', async (req, res) => {
       created_at:     admin.firestore.FieldValue.serverTimestamp(),
     });
 
+    // Queue v2 welcome action batch (shared engine)
+    try { _v2Hooks.queueGeneration(deviceId, { generationKind: 'setup' }); } catch {}
+
     res.json({ success: true, actions: firstActions });
   } catch (err) {
     console.error('[sleep] /setup error:', err);
@@ -395,6 +426,9 @@ router.post('/log', async (req, res) => {
     };
 
     const logRef = await logsCol(deviceId).add(logData);
+
+    // v2 Actions hook
+    _onSleepLog(deviceId);
 
     // Read state BEFORE incrementing
     const sleepSnapBefore  = await sleepDoc(deviceId).get();
@@ -657,7 +691,7 @@ router.patch('/log/:id', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 // GET /actions
 // ═══════════════════════════════════════════════════════════════
-router.get('/actions', async (req, res) => {
+router.get('/_legacy/actions', async (req, res) => {
   try {
     const { deviceId } = req.query;
     if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
@@ -714,7 +748,7 @@ router.get('/actions', async (req, res) => {
 });
 
 // ─── Action complete / skip ───────────────────────────────────
-router.post('/action/:id/complete', async (req, res) => {
+router.post('/_legacy/action/:id/complete', async (req, res) => {
   try {
     const { deviceId } = req.body;
     const { id }       = req.params;
@@ -730,7 +764,7 @@ router.post('/action/:id/complete', async (req, res) => {
   }
 });
 
-router.post('/action/:id/skip', async (req, res) => {
+router.post('/_legacy/action/:id/skip', async (req, res) => {
   try {
     const { deviceId } = req.body;
     const { id }       = req.params;
@@ -921,6 +955,30 @@ router.post('/chat', async (req, res) => {
     console.error('[sleep] /chat error:', err);
     res.status(500).json({ error: 'Chat failed' });
   }
+});
+
+// ─────────────────────────────────────────────────────────────────
+// POST /chat/stream — SSE streaming
+// ─────────────────────────────────────────────────────────────────
+const { mountChatStream: _mountChatStreamSleep } = require('./lib/chat-stream');
+_mountChatStreamSleep(router, {
+  agentName: 'sleep',
+  openai, admin, chatsCol,
+  rateLimitCheck: _checkChatRateLimit,
+  model: 'gpt-4o', maxTokens: 500, temperature: 0.6,
+  buildPrompt: async (deviceId, message, { proactive_context } = {}) => {
+    let systemPrompt = await getCachedContext(deviceId);
+    if (proactive_context) {
+      systemPrompt += `\n\n[THREAD CONTEXT] User is following up on a proactive message of type: ${proactive_context}. Briefly acknowledge then focus on what they asked.`;
+    }
+    const historySnap = await chatsCol(deviceId).orderBy('created_at', 'desc').limit(16).get();
+    const history = historySnap.docs.reverse()
+      .filter(d => !d.data().is_proactive)
+      .map(d => d.data())
+      .filter(m => m.role === 'assistant' || m.role === 'user')
+      .map(m => ({ role: m.role, content: m.content }));
+    return { systemPrompt, history };
+  },
 });
 
 router.get('/chat', async (req, res) => {
