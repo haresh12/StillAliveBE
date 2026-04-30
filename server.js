@@ -795,6 +795,39 @@ app.post('/api/wellness/signup', getWellnessDeviceId, async (req, res) => {
   }
 });
 
+app.post('/api/wellness/me', async (req, res) => {
+  try {
+    const { deviceId } = req.body || {};
+    if (!deviceId || typeof deviceId !== 'string' || deviceId.trim().length < 4) {
+      return res.status(400).json({ success: false, error: 'deviceId required' });
+    }
+    const doc = await db.collection('wellness_users').doc(deviceId.trim()).get();
+    if (!doc.exists) {
+      return res.status(404).json({ success: false, error: 'No account found' });
+    }
+    const data = doc.data();
+    if (!data.onboardingCompleted) {
+      return res.status(404).json({ success: false, error: 'Onboarding not completed' });
+    }
+    res.json({
+      success: true,
+      user: {
+        userId: data.deviceId || deviceId,
+        deviceId: data.deviceId || deviceId,
+        name: data.name || data.displayName || '',
+        displayName: data.displayName || data.name || '',
+        ageGroup: data.ageGroup || '',
+        gender: data.gender || '',
+        onboardingCompleted: true,
+        profileCompleted: data.profileCompleted || true,
+      },
+    });
+  } catch (error) {
+    console.error('wellness/me error:', error);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
 app.get('/api/version-check', async (req, res) => {
   try {
     console.log('🔍 Version check API called');

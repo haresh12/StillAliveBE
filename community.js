@@ -76,8 +76,11 @@ const RULES = [
 const GROUP_BY_ID = new Map(GROUPS.map(group => [group.id, group]));
 const MAX_MESSAGE_LENGTH = 900;
 const PAGE_LIMIT = 50;
+const COMMUNITY_UNLOCK_DAYS = 14;
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 const communityUserDoc = deviceId => db().collection('community_users').doc(deviceId);
+const wellnessUserDoc = deviceId => db().collection('wellness_users').doc(deviceId);
 const groupDoc = groupId => db().collection('community_groups').doc(groupId);
 const messagesCol = groupId => groupDoc(groupId).collection('messages');
 const participantsCol = groupId => groupDoc(groupId).collection('participants');
@@ -104,6 +107,82 @@ const cleanName = value => {
 };
 
 const isValidGroup = groupId => GROUP_BY_ID.has(groupId);
+
+const getMillis = value => {
+  if (!value) return null;
+  if (typeof value.toMillis === 'function') return value.toMillis();
+  if (typeof value.toDate === 'function') return value.toDate().getTime();
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.getTime();
+};
+
+const getCommunityAccess = async deviceId => {
+  const cleanDeviceId = String(deviceId || '').trim();
+  if (!cleanDeviceId) {
+    return {
+      eligible: false,
+      reason: 'device_id_required',
+      message: 'deviceId required',
+      unlockDays: COMMUNITY_UNLOCK_DAYS,
+    };
+  }
+
+  const snap = await wellnessUserDoc(cleanDeviceId).get();
+  if (!snap.exists) {
+    return {
+      eligible: false,
+      reason: 'signup_required',
+      message: 'Create your wellness account to unlock community.',
+      unlockDays: COMMUNITY_UNLOCK_DAYS,
+    };
+  }
+
+  const data = snap.data() || {};
+  const joinedAt =
+    getMillis(data.createdAt) ||
+    getMillis(data.joinedAt) ||
+    getMillis(data.created_at) ||
+    getMillis(data.created);
+
+  if (!joinedAt) {
+    return {
+      eligible: false,
+      reason: 'signup_date_pending',
+      message: 'Your signup date is still syncing. Try again shortly.',
+      unlockDays: COMMUNITY_UNLOCK_DAYS,
+    };
+  }
+
+  const unlockAtMs = joinedAt + COMMUNITY_UNLOCK_DAYS * DAY_MS;
+  const remainingMs = Math.max(0, unlockAtMs - Date.now());
+  const eligible = remainingMs <= 0;
+
+  return {
+    eligible,
+    reason: eligible ? 'eligible' : 'waiting_period',
+    message: eligible
+      ? 'Community is unlocked.'
+      : 'Community unlocks 14 days after signup.',
+    unlockDays: COMMUNITY_UNLOCK_DAYS,
+    joinedAt: new Date(joinedAt).toISOString(),
+    unlockAt: new Date(unlockAtMs).toISOString(),
+    daysRemaining: eligible ? 0 : Math.ceil(remainingMs / DAY_MS),
+    hoursRemaining: eligible ? 0 : Math.ceil(remainingMs / (60 * 60 * 1000)),
+  };
+};
+
+const requireCommunityAccess = async (deviceId, res) => {
+  const access = await getCommunityAccess(deviceId);
+  if (!access.eligible) {
+    res.status(403).json({
+      success: false,
+      error: access.message,
+      communityAccess: access,
+    });
+    return null;
+  }
+  return access;
+};
 
 const mapMessage = doc => {
   const data = doc.data() || {};
@@ -132,6 +211,7 @@ const getUserRules = async deviceId => {
 router.get('/groups', async (req, res) => {
   try {
     const { deviceId } = req.query;
+    const communityAccess = await getCommunityAccess(deviceId);
 
     const snaps = await Promise.all(GROUPS.map(group => groupDoc(group.id).get()));
     const groups = snaps.map((snap, index) => {
@@ -155,6 +235,7 @@ router.get('/groups', async (req, res) => {
       success: true,
       groups,
       rules: RULES,
+      communityAccess,
       rulesStatus: await getUserRules(deviceId),
     });
   } catch (err) {
@@ -167,7 +248,12 @@ router.get('/rules-status', async (req, res) => {
   try {
     const { deviceId } = req.query;
     if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
-    res.json({ success: true, rulesStatus: await getUserRules(deviceId), rules: RULES });
+    res.json({
+      success: true,
+      communityAccess: await getCommunityAccess(deviceId),
+      rulesStatus: await getUserRules(deviceId),
+      rules: RULES,
+    });
   } catch (err) {
     console.error('[community] /rules-status error:', err);
     res.status(500).json({ error: 'Could not load rules status' });
@@ -178,6 +264,8 @@ router.post('/rules/accept', async (req, res) => {
   try {
     const { deviceId, displayName } = req.body || {};
     if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+    const communityAccess = await requireCommunityAccess(deviceId, res);
+    if (!communityAccess) return;
 
     await communityUserDoc(deviceId).set({
       deviceId,
@@ -186,7 +274,7 @@ router.post('/rules/accept', async (req, res) => {
       updatedAt: serverTimestamp(),
     }, { merge: true });
 
-    res.json({ success: true, rulesStatus: { accepted: true } });
+    res.json({ success: true, communityAccess, rulesStatus: { accepted: true } });
   } catch (err) {
     console.error('[community] /rules/accept error:', err);
     res.status(500).json({ error: 'Could not accept rules' });
@@ -196,9 +284,12 @@ router.post('/rules/accept', async (req, res) => {
 router.get('/groups/:groupId/messages', async (req, res) => {
   try {
     const { groupId } = req.params;
+    const { deviceId } = req.query;
     const limit = Math.min(Number(req.query.limit || PAGE_LIMIT), PAGE_LIMIT);
 
     if (!isValidGroup(groupId)) return res.status(404).json({ error: 'Unknown group' });
+    const communityAccess = await requireCommunityAccess(deviceId, res);
+    if (!communityAccess) return;
 
     let query = messagesCol(groupId).orderBy('createdAt', 'desc').limit(limit);
     if (req.query.before) {
@@ -208,7 +299,7 @@ router.get('/groups/:groupId/messages', async (req, res) => {
 
     const snap = await query.get();
     const messages = snap.docs.map(mapMessage).reverse();
-    res.json({ success: true, messages });
+    res.json({ success: true, communityAccess, messages });
   } catch (err) {
     console.error('[community] /messages error:', err);
     res.status(500).json({ error: 'Could not load messages' });
@@ -224,6 +315,8 @@ router.post('/groups/:groupId/messages', async (req, res) => {
     if (!isValidGroup(groupId)) return res.status(404).json({ error: 'Unknown group' });
     if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
     if (!cleanedText) return res.status(400).json({ error: 'Message is empty' });
+    const communityAccess = await requireCommunityAccess(deviceId, res);
+    if (!communityAccess) return;
 
     const rules = await getUserRules(deviceId);
     if (!rules.accepted) {
@@ -273,7 +366,7 @@ router.post('/groups/:groupId/messages', async (req, res) => {
     await batch.commit();
 
     const created = await messageRef.get();
-    res.json({ success: true, message: mapMessage(created) });
+    res.json({ success: true, communityAccess, message: mapMessage(created) });
   } catch (err) {
     console.error('[community] /send message error:', err);
     res.status(500).json({ error: 'Could not send message' });
