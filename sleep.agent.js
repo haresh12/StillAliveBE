@@ -18,6 +18,8 @@ const router  = express.Router();
 const admin   = require('firebase-admin');
 const { OpenAI } = require('openai');
 const cron    = require('node-cron');
+const { fetchAgentSnapshot } = require('./lib/cross-agent-context');
+const { computeSleepScore: _computeSleepScore } = require('./lib/agent-scores');
 
 const openai  = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const db      = () => admin.firestore();
@@ -224,6 +226,60 @@ function computeSleepScore(stats) {
   };
 }
 
+async function refreshSleepScore(deviceId) {
+  try {
+    const [logsSnap, snap] = await Promise.all([
+      logsCol(deviceId).orderBy('logged_at', 'desc').limit(14).get(),
+      sleepDoc(deviceId).get(),
+    ]);
+    const setup = snap.data() || {};
+    const logs  = logsSnap.docs.map(d => d.data());
+    const daysLogged = new Set(logs.map(l => l.date_str)).size;
+    const recent = logs.slice(0, 7);
+    if (!recent.length) return;
+
+    const avgEff     = recent.reduce((s, l) => s + (l.sleep_efficiency  || 0), 0) / recent.length;
+    const avgDur     = recent.reduce((s, l) => s + (l.total_sleep_hours || 0), 0) / recent.length;
+    const avgQuality = recent.reduce((s, l) => s + (l.sleep_quality     || 3), 0) / recent.length;
+    const avgEnergy  = recent.reduce((s, l) => s + (l.morning_energy    || 3), 0) / recent.length;
+    const avgLatency = recent.reduce((s, l) => s + (l.sleep_latency     || 15), 0) / recent.length;
+    const targetH    = setup.target_hours || 7.5;
+
+    // Bedtime consistency → std dev of bedtime minutes (handle post-midnight)
+    const bedMins = recent.map(l => {
+      const [h, m] = (l.bedtime || '23:00').split(':').map(Number);
+      return (h < 12 ? h + 24 : h) * 60 + (m || 0);
+    });
+    const bedAvg = bedMins.reduce((s, x) => s + x, 0) / bedMins.length;
+    const bedStd = Math.sqrt(bedMins.reduce((s, x) => s + (x - bedAvg) ** 2, 0) / bedMins.length);
+    const consistencyScore = Math.max(0, Math.min(100, 100 - bedStd * 2));
+
+    const debtH = recent.reduce((s, l) => s + Math.max(0, targetH - (l.total_sleep_hours || 0)), 0) / recent.length;
+
+    const result = _computeSleepScore({
+      avg_efficiency:    avgEff,
+      avg_duration:      avgDur,
+      avg_quality:       avgQuality,
+      avg_energy:        avgEnergy,
+      avg_latency:       avgLatency,
+      consistency_score: consistencyScore,
+      target_hours:      targetH,
+      sleep_debt:        debtH,
+      days_logged:       daysLogged,
+    });
+    if (!result) return;
+
+    await sleepDoc(deviceId).update({
+      current_score:      result.score,
+      score_label:        result.label,
+      score_components:   result.components,
+      score_updated_at:   admin.firestore.FieldValue.serverTimestamp(),
+    });
+  } catch (err) {
+    console.error('[sleep] refreshScore:', err.message);
+  }
+}
+
 // ─── Tonight's recommendation ─────────────────────────────────
 // Uses CBT-I logic: if efficiency < 80% → sleep restriction (go later)
 // If debt ≥ 2h → go 30min earlier. Otherwise → stick to target.
@@ -378,6 +434,83 @@ router.get('/setup-status', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
+// GET /chat-prompts  — returns 6 prompts personalised from setup + logs
+// ═══════════════════════════════════════════════════════════════
+router.get('/chat-prompts', async (req, res) => {
+  try {
+    const { deviceId } = req.query;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+
+    const snap  = await sleepDoc(deviceId).get();
+    const setup = snap.exists ? snap.data() : {};
+    const problem    = setup.primary_problem || '';
+    const chronotype = setup.chronotype || 'in_between';
+    const disruptors = Array.isArray(setup.disruptors) ? setup.disruptors : [];
+    const targetBed  = setup.target_bedtime  || '23:00';
+    const targetHrs  = setup.target_hours    || 7.5;
+
+    const lastSnap = await sleepDoc(deviceId).collection('sleep_logs').orderBy('logged_at', 'desc').limit(1).get();
+    const lastLog  = lastSnap.empty ? null : lastSnap.docs[0].data();
+
+    const hour = new Date().getHours();
+    const isMorning = hour >= 5 && hour < 12;
+    const isEvening = hour >= 20;
+
+    const pool = [];
+
+    if (problem === 'falling_asleep') {
+      pool.push({ emoji: '🛏️', text: "I can't fall asleep — what actually works?" });
+      pool.push({ emoji: '🌬️', text: 'Give me a wind-down routine for tonight.' });
+    } else if (problem === 'staying_asleep') {
+      pool.push({ emoji: '😴', text: "I keep waking up at night — why?" });
+      pool.push({ emoji: '💡', text: 'What causes middle-of-night wake-ups?' });
+    } else if (problem === 'quality') {
+      pool.push({ emoji: '📊', text: "My sleep hours are OK but I still feel tired." });
+      pool.push({ emoji: '🔬', text: 'What affects deep sleep most?' });
+    } else if (problem === 'consistency') {
+      pool.push({ emoji: '⏰', text: "My sleep schedule is all over the place." });
+      pool.push({ emoji: '📅', text: 'How do I fix an inconsistent sleep schedule?' });
+    } else {
+      pool.push({ emoji: '😴', text: "Why do I wake up feeling unrefreshed?" });
+      pool.push({ emoji: '🌙', text: 'What can I do tonight to sleep better?' });
+    }
+
+    if (chronotype === 'early') {
+      pool.push({ emoji: '🌅', text: "I'm a morning person — how do I protect my early sleep?" });
+    } else if (chronotype === 'late' || chronotype === 'night_owl') {
+      pool.push({ emoji: '🦉', text: 'How do night owls shift their sleep earlier?' });
+    } else {
+      pool.push({ emoji: '⏰', text: `Help me stick to a ${targetBed} bedtime.` });
+    }
+
+    if (disruptors.includes('stress')) {
+      pool.push({ emoji: '😤', text: "Stress keeps me wired at bedtime. What helps?" });
+    } else if (disruptors.includes('phone')) {
+      pool.push({ emoji: '📱', text: 'I know I use my phone too late. How bad is it really?' });
+    } else if (disruptors.includes('caffeine')) {
+      pool.push({ emoji: '☕', text: 'How late is too late for caffeine?' });
+    } else {
+      pool.push({ emoji: '💭', text: 'What are my biggest sleep saboteurs?' });
+    }
+
+    if (isEvening) pool.push({ emoji: '🌙', text: 'What should I do right now to sleep well tonight?' });
+    else if (isMorning && lastLog) {
+      const hrs = lastLog.actual_hours || 0;
+      if (hrs < targetHrs - 0.5) pool.unshift({ emoji: '⚡', text: "I slept short last night — how do I recover?" });
+      else pool.push({ emoji: '📊', text: 'How was my sleep quality this week?' });
+    }
+
+    pool.push({ emoji: '📊', text: "What does my sleep data show this week?" });
+    pool.push({ emoji: '🔄', text: 'How does my sleep connect to my mood and energy?' });
+
+    res.json({ prompts: pool.slice(0, 6) });
+  } catch (err) {
+    console.error('[sleep] /chat-prompts error:', err);
+    res.status(500).json({ error: 'Failed' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
 // POST /log
 // Saves a sleep log. Calculates efficiency + sleep debt.
 // Triggers action regeneration every 3 logs.
@@ -447,10 +580,12 @@ router.post('/log', async (req, res) => {
     // ── Every 3 logs → retire active → generate fresh batch ──
     let newActions = null;
     if (sinceLast >= 3) {
-      const [recentLogsSnap, recentChatSnap, profileSnap] = await Promise.all([
+      const [recentLogsSnap, recentChatSnap, profileSnap, mindSnap, fitnessSnap] = await Promise.all([
         logsCol(deviceId).orderBy('logged_at', 'desc').limit(10).get(),
         chatsCol(deviceId).orderBy('created_at', 'desc').limit(10).get(),
         userDoc(deviceId).get(),
+        fetchAgentSnapshot(deviceId, 'mind', 3).catch(() => null),
+        fetchAgentSnapshot(deviceId, 'fitness', 1).catch(() => null),
       ]);
 
       const recentLogs     = recentLogsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
@@ -458,13 +593,26 @@ router.post('/log', async (req, res) => {
       const profile        = profileSnap.exists ? profileSnap.data() : {};
       const recentlySkipped = (sleepDataBefore.skip_history || []).slice(-8);
 
+      let crossAgentCtx = '';
+      if (mindSnap?.logs?.length) {
+        const avgAnxiety = (mindSnap.logs.reduce((s, l) => s + (l.anxiety_level || 0), 0) / mindSnap.logs.length).toFixed(1);
+        crossAgentCtx += `Mood last 3 days: avg anxiety ${avgAnxiety}/5. `;
+        if (parseFloat(avgAnxiety) >= 3) crossAgentCtx += 'High anxiety likely causing sleep onset issues. ';
+      }
+      if (fitnessSnap?.logs?.length) {
+        const w = fitnessSnap.logs[0];
+        const hour = w.logged_at?.toDate ? w.logged_at.toDate().getHours() : null;
+        if (hour !== null && hour >= 19) crossAgentCtx += `Late evening workout logged (${hour}:00) — may delay sleep onset. `;
+      }
+
       newActions = await generateActions({
         profile,
         setup:     sleepDataBefore,
         recentLogs,
         recentChat,
         recentlySkipped,
-        isFirstGen: false,
+        isFirstGen:    false,
+        crossAgentCtx,
       });
 
       const activeSnap = await actionsCol(deviceId).where('status', '==', 'active').get();
@@ -487,89 +635,84 @@ router.post('/log', async (req, res) => {
       await sleepDoc(deviceId).update({ last_action_gen_at_log: totalCount });
     }
 
-    // ── Poor quality proactive (1–2/5, max once per day) ──
-    const lastPoorSleepDate = sleepDataBefore.last_poor_sleep_date;
-    if ((sleep_quality || 3) <= 2 && lastPoorSleepDate !== today) {
+    // ── PROACTIVE GATE: max 1 proactive message per day, highest priority wins ──
+    // Priority: poor_sleep > sleep_debt (urgent ≥4h) > sleep_debt (mild ≥2h) > streak_milestone
+    // A single global guard (last_proactive_date) prevents any overlap regardless of type.
+    const lastProactiveDate = sleepDataBefore.last_proactive_date;
+    if (lastProactiveDate !== today) {
       try {
         const [profileSnap, recentLogsSnap] = await Promise.all([
           userDoc(deviceId).get(),
-          logsCol(deviceId).orderBy('logged_at', 'desc').limit(6).get(),
+          logsCol(deviceId).orderBy('logged_at', 'desc').limit(7).get(),
         ]);
         const pName    = profileSnap.exists ? (profileSnap.data().name || '') : '';
         const recent   = recentLogsSnap.docs.map(d => d.data());
-        const poorMsg  = await buildPoorSleepProactive(
-          pName, sleep_quality, disruptors || [], note || '', recent, sleepDataBefore
-        );
-        await chatsCol(deviceId).add({
-          role:                  'assistant',
-          content:               poorMsg,
-          is_proactive:          true,
-          proactive_type:        'poor_sleep',
-          is_read:               false,
-          triggered_by_log:      logRef.id,
-          created_at:            admin.firestore.FieldValue.serverTimestamp(),
-        });
-        await sleepDoc(deviceId).update({ last_poor_sleep_date: today });
+        const targetHours = sleepDataBefore.target_hours || 7.5;
+        const debt        = calcSleepDebt([...recent].reverse(), targetHours);
+
+        let proactiveMsg = null;
+        let proactiveType = null;
+        let extraUpdate = {};
+
+        // P1 — Poor quality (quality ≤ 2)
+        if ((sleep_quality || 3) <= 2) {
+          proactiveMsg  = await buildPoorSleepProactive(
+            pName, sleep_quality, disruptors || [], note || '', recent, sleepDataBefore
+          );
+          proactiveType = 'poor_sleep';
+          extraUpdate   = { last_poor_sleep_date: today };
+        }
+        // P2 — Urgent sleep debt (≥ 4h)
+        else if (debt >= 4) {
+          proactiveMsg  = await buildDebtProactive(pName, debt, targetHours, recent, sleepDataBefore, 'urgent');
+          proactiveType = 'sleep_debt';
+          extraUpdate   = { last_debt_alert_date: today };
+        }
+        // P3 — Mild sleep debt (≥ 2h)
+        else if (debt >= 2 && sleepDataBefore.last_debt_alert_date !== today) {
+          proactiveMsg  = await buildDebtProactive(pName, debt, targetHours, recent, sleepDataBefore, 'mild');
+          proactiveType = 'sleep_debt';
+          extraUpdate   = { last_debt_alert_date: today };
+        }
+        // P4 — Streak milestone (3, 7, 14, 30 nights)
+        else {
+          const STREAK_MILESTONES = [3, 7, 14, 30];
+          const uniqueDates = [...new Set(recent.map(d => d.date_str))];
+          let streakCount = 0;
+          for (let i = 0; i < uniqueDates.length; i++) {
+            const expected = dateStr(new Date(Date.now() - i * 86400000));
+            if (uniqueDates[i] === expected) streakCount++;
+            else break;
+          }
+          if (STREAK_MILESTONES.includes(streakCount) && sleepDataBefore.last_streak_celebrated !== streakCount) {
+            proactiveMsg  = await buildStreakProactive(pName, streakCount, sleepDataBefore);
+            proactiveType = 'streak_milestone';
+            extraUpdate   = { last_streak_celebrated: streakCount };
+          }
+        }
+
+        if (proactiveMsg && proactiveType) {
+          await chatsCol(deviceId).add({
+            role:             'assistant',
+            content:          proactiveMsg,
+            is_proactive:     true,
+            proactive_type:   proactiveType,
+            is_read:          false,
+            triggered_by_log: logRef.id,
+            created_at:       admin.firestore.FieldValue.serverTimestamp(),
+          });
+          await sleepDoc(deviceId).update({ last_proactive_date: today, ...extraUpdate });
+        }
       } catch (err) {
-        console.error('[sleep] poor sleep proactive error:', err.message);
+        console.error('[sleep] proactive error:', err.message);
       }
-    }
-
-    // ── Sleep debt alert (≥ 4 hours debt, not alerted today) ──
-    try {
-      const allLogsSnap = await logsCol(deviceId).orderBy('logged_at', 'desc').limit(7).get();
-      const allLogs     = allLogsSnap.docs.map(d => d.data());
-      const targetHours = sleepDataBefore.target_hours || 7.5;
-      const debt        = calcSleepDebt(allLogs.reverse(), targetHours);
-      const lastDebtAlert = sleepDataBefore.last_debt_alert_date;
-
-      if (debt >= 2 && lastDebtAlert !== today) {
-        const profileSnap = await userDoc(deviceId).get();
-        const pName = profileSnap.exists ? (profileSnap.data().name || '') : '';
-        const severity = debt >= 4 ? 'urgent' : 'mild';
-        const debtMsg = await buildDebtProactive(pName, debt, targetHours, allLogs, sleepDataBefore, severity);
-        await chatsCol(deviceId).add({
-          role:           'assistant',
-          content:        debtMsg,
-          is_proactive:   true,
-          proactive_type: 'sleep_debt',
-          is_read:        false,
-          created_at:     admin.firestore.FieldValue.serverTimestamp(),
-        });
-        await sleepDoc(deviceId).update({ last_debt_alert_date: today });
-      }
-    } catch (err) {
-      console.error('[sleep] debt alert error:', err.message);
-    }
-
-    // ── Streak milestone proactive (3, 7, 14, 30 nights) ──
-    const STREAK_MILESTONES = [3, 7, 14, 30];
-    const logsForStreakSnap = await logsCol(deviceId)
-      .orderBy('logged_at', 'desc').limit(40).get();
-    const uniqueDates = [...new Set(logsForStreakSnap.docs.map(d => d.data().date_str))];
-    let streakCount = 0;
-    for (let i = 0; i < uniqueDates.length; i++) {
-      const expected = dateStr(new Date(Date.now() - i * 86400000));
-      if (uniqueDates[i] === expected) streakCount++;
-      else break;
-    }
-    if (STREAK_MILESTONES.includes(streakCount) && sleepDataBefore.last_streak_celebrated !== streakCount) {
-      const pSnap   = await userDoc(deviceId).get();
-      const pName   = pSnap.exists ? (pSnap.data().name || '') : '';
-      const streakMsg = await buildStreakProactive(pName, streakCount, sleepDataBefore);
-      await chatsCol(deviceId).add({
-        role:           'assistant',
-        content:        streakMsg,
-        is_proactive:   true,
-        proactive_type: 'streak_milestone',
-        is_read:        false,
-        created_at:     admin.firestore.FieldValue.serverTimestamp(),
-      });
-      await sleepDoc(deviceId).update({ last_streak_celebrated: streakCount });
     }
 
     // Invalidate context cache — new log changes metrics the coach uses
     invalidateContextCache(deviceId);
+
+    // Refresh score cache (non-blocking)
+    refreshSleepScore(deviceId).catch(() => {});
 
     res.json({
       success:        true,
@@ -834,7 +977,18 @@ router.get('/analysis', async (req, res) => {
     const observations    = buildObservations(sleepData, stats, signal_points);
     const correlations    = buildCorrelationBars(sleepData, stats, allLogs);
     const deep_remaining  = Math.max(0, 5 - stats.days_logged);
-    const sleep_score     = computeSleepScore(stats);
+    // Use shared agent-scores formula (applies maturity factor) for cross-screen consistency
+    const sleep_score = _computeSleepScore({
+      avg_efficiency:    stats.avg_efficiency,
+      avg_duration:      stats.avg_duration,
+      avg_quality:       stats.avg_quality,
+      avg_energy:        stats.avg_energy,
+      avg_latency:       stats.avg_latency,
+      consistency_score: stats.consistency?.score ?? 50,
+      target_hours:      stats.target_hours,
+      sleep_debt:        stats.sleep_debt,
+      days_logged:       stats.days_logged,
+    }) || computeSleepScore(stats);
     const tonight         = buildTonightRecommendation(sleepData, stats);
 
     // AI insight only for all-time range — needs full history and is LLM-cached by total count
@@ -931,9 +1085,9 @@ router.post('/chat', async (req, res) => {
       });
 
     const completion = await openai.chat.completions.create({
-      model:       'gpt-4o',
+      model:       'gpt-4.1',
       temperature:  0.60,
-      max_tokens:   500,
+      max_tokens:   1000,
       messages: [
         { role: 'system', content: systemContext },
         ...history,
@@ -965,17 +1119,30 @@ _mountChatStreamSleep(router, {
   agentName: 'sleep',
   openai, admin, chatsCol,
   rateLimitCheck: _checkChatRateLimit,
-  model: 'gpt-4o', maxTokens: 500, temperature: 0.6,
+  model: 'gpt-4.1', maxTokens: 1000, temperature: 0.6,
   buildPrompt: async (deviceId, message, { proactive_context } = {}) => {
     let systemPrompt = await getCachedContext(deviceId);
     if (proactive_context) {
       systemPrompt += `\n\n[THREAD CONTEXT] User is following up on a proactive message of type: ${proactive_context}. Briefly acknowledge then focus on what they asked.`;
     }
+
+    // ── Cross-agent: fitness context ──────────────────────────────
+    try {
+      const fitnessSnap = await fetchAgentSnapshot(deviceId, 'fitness', 7);
+      if (fitnessSnap.logs && fitnessSnap.logs.length > 0) {
+        const workoutLines = fitnessSnap.logs
+          .map(l => `${l.date || l.date_str || 'unknown'}: ${l.duration_min != null ? l.duration_min + 'min' : 'duration unknown'}`)
+          .join(', ');
+        systemPrompt += `\n\nCROSS-AGENT CONTEXT (last 7 days):\nRecent training: ${workoutLines}\nNote: High training load typically increases sleep pressure but may reduce sleep quality if >60min sessions 3+ days running.`;
+      }
+    } catch (_e) { /* non-fatal — skip cross-agent block */ }
+    // ─────────────────────────────────────────────────────────────
+
     const historySnap = await chatsCol(deviceId).orderBy('created_at', 'desc').limit(16).get();
     const history = historySnap.docs.reverse()
       .filter(d => !d.data().is_proactive)
       .map(d => d.data())
-      .filter(m => m.role === 'assistant' || m.role === 'user')
+      .filter(m => (m.role === 'assistant' || m.role === 'user') && m.content && m.content.trim())
       .map(m => ({ role: m.role, content: m.content }));
     return { systemPrompt, history };
   },
@@ -1136,7 +1303,7 @@ function computeSleepMetrics(logs, setup) {
 }
 
 // ─── Stage 2: LLM generates actions from pre-computed brief ───
-async function generateActions({ profile, setup, recentLogs, recentChat, isFirstGen, recentlySkipped = [] }) {
+async function generateActions({ profile, setup, recentLogs, recentChat, isFirstGen, recentlySkipped = [], crossAgentCtx = '' }) {
   const name       = profile.name           || 'the user';
   const problem    = setup.primary_problem  || 'sleep quality';
   const disruptors = setup.disruptors       || [];
@@ -1194,6 +1361,8 @@ PRE-COMPUTED ANALYSIS (accurate — do not recalculate):
 • What they said in chat recently: ${chatSnippet || 'nothing yet'}`;
   }
 
+  const crossSection = crossAgentCtx ? `\n━━━ CROSS-AGENT CONTEXT ━━━\n${crossAgentCtx}\nNote: Use this to check if cross-agent factors (mood, exercise, hydration) are disrupting sleep — reference in the action's "why" if relevant.\n` : '';
+
   const prompt = `You are a clinical-grade sleep coach AI for ${name} in the Pulse wellness app.
 Generate exactly 3 personalised sleep actions grounded in CBT-I science and this user's actual data.
 
@@ -1205,6 +1374,7 @@ Setup disruptors: ${disruptors.join(', ') || 'not specified'}
 Past attempts: ${pastTried.join(', ') || 'nothing tried yet'}
 ${dataSection}
 ${skipSection}
+${crossSection}
 
 CBT-I CLINICAL PROTOCOL — apply in strict priority:
 
@@ -1257,7 +1427,7 @@ Return ONLY valid JSON array of 3 objects — no markdown, no explanation:
 
   try {
     const completion = await openai.chat.completions.create({
-      model:       'gpt-4o',
+      model:       'gpt-4.1',
       temperature:  0.35,
       max_tokens:   800,
       messages:    [{ role: 'user', content: prompt }],
@@ -1350,7 +1520,7 @@ Hard rules:
 
   try {
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4o', temperature: 0.7, max_tokens: 200,
+      model: 'gpt-4.1', temperature: 0.7, max_tokens: 200,
       messages: [{ role: 'user', content: prompt }],
     });
     // Store msg type for next rotation (fire-and-forget)
@@ -1387,7 +1557,7 @@ ${severity === 'urgent' ? 'Urgency: be direct — this is a real problem affecti
 
   try {
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4o', temperature: 0.55, max_tokens: 200,
+      model: 'gpt-4.1', temperature: 0.55, max_tokens: 200,
       messages: [{ role: 'user', content: prompt }],
     });
     return completion.choices[0].message.content.trim();
@@ -1408,7 +1578,7 @@ Use AFFIRMATION + CHALLENGE format:
 
   try {
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4o', temperature: 0.7, max_tokens: 120,
+      model: 'gpt-4.1', temperature: 0.7, max_tokens: 120,
       messages: [{ role: 'user', content: prompt }],
     });
     return completion.choices[0].message.content.trim();
@@ -1434,7 +1604,7 @@ Rules:
 
   try {
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4o', temperature: 0.6, max_tokens: 80,
+      model: 'gpt-4.1', temperature: 0.6, max_tokens: 80,
       messages: [{ role: 'user', content: prompt }],
     });
     return completion.choices[0].message.content.trim();
@@ -1459,7 +1629,7 @@ Rules:
 
   try {
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4o', temperature: 0.6, max_tokens: 80,
+      model: 'gpt-4.1', temperature: 0.6, max_tokens: 80,
       messages: [{ role: 'user', content: prompt }],
     });
     return completion.choices[0].message.content.trim();
@@ -2103,7 +2273,7 @@ Return ONLY valid JSON, no markdown:
 
   try {
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4o', temperature: 0.5, max_tokens: 280,
+      model: 'gpt-4.1', temperature: 0.5, max_tokens: 280,
       messages: [{ role: 'user', content: prompt }],
     });
     const raw     = completion.choices[0].message.content.trim();

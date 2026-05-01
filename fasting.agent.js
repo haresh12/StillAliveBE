@@ -68,6 +68,8 @@ const actionsCol   = (id) => fastingDoc(id).collection('fasting_actions');
 const { mountActionRoutes, gradeActions: _gradeActionsShared } = require('./lib/actions-engine');
 const { computeFastingCandidates, fastingGraders } = require('./lib/candidates/fasting');
 const { assertNoCrossAgent } = require('./lib/sandbox');
+const { computeFastingScore: _computeFastingScore } = require('./lib/agent-scores');
+const { fetchAgentSnapshot } = require('./lib/cross-agent-context');
 assertNoCrossAgent('fasting', computeFastingCandidates);
 const _v2Hooks = mountActionRoutes(router, {
   agentName: 'fasting',
@@ -76,6 +78,23 @@ const _v2Hooks = mountActionRoutes(router, {
   computeCandidates: computeFastingCandidates,
   graders: fastingGraders,
   openai, admin, db,
+  config: { LOGS_ORDER_FIELD: 'started_at' }, // fasting sessions use started_at, not logged_at
+  crossAgentEnricher: async (deviceId) => {
+    const [sleepSnap, mindSnap] = await Promise.all([
+      fetchAgentSnapshot(deviceId, 'sleep', 1).catch(() => null),
+      fetchAgentSnapshot(deviceId, 'mind', 1).catch(() => null),
+    ]);
+    const parts = [];
+    if (sleepSnap?.logs?.length) {
+      const hrs = sleepSnap.logs[0].actual_hours || 7;
+      if (hrs < 6) parts.push(`Short sleep last night (${hrs}h) → hunger hormones elevated; extended fast may be harder today.`);
+    }
+    if (mindSnap?.logs?.length) {
+      const stress = mindSnap.logs[0].anxiety_level || 0;
+      if (stress >= 4) parts.push(`High stress detected (anxiety ${stress}/5) → emotional hunger risk; plan distraction strategies.`);
+    }
+    return parts.join(' ');
+  },
 });
 function _onFastingLog(deviceId) {
   fastingDoc(deviceId).update({
@@ -697,6 +716,75 @@ router.get('/setup-status', async (req, res) => {
 
 // ================================================================
 // PATCH /setup -- update protocol or schedule without full re-setup
+// ═══════════════════════════════════════════════════════════════
+// GET /chat-prompts  — returns 6 prompts personalised from setup + logs
+// ═══════════════════════════════════════════════════════════════
+router.get('/chat-prompts', async (req, res) => {
+  try {
+    const { deviceId } = req.query;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+
+    const snap  = await fastingDoc(deviceId).get();
+    const data  = snap.exists ? snap.data() : {};
+    const setup = data.setup || {};
+    const protocol  = setup.protocol          || '16:8';
+    const goal      = setup.goal              || 'general_health';
+    const level     = setup.experience_level  || 'beginner';
+    const caffeine  = setup.caffeine_habit    || 'black';
+    const conditions = Array.isArray(setup.conditions) ? setup.conditions : [];
+
+    const hour = new Date().getHours();
+    const isMorning = hour >= 5 && hour < 12;
+    const isEvening = hour >= 18;
+
+    const pool = [];
+
+    if (protocol === 'omad' || protocol === '20:4') {
+      pool.push({ emoji: '⚡', text: `I'm doing ${protocol} — how do I make it sustainable?` });
+      pool.push({ emoji: '🍽️', text: `What should I eat in my ${protocol === 'omad' ? 'one meal' : '4-hour window'} for best results?` });
+    } else if (protocol === '18:6') {
+      pool.push({ emoji: '⏱️', text: "18:6 is tough some days — tips for the last 2 hours?" });
+      pool.push({ emoji: '🍽️', text: "What are the best foods to break my 18:6 fast?" });
+    } else {
+      pool.push({ emoji: '⏱️', text: "I'm doing 16:8 — how do I maximise results?" });
+      pool.push({ emoji: '🍽️', text: "What should I eat to break my fast properly?" });
+    }
+
+    if (goal === 'weight_loss') {
+      pool.push({ emoji: '📉', text: "Is fasting actually helping me lose weight?" });
+    } else if (goal === 'metabolic_health') {
+      pool.push({ emoji: '🧬', text: "How does fasting improve my metabolic health?" });
+    } else if (goal === 'longevity') {
+      pool.push({ emoji: '🌿', text: "What does the science say about fasting and longevity?" });
+    } else {
+      pool.push({ emoji: '💡', text: "What are the main benefits I should expect from fasting?" });
+    }
+
+    if (level === 'beginner') {
+      pool.push({ emoji: '🌱', text: "I'm new to fasting — what should I expect this week?" });
+    } else if (level === 'advanced') {
+      pool.push({ emoji: '🚀', text: "How do I take my fasting practice to the next level?" });
+    }
+
+    if (caffeine === 'none') {
+      pool.push({ emoji: '💧', text: "Caffeine-free fasting — what helps with hunger?" });
+    } else {
+      pool.push({ emoji: '☕', text: "Does my coffee or tea break my fast?" });
+    }
+
+    if (isMorning) pool.push({ emoji: '🌅', text: "Good morning — how do I power through the rest of my fast?" });
+    else if (isEvening) pool.push({ emoji: '🌙', text: "My eating window is closing — any tips for tonight?" });
+
+    pool.push({ emoji: '📊', text: "What does my fasting streak and completion data show?" });
+    pool.push({ emoji: '🔄', text: "How does fasting interact with my sleep and energy?" });
+
+    res.json({ prompts: pool.slice(0, 6) });
+  } catch (err) {
+    console.error('[fasting] /chat-prompts error:', err);
+    res.status(500).json({ error: 'Failed' });
+  }
+});
+
 // ================================================================
 router.patch('/setup', async (req, res) => {
   try {
@@ -864,6 +952,70 @@ router.post('/session/start', async (req, res) => {
   }
 });
 
+async function refreshFastingScore(deviceId) {
+  try {
+    const cutoff7d = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
+
+    const [sessSnap, fastSnap] = await Promise.all([
+      sessionsCol(deviceId).orderBy('started_at', 'desc').limit(60).get(),
+      fastingDoc(deviceId).get(),
+    ]);
+    const setup  = (fastSnap.data() || {}).setup || {};
+    const targetH = setup.target_fast_hours || 16;
+
+    const sessions = sessSnap.docs.map(d => d.data());
+    if (!sessions.length) return;
+
+    const completed  = sessions.filter(s => s.completed);
+    const streak     = fastSnap.data()?.streak || 0;
+    const daysLogged = new Set(sessions.map(s => s.date || '')).size;
+
+    // All-time completion rate
+    const completionRate = sessions.length > 0 ? completed.length / sessions.length : 0;
+
+    // 7-day cohort
+    const sessions7d  = sessions.filter(s => (s.date || '') >= cutoff7d);
+    const completed7d = sessions7d.filter(s => s.completed);
+    const completionRate7d = sessions7d.length > 0 ? completed7d.length / sessions7d.length : completionRate;
+
+    // Average duration (all-time and 7d)
+    const avgHours   = completed.length
+      ? completed.reduce((s, x) => s + (x.actual_hours || 0), 0) / completed.length : 0;
+    const avgHours7d = completed7d.length
+      ? completed7d.reduce((s, x) => s + (x.actual_hours || 0), 0) / completed7d.length : avgHours;
+
+    // Metabolic stage penetration rates (completed sessions with actual_hours)
+    const withHours = completed.filter(s => s.actual_hours > 0);
+    const pctFatBurn  = withHours.length
+      ? withHours.filter(s => s.actual_hours >= 12).length / withHours.length : 0;
+    const pctKetosis  = withHours.length
+      ? withHours.filter(s => s.actual_hours >= 16).length / withHours.length : 0;
+
+    const result = _computeFastingScore({
+      completion_rate:       completionRate,
+      completion_rate_7d:    completionRate7d,
+      streak,
+      avg_hours:             avgHours,
+      avg_hours_7d:          avgHours7d,
+      target_hours:          targetH,
+      pct_reaching_fat_burn: pctFatBurn,
+      pct_reaching_ketosis:  pctKetosis,
+      days_logged:           daysLogged,
+    });
+    if (!result) return;
+
+    await fastingDoc(deviceId).update({
+      current_score:      result.score,
+      score_label:        result.label,
+      score_components:   result.components,
+      score_clinical_flag: result.clinical_flag,
+      score_updated_at:   admin.firestore.FieldValue.serverTimestamp(),
+    });
+  } catch (err) {
+    console.error('[fasting] refreshScore:', err.message);
+  }
+}
+
 // ================================================================
 // POST /session/end -- complete or break fast
 // ================================================================
@@ -965,6 +1117,7 @@ router.post('/session/end', async (req, res) => {
       });
     }
 
+    refreshFastingScore(deviceId).catch(() => {});
     return res.json({
       success:         true,
       completed,
@@ -1336,14 +1489,6 @@ function computeLongestStreak(sessions = []) {
   return longest;
 }
 
-function computeFastingScore(completionRate, streak, avgHours, targetHours) {
-  const completion  = Math.round(clamp(completionRate * 100, 0, 100));
-  const duration    = Math.round(clamp((avgHours / Math.max(targetHours, 1)) * 100, 0, 100));
-  const streakScore = Math.min(100, streak * 5);
-  const score       = Math.round(completion * 0.40 + duration * 0.30 + streakScore * 0.20 + completion * 0.10);
-  const label       = score >= 80 ? 'Elite' : score >= 65 ? 'Strong' : score >= 45 ? 'Building' : 'Early Stage';
-  return { score, label, components: { completion, duration, streak: streakScore } };
-}
 
 function getSessionDateKey(session = {}) {
   return session.date || dateStr(new Date(getMillis(session.started_at)));
@@ -1590,13 +1735,13 @@ router.get('/analysis', async (req, res) => {
     }
     const totalComp = allSessions.filter(s => s.completed).length;
     const STAGE_META = {
-      fed:            { label: 'Fed State',       emoji: '🍽️', color: '#6B7280' },
-      post_absorptive:{ label: 'Post-Absorptive', emoji: '⚡', color: '#F59E0B' },
-      glycogen:       { label: 'Glycogen Burning',emoji: '🔥', color: '#EF4444' },
-      fat_burning:    { label: 'Fat Burning',     emoji: '💪', color: '#F97316' },
-      ketosis_entry:  { label: 'Ketosis Entry',   emoji: '🧬', color: '#A78BFA' },
-      autophagy:      { label: 'Autophagy Active',emoji: '🔬', color: '#60A5FA' },
-      deep_fast:      { label: 'Deep Fast',       emoji: '🌙', color: '#3B82F6' },
+      fed:            { label: 'Fed State',        emoji: '🍽️', color: '#6B7280' },
+      post_absorptive:{ label: 'Post-Absorptive',  emoji: '⚡', color: '#FBBF24' },
+      glycogen:       { label: 'Glycogen Burning', emoji: '🔥', color: '#F97316' },
+      fat_burning:    { label: 'Fat Burning',      emoji: '💪', color: '#EA580C' },
+      ketosis_entry:  { label: 'Ketosis Entry',    emoji: '🧬', color: '#DC2626' },
+      autophagy:      { label: 'Autophagy Active', emoji: '🔬', color: '#B91C1C' },
+      deep_fast:      { label: 'Deep Fast',        emoji: '🌙', color: '#7F1D1D' },
     };
     const stage_breakdown = Object.entries(stageCounts)
       .map(([id, count]) => ({
@@ -1640,8 +1785,28 @@ router.get('/analysis', async (req, res) => {
       observations.push({ title: `Personal best: ${round(bestFastH, 1)}h fast recorded`, body: 'A 20h+ fast reaches deep autophagy territory. That cellular repair event is now in your biological history.', accent: 'purple' });
     }
 
-    // Fasting score
-    const fasting_score = computeFastingScore(completion, streak, avgH, targetHours);
+    // Fasting score — 5-gate algorithm for cross-screen consistency
+    const _fastingDaysLogged = Object.keys(byDate).length;
+    const _cutoff7d = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
+    const _sessions7d   = allSessions.filter(s => (s.date || '') >= _cutoff7d);
+    const _completed7d  = _sessions7d.filter(s => s.completed);
+    const _cr7d  = _sessions7d.length > 0 ? _completed7d.length / _sessions7d.length : completion;
+    const _avgH7 = _completed7d.length
+      ? _completed7d.reduce((s, x) => s + (x.actual_hours || 0), 0) / _completed7d.length : avgH;
+    const _withH = completedSessions.filter(s => s.actual_hours > 0);
+    const _pctFB = _withH.length ? _withH.filter(s => s.actual_hours >= 12).length / _withH.length : 0;
+    const _pctKT = _withH.length ? _withH.filter(s => s.actual_hours >= 16).length / _withH.length : 0;
+    const fasting_score = _computeFastingScore({
+      completion_rate:       completion,
+      completion_rate_7d:    _cr7d,
+      streak,
+      avg_hours:             avgH,
+      avg_hours_7d:          _avgH7,
+      target_hours:          targetHours,
+      pct_reaching_fat_burn: _pctFB,
+      pct_reaching_ketosis:  _pctKT,
+      days_logged:           _fastingDaysLogged,
+    });
 
     // AI insight
     let ai_insight = null, personal_formula = null;
@@ -1767,6 +1932,40 @@ router.get('/analysis', async (req, res) => {
       observations,
       ai_insight,
       personal_formula,
+      ready_for_upgrade: _cr7d >= 0.85 && _avgH7 >= (targetHours - 0.5),
+      avg_hours_7d:      round(_avgH7, 1),
+      completion_rate_7d: Math.round(_cr7d * 100),
+      cross_agent_snapshot: await (async () => {
+        try {
+          const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+          const [sleepRes, waterRes, mindRes] = await Promise.allSettled([
+            userDoc(deviceId).collection('agents').doc('sleep')
+              .collection('sleep_logs').orderBy('date', 'desc').limit(1).get(),
+            (async () => {
+              const wRef = await userDoc(deviceId).collection('agents').doc('water').get();
+              const goalMl = wRef.exists ? (wRef.data()?.setup?.daily_goal_ml || wRef.data()?.setup?.recommended_goal_ml || 2500) : 2500;
+              const wSnap = await userDoc(deviceId).collection('agents').doc('water')
+                .collection('water_logs').where('logged_at', '>=', todayStart).get();
+              const todayMl = wSnap.docs.reduce((s, d) => s + (d.data().effective_ml || 0), 0);
+              return { todayMl, goalMl, pct: Math.min(1, todayMl / Math.max(goalMl, 1)) };
+            })(),
+            userDoc(deviceId).collection('agents').doc('mind')
+              .collection('mind_checkins').orderBy('created_at', 'desc').limit(1).get(),
+          ]);
+          const sleepDoc   = sleepRes.status === 'fulfilled' && !sleepRes.value?.empty ? sleepRes.value.docs[0].data() : null;
+          const waterData  = waterRes.status === 'fulfilled' ? waterRes.value : null;
+          const mindDoc    = mindRes.status === 'fulfilled'  && !mindRes.value?.empty  ? mindRes.value.docs[0].data()  : null;
+          const rawMind    = mindDoc ? (mindDoc.mood_score || mindDoc.current_rating || null) : null;
+          return {
+            sleep_quality:    sleepDoc?.quality_score ?? null,
+            sleep_hrs:        sleepDoc?.total_hours_in_bed ?? sleepDoc?.duration_hours ?? null,
+            water_today_pct:  waterData ? Math.round(waterData.pct * 100) : null,
+            water_today_ml:   waterData?.todayMl ?? null,
+            water_goal_ml:    waterData?.goalMl ?? null,
+            mind_score:       rawMind != null ? Math.min(100, Math.round((rawMind / 4) * 100)) : null,
+          };
+        } catch { return null; }
+      })(),
     });
   } catch (e) {
     console.error('[fasting] analysis:', e);
@@ -2376,6 +2575,7 @@ router.post('/chat', async (req, res) => {
     const history = histSnap.docs
       .map(d => d.data())
       .reverse()
+      .filter(m => m.content && m.content.trim())
       .map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content }));
 
     const messages = [
@@ -2385,7 +2585,7 @@ router.post('/chat', async (req, res) => {
     ];
 
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4o',
+      model: 'gpt-4.1',
       max_tokens: 220,
       temperature: 0.35,
       messages,
@@ -2425,14 +2625,17 @@ _mountChatStreamFasting(router, {
   agentName: 'fasting',
   openai, admin, chatsCol,
   rateLimitCheck: checkChatRate,
-  model: 'gpt-4o', maxTokens: 220, temperature: 0.35,
-  buildPrompt: async (deviceId /* , message, opts */) => {
+  model: 'gpt-4.1', maxTokens: 220, temperature: 0.35,
+  buildPrompt: async (deviceId, message, { proactive_context } = {}) => {
     const context = await getCachedContext(deviceId);
-    const systemPrompt = `CONTEXT:\n${context}\n\nYou are the Pulse Fasting Coach. Tight, precise, max 140 words. Reference exact hours/streak/water/sleep numbers. Sound human, never robotic.`;
+    let systemPrompt = `CONTEXT:\n${context}\n\nYou are the Pulse Fasting Coach. Tight, precise, max 140 words. Reference exact hours/streak/water/sleep numbers. Sound human, never robotic.`;
+    if (proactive_context) {
+      systemPrompt += `\n\n[THREAD CONTEXT] User is following up on a coach message of type: ${proactive_context}. Acknowledge briefly then focus on what they asked.`;
+    }
     const histSnap = await chatsCol(deviceId).orderBy('created_at', 'desc').limit(12).get();
     const history = histSnap.docs
       .map(d => d.data()).reverse()
-      .filter(m => m.role === 'assistant' || m.role === 'user')
+      .filter(m => (m.role === 'assistant' || m.role === 'user') && m.content && m.content.trim())
       .map(m => ({ role: m.role, content: m.content }))
       .slice(-10);
     return { systemPrompt, history };

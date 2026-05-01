@@ -17,6 +17,8 @@ const router = express.Router();
 const admin = require("firebase-admin");
 const { OpenAI } = require("openai");
 const cron = require("node-cron");
+const { fetchAgentSnapshot } = require("./lib/cross-agent-context");
+const { computeFitnessScore: _computeFitnessScore } = require('./lib/agent-scores');
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const db = () => admin.firestore();
@@ -96,6 +98,47 @@ const _v2Hooks = mountActionRoutes(router, {
   computeCandidates: computeFitnessCandidates,
   graders: fitnessGraders,
   openai, admin, db,
+  crossAgentEnricher: async (deviceId) => {
+    const [sleepSnap, mindSnap, nutSnap] = await Promise.all([
+      fetchAgentSnapshot(deviceId, 'sleep', 3).catch(() => null),
+      fetchAgentSnapshot(deviceId, 'mind', 3).catch(() => null),
+      // Read nutrition snapshot for protein-aware coaching
+      (async () => {
+        try {
+          const snap = await admin.firestore()
+            .collection('wellness_users').doc(deviceId)
+            .collection('agents').doc('nutrition').get();
+          return snap.exists ? snap.data().nutrition_snapshot : null;
+        } catch { return null; }
+      })(),
+    ]);
+    const parts = [];
+    if (sleepSnap?.logs?.length) {
+      const avg = (sleepSnap.logs.reduce((s, l) => s + (l.quality || 3), 0) / sleepSnap.logs.length).toFixed(1);
+      const hrs = (sleepSnap.logs.reduce((s, l) => s + (l.actual_hours || 7), 0) / sleepSnap.logs.length).toFixed(1);
+      parts.push(`Sleep last 3 nights: avg quality ${avg}/5, avg ${hrs}h.`);
+      if (parseFloat(avg) < 3) parts.push('Poor sleep → reduce workout intensity, prioritise recovery.');
+    }
+    if (mindSnap?.logs?.length) {
+      const avgMood = (mindSnap.logs.reduce((s, l) => s + (l.mood_score || 2), 0) / mindSnap.logs.length).toFixed(1);
+      parts.push(`Mood last 3 check-ins: avg ${avgMood}/4.`);
+      if (parseFloat(avgMood) < 2) parts.push('Low mood → schedule workout for afternoon; morning movement lifts mood.');
+    }
+    if (nutSnap) {
+      const protToday = nutSnap.protein_today || 0;
+      const protTarget = nutSnap.protein_target || 140;
+      const calDeficit = nutSnap.calorie_deficit || 0;
+      if (protToday < protTarget * 0.6) {
+        parts.push(`NUTRITION ALERT: only ${protToday}g protein logged today vs ${protTarget}g target — muscle protein synthesis will be compromised. Suggest high-protein post-workout meal.`);
+      } else if (nutSnap.protein_hit_today) {
+        parts.push(`Nutrition: protein target hit today (${protToday}g/${protTarget}g) — recovery conditions are good.`);
+      }
+      if (calDeficit < -600) {
+        parts.push(`Large caloric deficit today (${calDeficit} kcal) — performance and recovery may be impaired. Note this when assessing readiness.`);
+      }
+    }
+    return parts.join(' ');
+  },
 });
 function _onFitnessLog(deviceId) {
   fitnessDoc(deviceId).update({
@@ -1396,6 +1439,78 @@ router.get("/setup-status", async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════
+// GET /chat-prompts  — returns 6 prompts personalised from setup + logs
+// ═══════════════════════════════════════════════════════════════
+router.get("/chat-prompts", async (req, res) => {
+  try {
+    const { deviceId } = req.query;
+    if (!deviceId) return res.status(400).json({ error: "deviceId required" });
+
+    const snap  = await fitnessDoc(deviceId).get();
+    const setup = snap.exists ? (snap.data().setup || {}) : {};
+    const goal    = setup.primary_goal    || "general";
+    const level   = setup.training_level  || "beginner";
+    const split   = setup.preferred_split || "";
+    const days    = Array.isArray(setup.training_days) ? setup.training_days : [];
+    const equip   = setup.equipment       || "full_gym";
+
+    const lastSnap = await fitnessDoc(deviceId).collection("fitness_logs").orderBy("logged_at", "desc").limit(1).get();
+    const lastLog  = lastSnap.empty ? null : lastSnap.docs[0].data();
+
+    const hour = new Date().getHours();
+    const isMorning = hour >= 5 && hour < 12;
+
+    const pool = [];
+
+    if (goal === "strength") {
+      pool.push({ emoji: "💪", text: "How can I break through my strength plateau?" });
+      pool.push({ emoji: "📊", text: "Show me my strength progress this month." });
+    } else if (goal === "muscle" || goal === "hypertrophy") {
+      pool.push({ emoji: "🏋️", text: "Am I doing enough volume to build muscle?" });
+      pool.push({ emoji: "😴", text: "How does my recovery affect muscle growth?" });
+    } else if (goal === "weight_loss" || goal === "fat_loss") {
+      pool.push({ emoji: "🔥", text: "What workouts burn the most fat for my level?" });
+      pool.push({ emoji: "📉", text: "Is my training helping with weight loss?" });
+    } else if (goal === "endurance") {
+      pool.push({ emoji: "🏃", text: "How do I build endurance without overtraining?" });
+      pool.push({ emoji: "❤️", text: "What's a good cardio strategy for this week?" });
+    } else {
+      pool.push({ emoji: "🎯", text: "What should my workout focus be this week?" });
+      pool.push({ emoji: "📊", text: "How is my fitness improving over time?" });
+    }
+
+    if (level === "beginner") {
+      pool.push({ emoji: "🌱", text: "As a beginner, how fast should I progress?" });
+    } else if (level === "advanced") {
+      pool.push({ emoji: "🚀", text: "Design an advanced progressive overload plan for me." });
+    } else {
+      pool.push({ emoji: "📈", text: "How do I apply progressive overload to my workouts?" });
+    }
+
+    if (lastLog && lastLog.muscle_groups) {
+      const muscles = Array.isArray(lastLog.muscle_groups) ? lastLog.muscle_groups.join(", ") : lastLog.muscle_groups;
+      pool.unshift({ emoji: "🔄", text: `I just trained ${muscles} — what should I do next?` });
+    } else if (isMorning) {
+      pool.push({ emoji: "🌅", text: "What's the best workout for this morning?" });
+    }
+
+    if (equip === "home" || equip === "minimal") {
+      pool.push({ emoji: "🏠", text: "Give me an effective home workout for today." });
+    } else {
+      pool.push({ emoji: "💡", text: "What gym exercises give the best ROI for my goal?" });
+    }
+
+    pool.push({ emoji: "🔄", text: "How does my sleep and stress affect my performance?" });
+    pool.push({ emoji: "🩹", text: "I'm feeling sore — should I train or rest?" });
+
+    res.json({ prompts: pool.slice(0, 6) });
+  } catch (err) {
+    console.error("[fitness] /chat-prompts error:", err);
+    res.status(500).json({ error: "Failed" });
+  }
+});
+
 // ----------------------------------------------------------------
 // Post-workout debrief (fire-and-forget after /log)
 // ----------------------------------------------------------------
@@ -1546,6 +1661,88 @@ router.post("/setup", async (req, res) => {
   }
 });
 
+// ── refreshFitnessScore — lightweight score cache written after every log ──
+// Non-blocking: callers do refreshFitnessScore(deviceId).catch(() => {})
+async function refreshFitnessScore(deviceId) {
+  const [workoutsSnap, fSnap] = await Promise.all([
+    workoutsCol(deviceId).orderBy('logged_at', 'desc').limit(60).get(),
+    fitnessDoc(deviceId).get(),
+  ]);
+
+  const workouts = workoutsSnap.docs.map(d => d.data());
+  const data     = fSnap.data() || {};
+  const setup    = data.setup   || {};
+
+  const now28     = Date.now() - 28 * 86400000;
+  const now30     = Date.now() - 30 * 86400000;
+  const days_logged = workouts.length;
+
+  // ── (1) Consistency: workouts in last 28 days vs. expected ──
+  const plannedPerWeek = setup.days_per_week || 3;
+  const recentCount    = workouts.filter(w => {
+    const ms = w.logged_at && w.logged_at.toMillis ? w.logged_at.toMillis() : (w.logged_at || 0);
+    return ms >= now28;
+  }).length;
+  const expectedIn28 = plannedPerWeek * 4;
+  const consistency  = Math.min(100, Math.round((recentCount / Math.max(1, expectedIn28)) * 100));
+
+  // ── (2) Volume: linear slope of total_volume_kg over last 4 weeks ──
+  // Split workouts into 4 weekly buckets; slope normalized 0-100
+  const volume = (() => {
+    const weekMs = 7 * 86400000;
+    const buckets = [0, 0, 0, 0]; // index 0 = oldest, 3 = most recent
+    const counts  = [0, 0, 0, 0];
+    const cutoff4w = Date.now() - 4 * weekMs;
+    for (const w of workouts) {
+      const ms = w.logged_at && w.logged_at.toMillis ? w.logged_at.toMillis() : 0;
+      if (ms < cutoff4w) continue;
+      const weekIdx = Math.min(3, Math.floor((Date.now() - ms) / weekMs));
+      const bucket  = 3 - weekIdx; // flip so 0=oldest
+      buckets[bucket] += w.total_volume_kg || 0;
+      counts[bucket]++;
+    }
+    const avgs = buckets.map((v, i) => counts[i] ? v / counts[i] : null);
+    const filled = avgs.filter(v => v !== null);
+    if (filled.length < 2) return 50; // not enough data → neutral
+    const first = filled[0], last = filled[filled.length - 1];
+    // slope: % improvement per period, clamped 0-100
+    // +20% per week = 100, flat = 50, declining = <50
+    const pctChange = first > 0 ? ((last - first) / first) * 100 : 0;
+    return Math.min(100, Math.max(0, Math.round(50 + pctChange * 2.5)));
+  })();
+
+  // ── (3) Progression: PRs in last 30 days (0 PRs=0, 5+ PRs=100) ──
+  const recentPRs = workouts.reduce((sum, w) => {
+    const ms = w.logged_at && w.logged_at.toMillis ? w.logged_at.toMillis() : 0;
+    if (ms < now30) return sum;
+    return sum + ((w.personal_records || []).length);
+  }, 0);
+  const progression = Math.min(100, Math.round((recentPRs / 5) * 100));
+
+  // ── (4) Intensity: avg sets per session (target 15–25 = 100) ──
+  const recentWorkouts = workouts.slice(0, Math.min(workouts.length, 28));
+  const avgSets = recentWorkouts.length
+    ? recentWorkouts.reduce((s, w) => s + (w.total_sets || 0), 0) / recentWorkouts.length
+    : 0;
+  const intensity = (() => {
+    if (avgSets === 0) return 0;
+    if (avgSets >= 15 && avgSets <= 25) return 100;
+    if (avgSets < 15) return Math.round((avgSets / 15) * 100);
+    // above 25 — gentle penalty
+    return Math.max(60, Math.round(100 - (avgSets - 25) * 2));
+  })();
+
+  const result = _computeFitnessScore({ consistency, volume, progression, intensity, days_logged });
+  if (!result) return;
+
+  await fitnessDoc(deviceId).update({
+    current_score:    result.score,
+    score_label:      result.label,
+    score_components: result.components,
+    score_updated_at: admin.firestore.FieldValue.serverTimestamp(),
+  });
+}
+
 // POST /log — log a workout session
 router.post("/log", async (req, res) => {
   const { deviceId, exercises, date } = req.body;
@@ -1556,14 +1753,20 @@ router.post("/log", async (req, res) => {
   try {
     const workoutDate = date || dateStr();
 
-    // Enrich exercises with muscle groups
+    // Enrich exercises with muscle groups + e1RM
     const enriched = exercises.map((ex) => ({
       name: ex.name || "Unknown",
       muscle_group: detectMuscleGroup(ex.name),
-      sets: (ex.sets || []).map((s) => ({
-        reps: parseInt(s.reps, 10) || 0,
-        weight_kg: parseFloat(s.weight_kg) || 0,
-      })),
+      sets: (ex.sets || []).map((s) => {
+        const reps = parseInt(s.reps, 10) || 0;
+        const weight_kg = parseFloat(s.weight_kg) || 0;
+        const rpe = s.rpe != null ? Math.max(1, Math.min(10, parseFloat(s.rpe))) : null;
+        // Epley formula: weight * (1 + 0.0333 * reps)
+        const e1rm = weight_kg > 0 && reps > 0
+          ? Math.round(weight_kg * (1 + 0.0333 * reps) * 10) / 10
+          : null;
+        return { reps, weight_kg, ...(rpe != null ? { rpe } : {}), ...(e1rm != null ? { e1rm } : {}) };
+      }),
     }));
 
     // Compute total volume
@@ -1608,6 +1811,7 @@ router.post("/log", async (req, res) => {
         const data = fSnap.data() || {};
         const count = (data.workout_count_since_last_batch || 0) + 1;
         const shouldGenerate = count >= ACTION_BATCH_SIZE;
+        const setup = data.setup || {};
 
         const bgBatch = [];
 
@@ -1616,10 +1820,26 @@ router.post("/log", async (req, res) => {
           bgBatch.push(workoutRef.update({ personal_records: prs }));
         }
 
-        // Update batch counter
+        // ── Cross-agent fitness snapshot (readable by Home + Insights) ──
+        const muscleGroupsToday = [...new Set(enriched.map(e => e.muscle_group).filter(m => m && m !== 'other'))];
         bgBatch.push(
           fitnessDoc(deviceId).update({
             workout_count_since_last_batch: shouldGenerate ? 0 : count,
+            fitness_snapshot: {
+              last_workout_date: workoutDate,
+              last_workout_sets: totalSets,
+              last_workout_volume_kg: round(totalVolume, 1),
+              last_workout_muscles: muscleGroupsToday,
+              had_pr: prs.length > 0,
+              streak: newStreak,
+              weekly_sets: streakSnap.docs
+                .map(mapDoc)
+                .filter(w => getMillis(w.logged_at) >= Date.now() - 7 * 86400000)
+                .reduce((s, w) => s + (w.total_sets || 0), 0),
+              goal: setup.primary_goal || 'general',
+              training_level: setup.training_level || 'intermediate',
+              snapshot_at: new Date().toISOString(),
+            },
           }),
         );
 
@@ -1697,6 +1917,8 @@ router.post("/log", async (req, res) => {
           total_volume_kg: round(totalVolume, 1),
         }).catch(() => {});
 
+        refreshFitnessScore(deviceId).catch(() => {});
+
       } catch (bgErr) {
         console.error("[fitness] log background:", bgErr);
       }
@@ -1713,11 +1935,22 @@ router.get("/today", async (req, res) => {
   if (!deviceId) return res.status(400).json({ error: "deviceId required" });
   try {
     const today = dateStr();
+    const cutoff29 = new Date();
+    cutoff29.setDate(cutoff29.getDate() - 29);
 
-    // Today's workout — no composite index: fetch by date, sort in memory
-    const todaySnap = await workoutsCol(deviceId)
-      .where("date", "==", today)
-      .get();
+    // Parallel — all Firestore reads fire simultaneously (no sequential round trips)
+    const [todaySnap, calSnap, lastSnap, fDoc, wHistSnap, crossAgentResults] = await Promise.all([
+      workoutsCol(deviceId).where("date", "==", today).get(),
+      workoutsCol(deviceId).where("date", ">=", dateStr(cutoff29)).get(),
+      workoutsCol(deviceId).orderBy("logged_at", "desc").limit(5).get(),
+      fitnessDoc(deviceId).get(),
+      workoutsCol(deviceId).orderBy('logged_at', 'desc').limit(20).get().catch(() => ({ docs: [] })),
+      Promise.allSettled([
+        fetchAgentSnapshot(deviceId, 'sleep',  3).catch(() => null),
+        fetchAgentSnapshot(deviceId, 'water',  1).catch(() => null),
+        fetchAgentSnapshot(deviceId, 'mind',   3).catch(() => null),
+      ]),
+    ]);
     const todayDocs = todaySnap.docs.slice().sort((a, b) => {
       const ta = getMillis(a.data().logged_at);
       const tb = getMillis(b.data().logged_at);
@@ -1737,11 +1970,6 @@ router.get("/today", async (req, res) => {
           })();
 
     // Last 30 days calendar
-    const cutoff = new Date();
-    cutoff.setDate(cutoff.getDate() - 29);
-    const calSnap = await workoutsCol(deviceId)
-      .where("date", ">=", dateStr(cutoff))
-      .get();
     const calDates = {};
     for (const d of calSnap.docs) {
       const w = d.data();
@@ -1772,10 +2000,6 @@ router.get("/today", async (req, res) => {
     ).size;
 
     // Last session (most recent workout before today)
-    const lastSnap = await workoutsCol(deviceId)
-      .orderBy("logged_at", "desc")
-      .limit(5)
-      .get();
     const lastDoc = lastSnap.docs.find((d) => d.data().date !== today);
     const lastSession = lastDoc
       ? (() => {
@@ -1794,7 +2018,6 @@ router.get("/today", async (req, res) => {
       : null;
 
     // Setup for today's plan hint
-    const fDoc = await fitnessDoc(deviceId).get();
     const setup = fDoc.exists ? fDoc.data() : {};
     const todayName = [
       "sunday",
@@ -1809,6 +2032,82 @@ router.get("/today", async (req, res) => {
     const isTrainingDay =
       trainingDays.length === 0 || trainingDays.includes(todayName);
 
+    // ── Readiness Score (40% sleep + 25% hydration + 20% mind + 15% training load) ──
+    // Non-blocking: if cross-agent reads fail, readiness is null (never blocks workout)
+    let readiness_score = null;
+    try {
+      const [sleepSnap, waterSnap, mindSnap] = crossAgentResults;
+      const sleepLogs = sleepSnap.value?.logs || [];
+      const waterLogs = waterSnap.value?.logs || [];
+      const mindLogs  = mindSnap.value?.logs  || [];
+
+      // Sleep component (0-100): avg sleep_quality/5 over last 3 nights
+      // Raw logs use sleep_quality (not quality — that's the compacted alias)
+      const sleepScore = sleepLogs.length
+        ? Math.round((sleepLogs.reduce((s, l) => s + (l.sleep_quality || l.quality || 3), 0) / sleepLogs.length / 5) * 100)
+        : 60; // default moderate
+
+      // Hydration component (0-100): today's water vs goal
+      // Raw water logs are individual drink entries with date_str + amount_ml/effective_ml
+      const waterGoal = waterSnap.value?.setup?.daily_goal_ml || 2500;
+      const todayWaterMl = waterLogs
+        .filter(l => (l.date_str || l.date) === today)
+        .reduce((s, l) => s + (l.amount_ml || l.effective_ml || 0), 0);
+      const hydrationScore = todayWaterMl > 0
+        ? Math.min(100, Math.round((todayWaterMl / waterGoal) * 100))
+        : 50;
+
+      // Mind/stress component (0-100): avg mood_score/4 over last 3 check-ins
+      const mindScore = mindLogs.length
+        ? Math.round((mindLogs.reduce((s, l) => s + (l.mood_score || 2), 0) / mindLogs.length / 4) * 100)
+        : 60;
+
+      // Training load (ATL) component: more recent volume = more fatigue → lower readiness
+      // Use last 7d sets vs 14d sets. High recent load = lower score.
+      const cutoff7d  = Date.now() - 7  * 86400000;
+      const cutoff14d = Date.now() - 14 * 86400000;
+      const sets7d  = calWorkouts.filter(w => getMillis(w.logged_at) >= cutoff7d).reduce((s, w) => s + (w.total_sets || 0), 0);
+      const sets14d = calWorkouts.filter(w => getMillis(w.logged_at) >= cutoff14d && getMillis(w.logged_at) < cutoff7d).reduce((s, w) => s + (w.total_sets || 0), 0);
+      const loadRatio = sets14d > 0 ? sets7d / sets14d : (sets7d > 0 ? 1.2 : 1);
+      // loadRatio > 1.2 = high fatigue → low score; < 0.8 = fresh → high score
+      const loadScore = Math.min(100, Math.max(0, Math.round((1.5 - loadRatio) / 0.7 * 100)));
+
+      readiness_score = {
+        total: Math.round(sleepScore * 0.40 + hydrationScore * 0.25 + mindScore * 0.20 + loadScore * 0.15),
+        components: { sleep: sleepScore, hydration: hydrationScore, mind: mindScore, load: loadScore },
+      };
+    } catch { /* readiness is non-fatal */ }
+
+    // ── Progression suggestions (RPE-based) for top exercises ──
+    let progression_suggestions = null;
+    try {
+      const wHist = wHistSnap.docs.map(mapDoc);
+      const exMap = {};
+      for (const w of wHist) {
+        for (const ex of w.exercises || []) {
+          if (!exMap[ex.name]) exMap[ex.name] = [];
+          exMap[ex.name].push({ date: w.date, sets: ex.sets || [] });
+        }
+      }
+      const suggestions = {};
+      for (const [name, history] of Object.entries(exMap)) {
+        if (history.length < 2) continue;
+        const last2 = history.slice(0, 2);
+        const avgRpe0 = last2[0].sets.reduce((s, st) => s + (st.rpe || 0), 0) / (last2[0].sets.filter(s => s.rpe).length || 1);
+        const avgRpe1 = last2[1].sets.reduce((s, st) => s + (st.rpe || 0), 0) / (last2[1].sets.filter(s => s.rpe).length || 1);
+        const hasBothRpe = last2[0].sets.some(s => s.rpe) && last2[1].sets.some(s => s.rpe);
+        const maxWeight = Math.max(...last2[0].sets.map(s => s.weight_kg || 0));
+        if (!hasBothRpe || !maxWeight) continue;
+        // RPE ≤ 7 twice → progress (+2.5kg); RPE ≥ 9 → hold; 3x increase needed → deload
+        if (avgRpe0 <= 7 && avgRpe1 <= 7) {
+          suggestions[name] = { action: 'increase', amount: 2.5, msg: `+2.5kg — RPE ${Math.round(avgRpe0)}/10, ready to progress` };
+        } else if (avgRpe0 >= 9) {
+          suggestions[name] = { action: 'hold', msg: `Hold — RPE ${Math.round(avgRpe0)}/10, consolidate before adding load` };
+        }
+      }
+      if (Object.keys(suggestions).length > 0) progression_suggestions = suggestions;
+    } catch { /* non-fatal */ }
+
     return res.json({
       today_workout: todayWorkout,
       calendar_days: calendarDays,
@@ -1817,6 +2116,8 @@ router.get("/today", async (req, res) => {
       last_session: lastSession,
       is_training_day: isTrainingDay,
       preferred_split: setup.preferred_split || null,
+      readiness_score,
+      progression_suggestions,
     });
   } catch (e) {
     console.error("[fitness] today:", e);
@@ -2204,25 +2505,26 @@ router.get("/analysis", async (req, res) => {
       return Math.max(40, Math.round(100 - (wkSets - 60) * 1.5));
     })();
 
-    const fitness_score_value = Math.round(
-      consistencyScore * 0.35 + volumeScore * 0.25 + progressionScore * 0.25 + intensityScore * 0.15
-    );
-    const scoreLabel =
-      fitness_score_value >= 85 ? "Elite" :
-      fitness_score_value >= 70 ? "Strong" :
-      fitness_score_value >= 50 ? "Building" :
-      fitness_score_value >= 25 ? "Starting" : "Begin";
-
-    const fitness_score = {
-      score: fitness_score_value,
-      label: scoreLabel,
-      components: {
-        consistency: consistencyScore,
-        volume: volumeScore,
-        progression: progressionScore,
-        intensity: intensityScore,
-      },
+    // Use shared agent-scores formula (applies maturity factor) for cross-screen consistency
+    const fitness_score = _computeFitnessScore({
+      consistency:  consistencyScore,
+      volume:       volumeScore,
+      progression:  progressionScore,
+      intensity:    intensityScore,
+      days_logged:  daysLogged,
+    }) || {
+      score: Math.round(consistencyScore * 0.35 + volumeScore * 0.25 + progressionScore * 0.25 + intensityScore * 0.15),
+      label: 'Building',
+      components: { consistency: consistencyScore, volume: volumeScore, progression: progressionScore, intensity: intensityScore },
     };
+
+    // Cache the comprehensive analysis score (overwrites the log-time estimate)
+    fitnessDoc(deviceId).update({
+      current_score:    fitness_score.score,
+      score_label:      fitness_score.label,
+      score_components: fitness_score.components,
+      score_updated_at: admin.firestore.FieldValue.serverTimestamp(),
+    }).catch(() => {});
 
     // ── Signal Points Volume — one point per CALENDAR DAY in range ──
     // Logged days: { value: sets, completed: true, ...gap-aware metadata }
@@ -2674,7 +2976,7 @@ router.get("/analysis", async (req, res) => {
           .filter((m) => m.sets > 0)
           .map((m) => `${m.muscle}:${m.sets}sets/${m.sessions}sess(${m.weekly_sets}wk,${m.status}${m.delta_pct !== null ? `,${m.delta_pct >= 0 ? "+" : ""}${m.delta_pct}%vs.prior` : ""})`)
           .join(", ");
-        const scoreDetail = `score=${fitness_score_value}/100 (consistency=${consistencyScore}, volume=${volumeScore}, progression=${progressionScore}, intensity=${intensityScore})`;
+        const scoreDetail = `score=${fitness_score.score}/100 (consistency=${consistencyScore}, volume=${volumeScore}, progression=${progressionScore}, intensity=${intensityScore})`;
 
         const enrichedCtx = `${ctx}\n\nRange=${rangeLabel}, ${inRange.length} workouts, ${daysLogged} unique days.\n${scoreDetail}\nGap analysis: ${gapStats}\nMuscle grid: ${muscleSummary || "none"}`;
 
@@ -2732,8 +3034,79 @@ router.get("/analysis", async (req, res) => {
       console.error("[fitness] insight gen:", e);
     }
 
+    // ── ATL/CTL Series (Training Load Model) ────────────────────
+    // CTL = 42-day EMA of daily TSS (Training Stress Score ≈ total_sets).
+    // ATL = 7-day EMA of daily TSS. Form = CTL - ATL.
+    // Borrowed from cycling TrainingPeaks model, applied to strength.
+    const atl_ctl_series = (() => {
+      const allSorted = [...allWorkouts].sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+      if (allSorted.length < 3) return [];
+      // Build daily TSS map
+      const tssMap = {};
+      for (const w of allSorted) {
+        if (!w.date) continue;
+        tssMap[w.date] = (tssMap[w.date] || 0) + (w.total_sets || 0);
+      }
+      // Fill date range from first workout to today
+      const firstDate = allSorted[0].date;
+      const days = [];
+      const cur = new Date(firstDate + 'T12:00:00');
+      const todayD = new Date(); todayD.setHours(0, 0, 0, 0);
+      while (cur <= todayD) {
+        days.push(dateStr(cur));
+        cur.setDate(cur.getDate() + 1);
+      }
+      let ctl = 0, atl = 0;
+      const series = [];
+      const alphaCtl = 2 / (42 + 1);
+      const alphaAtl = 2 / (7 + 1);
+      for (const d of days) {
+        const tss = tssMap[d] || 0;
+        ctl = ctl + alphaCtl * (tss - ctl);
+        atl = atl + alphaAtl * (tss - atl);
+        series.push({ date: d, ctl: Math.round(ctl * 10) / 10, atl: Math.round(atl * 10) / 10, form: Math.round((ctl - atl) * 10) / 10 });
+      }
+      // Return last 60 days of series
+      return series.slice(-60);
+    })();
+
+    // ── Deload Status ────────────────────────────────────────────
+    const deload_status = (() => {
+      const last3 = allWorkouts.slice(0, 3);
+      if (last3.length < 3) return null;
+      const avgSets = last3.reduce((s, w) => s + (w.total_sets || 0), 0) / 3;
+      const over14dSets = allWorkouts.filter(w => {
+        const ms = getMillis(w.logged_at);
+        return ms >= Date.now() - 14 * 86400000 && ms < Date.now() - 7 * 86400000;
+      }).reduce((s, w) => s + (w.total_sets || 0), 0);
+      const over7dSets = allWorkouts.filter(w => getMillis(w.logged_at) >= Date.now() - 7 * 86400000).reduce((s, w) => s + (w.total_sets || 0), 0);
+      const consecutive_heavy = last3.filter(w => (w.total_sets || 0) >= 20).length;
+      const recommended = consecutive_heavy >= 3 || (over7dSets > 0 && over14dSets > 0 && over7dSets / over14dSets > 1.4);
+      return {
+        recommended,
+        reason: recommended
+          ? consecutive_heavy >= 3
+            ? `${consecutive_heavy} consecutive heavy sessions (≥20 sets). Planned deload = supercompensation.`
+            : `Volume up ${Math.round((over7dSets / over14dSets - 1) * 100)}% vs prior week — deload to absorb gains.`
+          : 'Training load balanced — continue current plan.',
+        avg_sets_last3: Math.round(avgSets * 10) / 10,
+      };
+    })();
+
+    // ── Stage (matches determineStage pattern used by all agents) ──
+    const stage = (() => {
+      const n = allWorkouts.length;
+      if (!n)   return 0;
+      if (n < 4)  return 1;
+      if (n < 10) return 2;
+      if (n < 30) return 3;
+      if (n < 60) return 4;
+      return 5;
+    })();
+
     const responseBody = {
       fitness_score,
+      stage,
       stats: {
         total_workouts: inRange.length,
         current_streak: currentStreak,
@@ -2760,6 +3133,8 @@ router.get("/analysis", async (req, res) => {
       next_session,
       personal_formula: formula,
       insight_cached_at: insightCachedAt,
+      atl_ctl_series,
+      deload_status,
       range_meta: (() => {
         // Compute date window text
         const fmtD = (d) => d.toLocaleDateString("en", { month: "short", day: "numeric" });
@@ -3279,12 +3654,27 @@ router.post("/chat", async (req, res) => {
         ? setup.supplements.join(", ")
         : "none";
 
+    // ── Cross-agent: sleep context ────────────────────────────────
+    let sleepCrossContext = "";
+    try {
+      const sleepSnap = await fetchAgentSnapshot(deviceId, 'sleep', 7);
+      if (sleepSnap.logs && sleepSnap.logs.length > 0) {
+        const sleepLines = sleepSnap.logs
+          .map(l => `${l.date || l.date_str || 'unknown'}: ${l.duration_h != null ? l.duration_h + 'h' : (l.total_sleep_hours != null ? l.total_sleep_hours + 'h' : '?h')}, quality ${l.quality != null ? l.quality : (l.sleep_quality != null ? l.sleep_quality : '?')}/5`)
+          .join(' | ');
+        const avgDur = (sleepSnap.logs.reduce((s, l) => s + (l.duration_h || l.total_sleep_hours || 0), 0) / sleepSnap.logs.length).toFixed(1);
+        const avgQ   = (sleepSnap.logs.reduce((s, l) => s + (l.quality || l.sleep_quality || 0), 0) / sleepSnap.logs.length).toFixed(1);
+        sleepCrossContext = `\n\nCROSS-AGENT CONTEXT (last 7 days):\nRecent sleep: ${sleepLines}\nAvg: ${avgDur}h duration, ${avgQ}/5 quality\nNote: <7h sleep = suboptimal recovery. Recommend deload or reduced intensity if <6h for 2+ nights.`;
+      }
+    } catch (_e) { /* non-fatal — skip cross-agent block */ }
+    // ─────────────────────────────────────────────────────────────
+
     const systemPrompt = [
       `You are an expert fitness coach inside a premium app. You have access to this user's complete training history.`,
       `User profile: goal=${setup.primary_goal}, level=${setup.training_level}, split=${splitLabel}, equipment=${setup.equipment}, injuries=${setup.injury_notes || "none"}.`,
       `Training schedule: ${trainingDaysStr}. Gym time: ${setup.gym_time || "07:00"}. Supplements: ${supplements}.`,
       `Baseline lifts: ${baselines}.`,
-      `Context:\n${context}${proactiveHint}`,
+      `Context:\n${context}${proactiveHint}${sleepCrossContext}`,
       `Rules: Be specific and data-driven. Reference exact exercise names, weights, volumes, and dates from their data.`,
       `Use MEV/MAV/MRV landmarks when discussing volume. Reference progressive overload, periodization, deload needs when relevant.`,
       `Keep replies concise (2-4 sentences max, or a numbered list when steps are needed). No generic advice. No filler.`,
@@ -3357,12 +3747,28 @@ _mountChatStreamFitness(router, {
       ? `bench ${setup.baseline_lifts.bench_press || "?"}kg, squat ${setup.baseline_lifts.squat || "?"}kg, deadlift ${setup.baseline_lifts.deadlift || "?"}kg`
       : "not set";
     const supplements = Array.isArray(setup.supplements) && !setup.supplements.includes("none") && setup.supplements.length > 0 ? setup.supplements.join(", ") : "none";
+
+    // ── Cross-agent: sleep context ──────────────────────────────
+    let sleepCrossCtx = "";
+    try {
+      const sleepSnap = await fetchAgentSnapshot(deviceId, 'sleep', 7);
+      if (sleepSnap.logs && sleepSnap.logs.length > 0) {
+        const sleepLines = sleepSnap.logs
+          .map(l => `${l.date || l.date_str || 'unknown'}: ${l.duration_h != null ? l.duration_h + 'h' : (l.total_sleep_hours != null ? l.total_sleep_hours + 'h' : '?h')}, quality ${l.quality != null ? l.quality : (l.sleep_quality != null ? l.sleep_quality : '?')}/5`)
+          .join(' | ');
+        const avgDur = (sleepSnap.logs.reduce((s, l) => s + (l.duration_h || l.total_sleep_hours || 0), 0) / sleepSnap.logs.length).toFixed(1);
+        const avgQ   = (sleepSnap.logs.reduce((s, l) => s + (l.quality || l.sleep_quality || 0), 0) / sleepSnap.logs.length).toFixed(1);
+        sleepCrossCtx = `\n\nCROSS-AGENT CONTEXT (last 7 days):\nRecent sleep: ${sleepLines}\nAvg: ${avgDur}h duration, ${avgQ}/5 quality\nNote: <7h sleep = suboptimal recovery. Recommend deload or reduced intensity if <6h for 2+ nights.`;
+      }
+    } catch (_e) { /* non-fatal — skip cross-agent block */ }
+    // ──────────────────────────────────────────────────────────
+
     const systemPrompt = [
       `You are an expert fitness coach inside a premium app. You have access to this user's complete training history.`,
       `User profile: goal=${setup.primary_goal}, level=${setup.training_level}, split=${splitLabel}, equipment=${setup.equipment}, injuries=${setup.injury_notes || "none"}.`,
       `Training schedule: ${trainingDaysStr}. Gym time: ${setup.gym_time || "07:00"}. Supplements: ${supplements}.`,
       `Baseline lifts: ${baselines}.`,
-      `Context:\n${context}${proactiveHint}`,
+      `Context:\n${context}${proactiveHint}${sleepCrossCtx}`,
       `Rules: Be specific and data-driven. Reference exact exercise names, weights, volumes, and dates from their data.`,
       `Use MEV/MAV/MRV landmarks when discussing volume. Reference progressive overload, periodization, deload needs when relevant.`,
       `Keep replies concise (2-4 sentences max, or a numbered list when steps are needed). No generic advice. No filler.`,

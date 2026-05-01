@@ -60,6 +60,8 @@ const actionsCol = (id) => waterDoc(id).collection('water_actions');
 const { mountActionRoutes, gradeActions: _gradeActionsShared } = require('./lib/actions-engine');
 const { computeWaterCandidates, waterGraders } = require('./lib/candidates/water');
 const { assertNoCrossAgent } = require('./lib/sandbox');
+const { computeWaterScore: _computeWaterScore } = require('./lib/agent-scores');
+const { fetchAgentSnapshot } = require('./lib/cross-agent-context');
 assertNoCrossAgent('water', computeWaterCandidates);
 const _v2Hooks = mountActionRoutes(router, {
   agentName: 'water',
@@ -68,6 +70,16 @@ const _v2Hooks = mountActionRoutes(router, {
   computeCandidates: computeWaterCandidates,
   graders: waterGraders,
   openai, admin, db,
+  crossAgentEnricher: async (deviceId) => {
+    const fitnessSnap = await fetchAgentSnapshot(deviceId, 'fitness', 1).catch(() => null);
+    const parts = [];
+    if (fitnessSnap?.logs?.length) {
+      const w = fitnessSnap.logs[0];
+      const mins = w.duration_min || 0;
+      if (mins >= 30) parts.push(`Workout logged today (${mins} min) → increase hydration goal by ~500ml.`);
+    }
+    return parts.join(' ');
+  },
 });
 function _onWaterLog(deviceId) {
   waterDoc(deviceId).update({
@@ -494,56 +506,47 @@ function computeLongestStreak(byDate, goalForDate) {
 function computeHydrationScore(byDate, goalByDate) {
   const recentKeys = buildDateRangeKeys(7);
 
-  const goalAdherence = Math.round(avg(recentKeys.map(key =>
+  // Gate 1: Hydration Adequacy (35%) — EFSA 2010, Gandy 2015
+  const hydrationAdequacy = Math.round(avg(recentKeys.map(key =>
     clamp(((byDate[key]?.effective_ml || 0) / Math.max(goalByDate[key] || 2500, 1)) * 100, 0, 100)
   )));
 
+  // Gate 2: Consistency (25%) — Lally 2010, Popkin 2010
   const consistency = Math.round(
     (recentKeys.filter(key => (byDate[key]?.effective_ml || 0) >= (goalByDate[key] || 2500) * 0.8).length / recentKeys.length) * 100
   );
 
-  const frontLoad = Math.round(
+  // Gate 3: Chronobiology (25%) — Sawka 2007 ACSM + Shirreffs 2000
+  // 60% weight on morning front-load (highest-leverage window)
+  // 40% weight on late-day taper (ADH rhythm protection)
+  const frontLoadPct = Math.round(
     (recentKeys.filter(key => (byDate[key]?.parts?.morning || 0) >= Math.max(300, (goalByDate[key] || 2500) * 0.22)).length / recentKeys.length) * 100
   );
-
-  const timing = Math.round(
+  const lateTaperPct = Math.round(
     (recentKeys.filter(key => (byDate[key]?.late_ml || 0) <= 250).length / recentKeys.length) * 100
   );
+  const chronobiology = Math.round(frontLoadPct * 0.60 + lateTaperPct * 0.40);
 
+  // Gate 4: Beverage Quality (15%) — Maughan 2016 BHI
   const beverageQuality = Math.round(avg(recentKeys.map(key => {
     const day = byDate[key] || emptyDay();
     if (!day.effective_ml) return 60;
     return clamp((day.water_friendly_ml / day.effective_ml) * 100, 0, 100);
   })));
 
-  const score = Math.min(100, Math.round(
-    goalAdherence   * 0.35 +
-    consistency     * 0.25 +
-    frontLoad       * 0.15 +
-    timing          * 0.15 +
-    beverageQuality * 0.10
-  ));
+  const avg7dMl = Math.round(avg(recentKeys.map(key => byDate[key]?.effective_ml || 0)));
+  const daysLogged = Object.keys(byDate).filter(k => (byDate[k]?.log_count || 0) > 0).length;
 
-  const label = score >= 85
-    ? 'Excellent'
-    : score >= 70
-    ? 'Strong'
-    : score >= 55
-    ? 'Good'
-    : score >= 35
-    ? 'Building'
-    : 'Starting';
-
-  return {
-    score,
-    label,
-    components: {
-      goal_adherence: goalAdherence,
-      consistency,
-      front_load: frontLoad,
-      timing,
-      beverage_quality: beverageQuality,
-    },
+  return _computeWaterScore({
+    hydration_adequacy: hydrationAdequacy,
+    consistency,
+    chronobiology,
+    beverage_quality: beverageQuality,
+    avg_7d_ml: avg7dMl,
+    days_logged: daysLogged,
+  }) || {
+    score: 0, label: 'Starting',
+    components: { hydration_adequacy: hydrationAdequacy, consistency, chronobiology, beverage_quality: beverageQuality },
   };
 }
 
@@ -651,6 +654,71 @@ function buildObservations({ goalMl, avg7d, streak, longestStreak, recentKeys, b
   }
 
   return observations.slice(0, hydrationScore.score >= 70 ? 4 : 3);
+}
+
+function buildPatternInsights({ byDate, rangeKeys, goalByDate, goalMl }) {
+  const insights = [];
+  const DAY_NAMES = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+
+  // Best day of week
+  const dayTotals = [0, 0, 0, 0, 0, 0, 0];
+  const dayCounts = [0, 0, 0, 0, 0, 0, 0];
+  for (const key of rangeKeys) {
+    if (!(byDate[key]?.log_count > 0)) continue;
+    const dow = new Date(`${key}T12:00:00`).getDay();
+    dayTotals[dow] += byDate[key].effective_ml || 0;
+    dayCounts[dow]++;
+  }
+  const dayAvgs = dayTotals.map((t, i) => (dayCounts[i] >= 2 ? Math.round(t / dayCounts[i]) : 0));
+  const maxAvg = Math.max(...dayAvgs);
+  const bestDow = dayAvgs.indexOf(maxAvg);
+  if (maxAvg > 0 && dayCounts[bestDow] >= 2) {
+    const bestGoal = Math.round(avg(rangeKeys.filter(k => new Date(`${k}T12:00:00`).getDay() === bestDow).map(k => goalByDate[k] || goalMl)));
+    const pct = Math.round((maxAvg / Math.max(bestGoal, 1)) * 100);
+    insights.push({
+      type: 'best_day',
+      title: `${DAY_NAMES[bestDow]}s are your strongest`,
+      body: `You average ${maxAvg} ml on ${DAY_NAMES[bestDow]}s (${pct}% of goal) — highest of any weekday. What's different on those days?`,
+    });
+  }
+
+  // Goal hit rate trend: recent 7 vs previous 7
+  const recent7 = buildDateRangeKeys(7);
+  const all14   = buildDateRangeKeys(14);
+  const prev7   = all14.slice(0, 7);
+  const recentHits = recent7.filter(k => (byDate[k]?.effective_ml || 0) >= (goalByDate[k] || goalMl)).length;
+  const prevHits   = prev7.filter(k => (byDate[k]?.effective_ml || 0) >= (goalByDate[k] || goalMl)).length;
+  if (recentHits > prevHits + 1) {
+    insights.push({
+      type: 'trend_up',
+      title: 'Goal hit rate is climbing',
+      body: `${recentHits}/7 days this week vs ${prevHits}/7 last week. You are building real momentum — protect the streak.`,
+    });
+  } else if (recentHits < prevHits - 1 && prevHits > 0) {
+    insights.push({
+      type: 'trend_down',
+      title: 'Goal hit rate slipped this week',
+      body: `${recentHits}/7 days this week vs ${prevHits}/7 last week. A brief focus reset gets you back on track.`,
+    });
+  }
+
+  // Morning consistency
+  const morningDays = recent7.filter(k => (byDate[k]?.parts?.morning || 0) >= Math.max(300, (goalByDate[k] || goalMl) * 0.22)).length;
+  if (morningDays >= 5) {
+    insights.push({
+      type: 'morning_strong',
+      title: 'Consistent morning front-loader',
+      body: `${morningDays}/7 mornings with strong early hydration. You are building the highest-leverage chronobiology habit — Sawka 2007.`,
+    });
+  } else if (morningDays <= 2) {
+    insights.push({
+      type: 'morning_opportunity',
+      title: 'Morning front-load opportunity',
+      body: `Only ${morningDays}/7 mornings with early hydration. 400 ml within 45 min of waking is the single highest-leverage window for the day.`,
+    });
+  }
+
+  return insights.slice(0, 3);
 }
 
 async function buildCrossAgentInsights(deviceId, byDate, goalMl, goalByDate, rangeKeys, streak) {
@@ -835,7 +903,7 @@ async function generateAnalysisInsight(setup, stats, hydrationScore, crossAgentI
       `Late-cutoff misses (last 7): ${stats.late_cutoff_days}/7`,
       `Goal changes: ${stats.goal_changes || 'none'}`,
       `Hydration score: ${hydrationScore.score} (${hydrationScore.label})`,
-      `Score → goal adherence ${hydrationScore.components?.goal_adherence}%, consistency ${hydrationScore.components?.consistency}%, morning front-load ${hydrationScore.components?.front_load}%, late timing ${hydrationScore.components?.timing}%, beverage quality ${hydrationScore.components?.beverage_quality}%`,
+      `Score → hydration adequacy ${hydrationScore.components?.hydration_adequacy}%, consistency ${hydrationScore.components?.consistency}%, chronobiology ${hydrationScore.components?.chronobiology}%, beverage quality ${hydrationScore.components?.beverage_quality}%`,
       `Day-part intake: ${dayPartSummary}`,
       `Beverage mix: ${beverageSummary}`,
       `Setup: ${setup.weight_kg || '?'}kg, ${setup.activity_level || 'moderate'} activity, ${setup.climate || 'mild'} climate`,
@@ -1331,6 +1399,64 @@ router.get('/setup-status', async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════
+// GET /chat-prompts  — returns 6 prompts personalised from setup + logs
+// ═══════════════════════════════════════════════════════════════
+router.get('/chat-prompts', async (req, res) => {
+  try {
+    const { deviceId } = req.query;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+
+    const snap  = await waterDoc(deviceId).get();
+    const data  = snap.exists ? snap.data() : {};
+    const setup = data.setup || {};
+    const activity = setup.activity_level || 'moderate';
+    const climate  = setup.climate        || 'mild';
+    const weight   = setup.weight_kg      || 70;
+    const goalMl   = setup.daily_goal_ml  || setup.recommended_goal_ml || 2500;
+    const goalL    = (goalMl / 1000).toFixed(1);
+
+    const hour = new Date().getHours();
+    const isMorning = hour >= 5 && hour < 12;
+    const isAfternoon = hour >= 12 && hour < 17;
+
+    const pool = [];
+
+    if (activity === 'athlete' || activity === 'active') {
+      pool.push({ emoji: '🏃', text: "How much extra water do I need on workout days?" });
+      pool.push({ emoji: '⚡', text: "Best electrolyte strategy for my training level?" });
+    } else if (activity === 'sedentary') {
+      pool.push({ emoji: '💧', text: `I sit most of the day — how do I hit my ${goalL}L goal?` });
+      pool.push({ emoji: '⏰', text: "Set me a hydration schedule for a desk job." });
+    } else {
+      pool.push({ emoji: '💧', text: `What's the best way to hit ${goalL}L today?` });
+      pool.push({ emoji: '⏰', text: "Help me build a hydration habit for the day." });
+    }
+
+    if (climate === 'hot' || climate === 'tropical') {
+      pool.push({ emoji: '🌡️', text: "Hot weather — how much more should I drink?" });
+    } else if (climate === 'cold') {
+      pool.push({ emoji: '❄️', text: "Why is hydration important even in cold weather?" });
+    }
+
+    if (isMorning) {
+      pool.push({ emoji: '🌅', text: "What's the best way to start the day hydrated?" });
+    } else if (isAfternoon) {
+      pool.push({ emoji: '☀️', text: "Afternoon slump — is dehydration causing it?" });
+    }
+
+    pool.push({ emoji: '📊', text: "What does my water intake trend look like?" });
+    pool.push({ emoji: '🧠', text: "How does dehydration affect my mood and focus?" });
+    pool.push({ emoji: '💡', text: "What are signs I'm not drinking enough?" });
+    pool.push({ emoji: '🏋️', text: "How does hydration affect my workout performance?" });
+
+    res.json({ prompts: pool.slice(0, 6) });
+  } catch (err) {
+    console.error('[water] /chat-prompts error:', err);
+    res.status(500).json({ error: 'Failed' });
+  }
+});
+
 // ─── POST /goal ───────────────────────────────────────────────
 router.post('/goal', async (req, res) => {
   try {
@@ -1392,6 +1518,63 @@ router.post('/goal', async (req, res) => {
   }
 });
 
+async function refreshWaterScore(deviceId) {
+  try {
+    const [logsSnap, waterSnap] = await Promise.all([
+      logsCol(deviceId).orderBy('logged_at', 'desc').limit(70).get(),
+      waterDoc(deviceId).get(),
+    ]);
+    const setup = (waterSnap.data() || {}).setup || {};
+    const goalMl = setup.daily_goal_ml || 2500;
+
+    // Group by date
+    const byDate = {};
+    logsSnap.docs.forEach(doc => {
+      const data = doc.data();
+      const ds = data.date || data.date_str;
+      if (!ds) return;
+      if (!byDate[ds]) byDate[ds] = { ml: 0, morningMl: 0, lateMl: 0, total: 0 };
+      const effectiveMl = data.effective_ml || data.ml || 0;
+      byDate[ds].ml    += effectiveMl;
+      byDate[ds].total += effectiveMl;
+      const h = data.hour || (data.logged_at?.toDate ? data.logged_at.toDate().getHours() : 12);
+      if (h < 12) byDate[ds].morningMl += effectiveMl;
+      if (h >= 20) byDate[ds].lateMl    += effectiveMl;
+    });
+
+    const dates = Object.keys(byDate).sort().slice(-7);
+    if (!dates.length) return;
+    const daysLogged = Object.keys(byDate).length;
+    const n = dates.length;
+
+    const hydrationAdequacy = Math.round(dates.reduce((s, d) => s + Math.min(100, (byDate[d].ml / goalMl) * 100), 0) / n);
+    const consistency       = Math.round((dates.filter(d => byDate[d].ml >= goalMl * 0.8).length / n) * 100);
+    const frontLoadPct      = Math.round((dates.filter(d => byDate[d].morningMl >= Math.max(300, goalMl * 0.22)).length / n) * 100);
+    const lateTaperPct      = Math.round((dates.filter(d => byDate[d].lateMl <= 250).length / n) * 100);
+    const chronobiology     = Math.round(frontLoadPct * 0.60 + lateTaperPct * 0.40);
+    const avg7dMl           = Math.round(dates.reduce((s, d) => s + (byDate[d].ml || 0), 0) / n);
+
+    const result = _computeWaterScore({
+      hydration_adequacy: hydrationAdequacy,
+      consistency,
+      chronobiology,
+      beverage_quality: 70, // default; full calc only in analysis
+      avg_7d_ml: avg7dMl,
+      days_logged: daysLogged,
+    });
+    if (!result) return;
+
+    await waterDoc(deviceId).update({
+      current_score:    result.score,
+      score_label:      result.label,
+      score_components: result.components,
+      score_updated_at: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  } catch (err) {
+    console.error('[water] refreshScore:', err.message);
+  }
+}
+
 // ─── POST /log ────────────────────────────────────────────────
 router.post('/log', async (req, res) => {
   try {
@@ -1417,6 +1600,7 @@ router.post('/log', async (req, res) => {
 
     invalidateCtx(deviceId);
     _onWaterLog(deviceId);  // v2 Actions hook
+    refreshWaterScore(deviceId).catch(() => {});
     res.json({ ok: true, id: ref.id, effective_ml: effectiveMl });
   } catch (e) {
     console.error('[water] POST /log:', e);
@@ -1614,6 +1798,27 @@ router.get('/analysis', async (req, res) => {
 
     const crossAgent = await buildCrossAgentInsights(deviceId, byDate, goalMl, goalByDate, rangeKeys, streak);
 
+    // Hourly breakdown for 1D range (Sawka 2007 optimal window markers)
+    let hourlyChart = null;
+    if (range === '1') {
+      const todayKey = dateStr();
+      const todayLogs = logs.filter(l => {
+        const ms = getMillis(l.logged_at);
+        return ms && new Date(ms).toISOString().slice(0, 10) === todayKey;
+      });
+      hourlyChart = Array.from({ length: 24 }, (_, h) => {
+        const hLogs = todayLogs.filter(l => new Date(getMillis(l.logged_at)).getHours() === h);
+        const ml = Math.round(hLogs.reduce((s, l) => s + (l.effective_ml || l.ml || 0), 0));
+        const label = h === 0 ? '12am' : h < 12 ? `${h}am` : h === 12 ? '12pm' : `${h - 12}pm`;
+        const window = (h >= 6 && h < 10) ? 'front_load' :
+                       (h >= 10 && h < 18) ? 'active' :
+                       (h >= 18 && h < 20) ? 'taper' : 'other';
+        return { hour: h, ml, label, window };
+      });
+    }
+
+    const patternInsights = buildPatternInsights({ byDate, rangeKeys, goalByDate, goalMl });
+
     let aiInsight = null;
     let personalFormula = null;
 
@@ -1687,14 +1892,16 @@ router.get('/analysis', async (req, res) => {
         late_cutoff_days: lateCutoffDays,
       },
       hydration_score: hydrationScore,
+      clinical_flag: hydrationScore?.clinical_flag || null,
       day_parts: dayParts,
       beverage_mix: beverageMix,
       observations,
+      pattern_insights: patternInsights,
       ai_insight: aiInsight,
       personal_formula: personalFormula,
       heatmap,
-      chart,
-      cross_agent: crossAgent,
+      chart: hourlyChart || chart,
+      chart_type: hourlyChart ? 'hourly' : 'daily',
       setup: {
         ...setup,
         daily_goal_ml: goalMl,

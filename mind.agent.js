@@ -11,6 +11,8 @@ const router  = express.Router();
 const admin   = require('firebase-admin');
 const { OpenAI } = require('openai');
 const cron    = require('node-cron');
+const { fetchAgentSnapshot } = require('./lib/cross-agent-context');
+const { computeMindScore: _computeMindScore } = require('./lib/agent-scores');
 
 const openai  = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const db      = () => admin.firestore();
@@ -224,6 +226,130 @@ router.get('/setup-status', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
+// GET /chat-prompts  — returns 6 prompts personalised from setup + logs
+// ═══════════════════════════════════════════════════════════════
+router.get('/chat-prompts', async (req, res) => {
+  try {
+    const { deviceId } = req.query;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+
+    const snap = await mindDoc(deviceId).get();
+    const setup = snap.exists ? snap.data() : {};
+    const challenge = setup.primary_challenge || '';
+    const worstTime = setup.worst_time || '';
+    const triggers  = Array.isArray(setup.triggers) ? setup.triggers : [];
+
+    // Fetch last checkin for mood/stress context
+    const lastSnap = await checkinsCol(deviceId).orderBy('logged_at', 'desc').limit(1).get();
+    const lastLog  = lastSnap.empty ? null : lastSnap.docs[0].data();
+
+    const hour = new Date().getHours();
+    const isMorning = hour >= 5 && hour < 12;
+    const isEvening = hour >= 17;
+
+    const pool = [];
+
+    // Challenge-specific prompts
+    if (challenge === 'anxiety') {
+      pool.push({ emoji: '😰', text: "I'm feeling anxious right now — help me calm down." });
+      pool.push({ emoji: '🌬️', text: 'Walk me through a breathing exercise.' });
+    } else if (challenge === 'stress') {
+      pool.push({ emoji: '😤', text: "Work stress is overwhelming me today." });
+      pool.push({ emoji: '🧘', text: 'Give me a 2-minute stress release.' });
+    } else if (challenge === 'focus') {
+      pool.push({ emoji: '🎯', text: "I can't focus — what should I try?" });
+      pool.push({ emoji: '⏱️', text: 'Help me design a deep-work block.' });
+    } else if (challenge === 'mood') {
+      pool.push({ emoji: '📉', text: "My mood has been low. What patterns do you see?" });
+      pool.push({ emoji: '✨', text: 'Give me one quick mood boost.' });
+    } else {
+      pool.push({ emoji: '😰', text: "I'm feeling overwhelmed right now." });
+      pool.push({ emoji: '🧘', text: 'Give me a 60-second grounding exercise.' });
+    }
+
+    // Time-specific
+    if (isMorning) {
+      pool.push({ emoji: '🌅', text: 'How can I start my morning with less anxiety?' });
+    } else if (isEvening || worstTime === 'evening' || worstTime === 'night') {
+      pool.push({ emoji: '🌙', text: 'How do I stop the racing thoughts at night?' });
+    } else {
+      pool.push({ emoji: '🌅', text: 'How can I build a calmer morning routine?' });
+    }
+
+    // Trigger-based
+    if (triggers.includes('work')) {
+      pool.push({ emoji: '💼', text: "Work is triggering me again — how do I handle it?" });
+    } else if (triggers.includes('relationships')) {
+      pool.push({ emoji: '💬', text: "A relationship situation is stressing me out." });
+    } else {
+      pool.push({ emoji: '💭', text: 'Help me reframe a negative thought right now.' });
+    }
+
+    // Recent log context
+    if (lastLog && lastLog.anxiety_level >= 4) {
+      pool.unshift({ emoji: '🚨', text: "I logged high anxiety recently — what should I do?" });
+    }
+    if (lastLog && lastLog.mood_score <= 2) {
+      pool.unshift({ emoji: '📊', text: "My mood has been rough — what does my data show?" });
+    }
+
+    // Always include data and pattern prompts
+    pool.push({ emoji: '📊', text: "What's my mood pattern this week?" });
+    pool.push({ emoji: '🔄', text: 'What cross-agent patterns have you noticed about me?' });
+
+    res.json({ prompts: pool.slice(0, 6) });
+  } catch (err) {
+    console.error('[mind] /chat-prompts error:', err);
+    res.status(500).json({ error: 'Failed' });
+  }
+});
+
+async function refreshMindScore(deviceId) {
+  try {
+    const sleepLogsRef = userDoc(deviceId).collection('agents').doc('sleep').collection('sleep_logs');
+    const [checkinsSnap, mindSnap, sleepSnap] = await Promise.all([
+      checkinsCol(deviceId).orderBy('logged_at', 'desc').limit(14).get(),
+      mindDoc(deviceId).get(),
+      sleepLogsRef.orderBy('logged_at', 'desc').limit(3).get(), // cross-agent signal
+    ]);
+    const setup    = mindSnap.data() || {};
+    const checkins = checkinsSnap.docs.map(d => d.data());
+    if (!checkins.length) return;
+
+    const moodScores    = checkins.map(c => c.mood_score || c.mood || 3);
+    const anxietyScores = checkins.map(c => c.anxiety_level || c.anxiety || 2);
+    const checkinDates  = [...new Set(checkins.map(c => c.date_str))];
+    const daysLogged    = checkinDates.length;
+    const streak        = setup.checkin_streak || 0;
+
+    // Cross-agent: recent sleep hours (Palmer 2023 — sleep deprivation → mood impairment)
+    const sleepLogs       = sleepSnap.docs.map(d => d.data());
+    const recentSleepHours = sleepLogs.length
+      ? sleepLogs.reduce((s, l) => s + (l.total_sleep_hours || 0), 0) / sleepLogs.length
+      : null;
+
+    const result = _computeMindScore({
+      mood_scores:         moodScores,
+      anxiety_scores:      anxietyScores,
+      checkin_dates:       checkinDates,
+      days_logged:         daysLogged,
+      streak,
+      recent_sleep_hours:  recentSleepHours,
+    });
+    if (!result) return;
+
+    await mindDoc(deviceId).update({
+      current_score:    result.score,
+      score_label:      result.label,
+      score_components: result.components,
+      score_updated_at: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  } catch (err) {
+    console.error('[mind] refreshScore:', err.message);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
 // POST /checkin
 // Saves a mood log. Triggers action regeneration every 3 checkins.
 // Fires instant proactive message on high anxiety (4-5).
@@ -287,16 +413,29 @@ router.post('/checkin', async (req, res) => {
     // Every 3 check-ins → retire current active actions to 'past', generate fresh batch
     let newActions = null;
     if (sinceLast >= 3) {
-      const [recentCheckinsSnap, recentChatSnap, profileSnap] = await Promise.all([
+      const [recentCheckinsSnap, recentChatSnap, profileSnap, sleepSnap, waterSnap] = await Promise.all([
         checkinsCol(deviceId).orderBy('logged_at', 'desc').limit(10).get(),
         chatsCol(deviceId).orderBy('created_at', 'desc').limit(10).get(),
         userDoc(deviceId).get(),
+        fetchAgentSnapshot(deviceId, 'sleep', 3).catch(() => null),
+        fetchAgentSnapshot(deviceId, 'water', 1).catch(() => null),
       ]);
 
       const recentCheckins  = recentCheckinsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
       const recentChat      = recentChatSnap.docs.reverse().map(d => d.data());
       const profile         = profileSnap.exists ? profileSnap.data() : {};
       const recentlySkipped = (mindData.skip_history || []).slice(-8);
+
+      let crossAgentCtx = '';
+      if (sleepSnap?.logs?.length) {
+        const avg = (sleepSnap.logs.reduce((s, l) => s + (l.quality || 3), 0) / sleepSnap.logs.length).toFixed(1);
+        crossAgentCtx += `Sleep quality last 3 nights: avg ${avg}/5 (${sleepSnap.logs.map(l => l.quality || '?').join(', ')}). `;
+      }
+      if (waterSnap?.logs?.length) {
+        const w = waterSnap.logs[0];
+        const pct = w.goal_ml ? Math.round((w.total_ml / w.goal_ml) * 100) : null;
+        if (pct !== null) crossAgentCtx += `Hydration today: ${pct}% of goal. `;
+      }
 
       newActions = await generateActions({
         profile,
@@ -306,6 +445,7 @@ router.post('/checkin', async (req, res) => {
         recentlySkipped,
         timeOfDay:      hour < 12 ? 'morning' : hour < 18 ? 'afternoon' : 'evening',
         isFirstGen:     false,
+        crossAgentCtx,
       });
 
       // Move current active batch → 'past', then write fresh batch
@@ -329,58 +469,67 @@ router.post('/checkin', async (req, res) => {
       await mindDoc(deviceId).update({ last_action_gen_at_checkin: totalCount });
     }
 
-    // Instant proactive on high anxiety (4-5) — GPT-generated, personal to their data
-    if (anxiety >= 4 && hour >= 8 && hour < 22) {
-      try {
-        const [profileSnap, recentCheckinsSnap] = await Promise.all([
-          userDoc(deviceId).get(),
-          checkinsCol(deviceId).orderBy('logged_at', 'desc').limit(6).get(),
-        ]);
-        const pName     = profileSnap.exists ? (profileSnap.data().name || '') : '';
-        const recent    = recentCheckinsSnap.docs.map(d => d.data());
-        const anxietyMsg = await buildAnxietyProactive(
-          pName, anxiety, emotions || [], triggers || [], note || '', recent, mindDataBefore
-        );
+    // Single proactive gate — max 1 per day. P1: anxiety_spike, P2: streak_milestone
+    if (mindDataBefore.last_proactive_date !== today) {
+      const STREAK_MILESTONES = [3, 7, 14, 30];
+      let proactiveType = null;
+      let proactiveMsg  = null;
+      const extraUpdate = {};
+
+      // P1: High anxiety during waking hours
+      if (anxiety >= 4 && hour >= 8 && hour < 22) {
+        try {
+          const [profileSnap, recentCheckinsSnap] = await Promise.all([
+            userDoc(deviceId).get(),
+            checkinsCol(deviceId).orderBy('logged_at', 'desc').limit(6).get(),
+          ]);
+          const pName  = profileSnap.exists ? (profileSnap.data().name || '') : '';
+          const recent = recentCheckinsSnap.docs.map(d => d.data());
+          proactiveMsg  = await buildAnxietyProactive(
+            pName, anxiety, emotions || [], triggers || [], note || '', recent, mindDataBefore
+          );
+          proactiveType = 'anxiety_spike';
+        } catch (err) {
+          console.error('[mind] anxiety proactive gen error:', err.message);
+        }
+      }
+
+      // P2: Streak milestone (only if anxiety didn't fire)
+      if (!proactiveType) {
+        const checkinDatesSnap = await checkinsCol(deviceId)
+          .orderBy('logged_at', 'desc').limit(40).get();
+        const uniqueDates = [...new Set(checkinDatesSnap.docs.map(d => d.data().date_str))];
+        let streakCount = 0;
+        for (let i = 0; i < uniqueDates.length; i++) {
+          const expected = dateStr(new Date(Date.now() - i * 86400000));
+          if (uniqueDates[i] === expected) streakCount++;
+          else break;
+        }
+        if (STREAK_MILESTONES.includes(streakCount) && mindDataBefore.last_streak_celebrated !== streakCount) {
+          const pSnap = await userDoc(deviceId).get();
+          const pName = pSnap.exists ? (pSnap.data().name || '') : '';
+          proactiveMsg  = await buildStreakProactive(pName, streakCount, mindDataBefore);
+          proactiveType = 'streak_milestone';
+          extraUpdate.last_streak_celebrated = streakCount;
+        }
+      }
+
+      if (proactiveMsg && proactiveType) {
         await chatsCol(deviceId).add({
-          role:                  'assistant',
-          content:               anxietyMsg,
-          is_proactive:          true,
-          proactive_type:        'anxiety_spike',
-          is_read:               false,
-          triggered_by_checkin:  checkinRef.id,
-          created_at:            admin.firestore.FieldValue.serverTimestamp(),
+          role:                 'assistant',
+          content:              proactiveMsg,
+          is_proactive:         true,
+          proactive_type:       proactiveType,
+          is_read:              false,
+          triggered_by_checkin: checkinRef.id,
+          created_at:           admin.firestore.FieldValue.serverTimestamp(),
         });
-      } catch (err) {
-        console.error('[mind] anxiety proactive gen error:', err.message);
+        await mindDoc(deviceId).update({ last_proactive_date: today, ...extraUpdate });
       }
     }
 
-    // Streak milestone proactive (3, 7, 14, 30 days)
-    const STREAK_MILESTONES = [3, 7, 14, 30];
-    const checkinDatesSnap = await checkinsCol(deviceId)
-      .orderBy('logged_at', 'desc').limit(40).get();
-    const uniqueDates = [...new Set(checkinDatesSnap.docs.map(d => d.data().date_str))];
-    // Count consecutive days ending today
-    let streakCount = 0;
-    for (let i = 0; i < uniqueDates.length; i++) {
-      const expected = dateStr(new Date(Date.now() - i * 86400000));
-      if (uniqueDates[i] === expected) streakCount++;
-      else break;
-    }
-    if (STREAK_MILESTONES.includes(streakCount) && mindDataBefore.last_streak_celebrated !== streakCount) {
-      const pSnap  = await userDoc(deviceId).get();
-      const pName  = pSnap.exists ? (pSnap.data().name || '') : '';
-      const streakMsg = await buildStreakProactive(pName, streakCount, mindDataBefore);
-      await chatsCol(deviceId).add({
-        role:           'assistant',
-        content:        streakMsg,
-        is_proactive:   true,
-        proactive_type: 'streak_milestone',
-        is_read:        false,
-        created_at:     admin.firestore.FieldValue.serverTimestamp(),
-      });
-      await mindDoc(deviceId).update({ last_streak_celebrated: streakCount });
-    }
+    // Refresh score cache (non-blocking)
+    refreshMindScore(deviceId).catch(() => {});
 
     res.json({
       success:        true,
@@ -630,7 +779,7 @@ router.post('/intention', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 router.get('/analysis', async (req, res) => {
   try {
-    const { deviceId } = req.query;
+    const { deviceId, days } = req.query;
     if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
 
     const [mindSnap, allCheckinsSnap] = await Promise.all([
@@ -651,25 +800,45 @@ router.get('/analysis', async (req, res) => {
       return res.json({ stage: 0, stats: { total_checkins: 0 }, setup: mindData });
     }
 
-    const stats = computeStats(allCheckins);
-    const stage = determineStage(stats);
-    const recent_signal_points = buildRecentSignalPoints(allCheckins);
-    const recent_timeline = buildRecentTimeline(allCheckins);
-    const observations = buildAnalysisObservations(mindData, stats, recent_signal_points);
-    const correlations = buildCorrelationBars(mindData, stats);
-    const deep_analysis_remaining = Math.max(0, 5 - stats.days_with_logs);
+    // ── Period filter — Today/7d/30d/90d or all-time ─────────────
+    const daysNum = days ? parseInt(days, 10) : null;
+    const periodCheckins = daysNum
+      ? (() => {
+          const cutoff = new Date();
+          cutoff.setDate(cutoff.getDate() - (daysNum - 1));
+          cutoff.setHours(0, 0, 0, 0);
+          const cutoffStr = dateStr(cutoff);
+          return allCheckins.filter(c => {
+            const ds = c.date_str || dateStr(c.logged_at instanceof Date ? c.logged_at : new Date(c.logged_at));
+            return ds >= cutoffStr;
+          });
+        })()
+      : allCheckins;
 
-    // Cache key: only regenerate AI insight when data actually changed
-    const cacheKey  = `${stats.total_checkins}_${stats.days_with_logs}`;
+    // Stage + streak always from ALL-TIME data (progression/habit metrics)
+    const allTimeStats = computeStats(allCheckins);
+    const stage        = determineStage(allTimeStats);
+
+    // Period-specific analytics
+    const stats = periodCheckins.length > 0
+      ? { ...computeStats(periodCheckins), streak: allTimeStats.streak }
+      : { total_checkins: 0, days_with_logs: 0, streak: allTimeStats.streak };
+    const recent_signal_points = buildRecentSignalPoints(periodCheckins);
+    const recent_timeline      = buildRecentTimeline(periodCheckins);
+    const observations         = buildAnalysisObservations(mindData, stats, recent_signal_points);
+    const correlations         = buildCorrelationBars(mindData, stats);
+
+    // AI insight — keyed to all-time data (expensive, don't regenerate per period)
+    const cacheKey  = `${allTimeStats.total_checkins}_${allTimeStats.days_with_logs}`;
     const cached    = mindData.analysis_cache;
-    let ai_insight      = null;
+    let ai_insight       = null;
     let personal_formula = null;
 
     if (cached && cached.key === cacheKey) {
       ai_insight       = cached.insight;
       personal_formula = cached.formula;
-    } else if (stats.total_checkins >= 1) {
-      const result = await generateAnalysisInsight(mindData, stats, stage);
+    } else if (allTimeStats.total_checkins >= 1) {
+      const result = await generateAnalysisInsight(mindData, allTimeStats);
       ai_insight       = result.insight;
       personal_formula = result.formula;
       await mindDoc(deviceId).update({
@@ -682,14 +851,47 @@ router.get('/analysis', async (req, res) => {
       });
     }
 
-    // Today's logs for the timeline strip
-    const today       = dateStr();
-    const todayLogs   = allCheckins
+    // Today's logs (always all-time scoped)
+    const today     = dateStr();
+    const todayLogs = allCheckins
       .filter(c => c.date_str === today)
       .map(c => ({
         ...c,
         logged_at: c.logged_at instanceof Date ? c.logged_at.toISOString() : c.logged_at,
       }));
+
+    // Mind Score — always all-time (rolling health score, not period-scoped)
+    // Fetch sleep cross-agent signal in parallel with existing queries above
+    const sleepLogsRef = userDoc(deviceId).collection('agents').doc('sleep').collection('sleep_logs');
+    let recentSleepHoursForScore = null;
+    try {
+      const recentSleepSnap = await sleepLogsRef.orderBy('logged_at', 'desc').limit(3).get();
+      const recentSleepLogs = recentSleepSnap.docs.map(d => d.data());
+      if (recentSleepLogs.length) {
+        recentSleepHoursForScore = recentSleepLogs.reduce((s, l) => s + (l.total_sleep_hours || 0), 0) / recentSleepLogs.length;
+      }
+    } catch { /* non-fatal: scoring gracefully degrades without sleep data */ }
+
+    const moodScores    = [...allCheckins].reverse().map(c => c.mood_score || c.mood || 3); // oldest-first → reverse for most-recent-first
+    const anxietyScores = [...allCheckins].reverse().map(c => c.anxiety_level || c.anxiety || 2);
+    const checkinDates  = [...new Set(allCheckins.map(c => c.date_str).filter(Boolean))];
+    const mindScore = _computeMindScore({
+      mood_scores:         moodScores,
+      anxiety_scores:      anxietyScores,
+      checkin_dates:       checkinDates,
+      days_logged:         checkinDates.length,
+      streak:              allTimeStats.streak || 0,
+      recent_sleep_hours:  recentSleepHoursForScore,
+    });
+
+    if (mindScore) {
+      mindDoc(deviceId).update({
+        current_score:    mindScore.score,
+        score_label:      mindScore.label,
+        score_components: mindScore.components,
+        score_updated_at: admin.firestore.FieldValue.serverTimestamp(),
+      }).catch(() => {});
+    }
 
     res.json({
       stage,
@@ -700,9 +902,12 @@ router.get('/analysis', async (req, res) => {
       recent_timeline,
       observations,
       correlations,
-      deep_analysis_remaining,
-      today_checkins: todayLogs,
-      setup:          mindData,
+      deep_analysis_remaining: Math.max(0, 5 - allTimeStats.days_with_logs),
+      today_checkins:          todayLogs,
+      setup:                   mindData,
+      mind_score:              mindScore,
+      period_days:             daysNum,
+      all_time_total:          allTimeStats.total_checkins,
     });
   } catch (err) {
     console.error('[mind] /analysis error:', err);
@@ -744,9 +949,9 @@ router.post('/chat', async (req, res) => {
     }));
 
     const completion = await openai.chat.completions.create({
-      model:      'gpt-4o',
+      model:      'gpt-4.1',
       temperature: 0.72,
-      max_tokens:  650,
+      max_tokens:  1000,
       messages: [
         { role: 'system', content: systemContext },
         ...history,
@@ -778,7 +983,7 @@ const { mountChatStream: _mountChatStreamMind } = require('./lib/chat-stream');
 _mountChatStreamMind(router, {
   agentName: 'mind',
   openai, admin, chatsCol,
-  model: 'gpt-4o',
+  model: 'gpt-4.1',
   maxTokens: 650,
   temperature: 0.72,
   buildPrompt: async (deviceId /* , message */) => {
@@ -786,7 +991,7 @@ _mountChatStreamMind(router, {
     const historySnap = await chatsCol(deviceId).orderBy('created_at', 'desc').limit(14).get();
     const history = historySnap.docs.reverse()
       .map(d => d.data())
-      .filter(m => m.role === 'assistant' || m.role === 'user')
+      .filter(m => (m.role === 'assistant' || m.role === 'user') && m.content && m.content.trim())
       .map(m => ({ role: m.role, content: m.content }));
     return { systemPrompt, history };
   },
@@ -879,7 +1084,7 @@ router.post('/chat/read', async (req, res) => {
 // ─── ACTION GENERATOR ─────────────────────────────────────────
 // ═══════════════════════════════════════════════════════════════
 
-async function generateActions({ profile, setup, recentCheckins, recentChat, isFirstGen, isBonus = false, timeOfDay = 'morning', recentlySkipped = [] }) {
+async function generateActions({ profile, setup, recentCheckins, recentChat, isFirstGen, isBonus = false, timeOfDay = 'morning', recentlySkipped = [], crossAgentCtx = '' }) {
   const name      = profile.name              || 'the user';
   const challenge = setup.primary_challenge   || 'mental wellness';
   const triggers  = setup.triggers            || [];
@@ -934,6 +1139,7 @@ ${chatSnippet || 'nothing yet'}`;
     : '';
 
   const count = isBonus ? '2' : '2-3';
+  const crossSection = crossAgentCtx ? `\n━━━ CROSS-AGENT CONTEXT ━━━\n${crossAgentCtx}\nUse this data to make at least one action directly address a cross-agent pattern.\n` : '';
 
   const prompt = `Generate ${count} daily actions for ${name}'s Mind Coach in the Pulse wellness app.
 
@@ -946,6 +1152,7 @@ Worst time of day: ${worstTime}
 
 ${dataSection}
 ${skipSection}
+${crossSection}
 ${timeContext}
 ${bonusContext}
 
@@ -972,7 +1179,7 @@ Return ONLY valid JSON — an array of ${count} objects. No markdown, no explana
 
   try {
     const completion = await openai.chat.completions.create({
-      model:       'gpt-4o',
+      model:       'gpt-4.1',
       temperature:  0.48,
       max_tokens:   700,
       messages:    [{ role: 'user', content: prompt }],
@@ -1200,6 +1407,29 @@ async function buildContext(deviceId) {
     insights.push(`They tend to write notes during high-anxiety moments (${highAnxietyWithNotes.length} times) — these notes reveal what's really going on.`);
   }
 
+  // ── Cross-agent: sleep + water context ────────────────────────
+  let crossAgentBlock = '';
+  try {
+    const [sleepSnap, waterSnap] = await Promise.all([
+      fetchAgentSnapshot(deviceId, 'sleep', 7),
+      fetchAgentSnapshot(deviceId, 'water', 1),
+    ]);
+
+    const sleepPart = (sleepSnap.logs && sleepSnap.logs.length > 0)
+      ? sleepSnap.logs.slice(0, 3)
+          .map(l => `${l.date || l.date_str || 'unknown'}: ${l.duration_h != null ? l.duration_h + 'h' : (l.total_sleep_hours != null ? l.total_sleep_hours + 'h' : '?h')}, quality ${l.quality != null ? l.quality : (l.sleep_quality != null ? l.sleep_quality : '?')}/5`)
+          .join(' | ')
+      : 'No sleep logged';
+
+    const todayWaterMl = waterSnap.logs && waterSnap.logs.length > 0
+      ? waterSnap.logs.reduce((s, l) => s + (l.amount_ml || l.effective_ml || 0), 0)
+      : null;
+    const waterPart = todayWaterMl != null ? `${todayWaterMl}ml logged` : 'Not logged today';
+
+    crossAgentBlock = `\n\n━━━ CROSS-AGENT CONTEXT ━━━\nRecent sleep (last 3 nights): ${sleepPart}\nToday's hydration: ${waterPart}\nNote: Mood tracks sleep with 1-day lag. Dehydration correlates with anxiety elevation.`;
+  } catch (_e) { /* non-fatal — skip cross-agent block */ }
+  // ──────────────────────────────────────────────────────────────
+
   return `You are the Mind Coach in Pulse — a deeply personal AI mental health coach. You are NOT a generic AI assistant. You are not ChatGPT. You have been privately observing ${name} for ${daysLogged > 0 ? `${daysLogged} days` : 'the start of their journey'} across ${totalCount} total check-ins. You know them in ways no generic AI ever could.
 
 Your rule: if you say something a stranger could have said, you have failed. Every sentence must reflect their specific data, their specific words, their specific patterns.
@@ -1243,6 +1473,7 @@ ${bestDay ? `Best day of week: ${bestDay}` : ''}
 
 ━━━ WHAT THE DATA IS TELLING YOU (PRE-COMPUTED INSIGHTS) ━━━
 ${insights.length ? insights.map(i => `• ${i}`).join('\n') : '• Not enough data for pattern insights yet — keep observing.'}
+${crossAgentBlock}
 
 ━━━ THEIR WORDS (recent notes they wrote) ━━━
 ${notesWithContext || '  no personal notes yet'}
@@ -1613,12 +1844,12 @@ function buildEarlyMindInsight(stats) {
 // ─── ANALYSIS INSIGHT GENERATOR ───────────────────────────────
 // ═══════════════════════════════════════════════════════════════
 
-async function generateAnalysisInsight(setup, stats, stage) {
+async function generateAnalysisInsight(setup, stats) {
   const {
-    emotion_freq,
-    trigger_freq,
-    time_breakdown,
-    dow_avgs,
+    emotion_freq     = [],
+    trigger_freq     = [],
+    time_breakdown   = {},
+    dow_avgs         = [],
     week1_avg,
     week2_avg,
     overall_avg,
@@ -1626,68 +1857,73 @@ async function generateAnalysisInsight(setup, stats, stage) {
     anxiety_peak_time,
     streak,
     total_checkins,
+    days_with_logs,
   } = stats;
-
-  if (stage < 2) {
-    return { insight: buildEarlyMindInsight(stats), formula: null };
-  }
 
   const topEmotion = emotion_freq[0]?.name || 'mixed';
   const topTrigger = trigger_freq[0]?.name;
   const worstDay   = dow_avgs[0];
   const bestDay    = dow_avgs[dow_avgs.length - 1];
 
-  const bestTime   = Object.entries(time_breakdown)
-    .filter(([, v]) => v !== null)
-    .sort((a, b) => b[1] - a[1])[0]?.[0] || null;
-  const worstTime  = Object.entries(time_breakdown)
-    .filter(([, v]) => v !== null)
-    .sort((a, b) => a[1] - b[1])[0]?.[0] || null;
+  const bestTime  = Object.entries(time_breakdown).filter(([, v]) => v !== null).sort((a, b) => b[1] - a[1])[0]?.[0] || null;
+  const worstTime = Object.entries(time_breakdown).filter(([, v]) => v !== null).sort((a, b) => a[1] - b[1])[0]?.[0] || null;
 
-  let taskLine = '';
-  if (stage >= 5) {
-    taskLine = `Generate a PERSONAL FORMULA card focused on anxiety regulation first. State which conditions lower anxiety, protect mood, and make this user feel safest in their own head. Then generate a concrete prediction for the coming week from the real patterns.`;
-  } else if (stage >= 4) {
-    const direction = (week2_avg && week1_avg) ? (week2_avg > week1_avg ? 'improving' : week2_avg < week1_avg ? 'declining' : 'stable') : 'early';
-    taskLine = `Week-over-week insight. Week 1 mood average: ${week1_avg}/4. This week mood average: ${week2_avg}/4. Overall anxiety average: ${overall_anxiety}/5. Peak anxiety time: ${anxiety_peak_time || 'unclear'}. Be honest about whether the user is getting calmer or getting more activated.`;
-  } else if (stage >= 3) {
-    const worstDayText = worstDay ? `${worstDay.day} (avg ${worstDay.avg}/4)` : 'unknown';
-    const bestDayText  = bestDay  ? `${bestDay.day} (avg ${bestDay.avg}/4)` : 'unknown';
-    const topTrigText  = topTrigger ? `${topTrigger} appears in ${trigger_freq[0]?.count} check-ins` : 'no clear trigger yet';
-    taskLine = `Generate the first major pattern insight. Center it on anxiety regulation, not generic mood. Their worst day: ${worstDayText}. Best day: ${bestDayText}. Best time: ${bestTime || 'unclear'}. Worst time: ${worstTime || 'unclear'}. Peak anxiety time: ${anxiety_peak_time || 'unclear'}. Top trigger: ${topTrigText}. Make it feel like a therapist-level observation, not an app summary.`;
+  // Setup context for personalization
+  const primaryChallenge = setup.primary_challenge || 'general mental wellness';
+  const setupTriggers    = (setup.triggers || []).join(', ') || null;
+  const setupGoals       = (setup.goals || []).join(', ') || null;
+  const worstSetupTime   = setup.worst_time || null;
+
+  // Task calibrated by check-in volume — not stage
+  let taskLine;
+  if (total_checkins >= 15) {
+    taskLine = `Generate a PERSONAL FORMULA: their conditions for anxiety regulation. Synthesize which time of day they feel safest (best: ${bestTime || 'unclear'}), which triggers to protect against, and what the current mood trajectory means for the coming week. Be direct — "your pattern is: [X] + [Y] → anxiety stays below [N]." Note if week-over-week trend is improving or declining${week1_avg != null && week2_avg != null ? ` (last week avg ${week2_avg}/4, this week avg ${week1_avg}/4)` : ''}.`;
+  } else if (total_checkins >= 8) {
+    const direction = (week1_avg != null && week2_avg != null)
+      ? (week1_avg < week2_avg ? 'improving' : week1_avg > week2_avg ? 'declining' : 'stable')
+      : 'building';
+    taskLine = `Full pattern insight. Week-over-week mood trend: ${direction}${week1_avg != null ? ` (last week ${week2_avg ?? '?'}/4 → this week ${week1_avg ?? '?'}/4)` : ''}. Worst day: ${worstDay ? `${worstDay.day} (${worstDay.avg}/4)` : 'unclear'}. Best day: ${bestDay ? `${bestDay.day} (${bestDay.avg}/4)` : 'unclear'}. Best time of day: ${bestTime || 'unclear'}. Anxiety peak: ${anxiety_peak_time || 'unclear'}. Write a pattern insight that connects the anxiety loop to the specific trigger and timing — name the loop, not just the numbers.`;
+  } else if (total_checkins >= 4) {
+    const topTrigText = topTrigger ? `"${topTrigger}" in ${trigger_freq[0]?.count} of ${total_checkins} check-ins` : 'no clear trigger yet';
+    taskLine = `First real pattern observation — ${total_checkins} check-ins in. Worst day: ${worstDay ? `${worstDay.day} (${worstDay.avg}/4)` : 'unknown'}. Best time: ${bestTime || 'unclear'}. Worst time: ${worstTime || 'unclear'}. Anxiety peak: ${anxiety_peak_time || 'unclear'}. Top trigger: ${topTrigText}. Name the emerging anxiety cycle specifically — connect two dots the user hasn't connected themselves.`;
   } else {
-    taskLine = `Early data observation. ${total_checkins} check-ins logged. Most common emotion: ${topEmotion}${topTrigger ? `. Most common trigger: ${topTrigger}` : ''}. Overall mood average: ${overall_avg}/4. Overall anxiety average: ${overall_anxiety}/5. Write a sharp observation about what is already happening in their anxiety cycle.`;
+    taskLine = `Early signal — only ${total_checkins} check-in${total_checkins === 1 ? '' : 's'}. Most common emotion: ${topEmotion}${topTrigger ? `. First trigger appearing: "${topTrigger}"` : ''}. Mood avg: ${overall_avg != null ? `${overall_avg.toFixed(1)}/4` : '—'}. Anxiety avg: ${overall_anxiety != null ? `${overall_anxiety.toFixed(1)}/5` : '—'}${anxiety_peak_time ? `. Anxiety hitting hardest in the ${anxiety_peak_time}` : ''}. Write 2 sharp sentences: what's already visible in the data, and what pattern to watch for next. Reference their stated challenge if it matches.`;
   }
 
-  const prompt = `Generate an AI insight for the analysis page of a mental health tracking app.
+  const prompt = `You are the Mind Coach insight engine for Pulse — a premium mental health tracking app.
 
-User data:
-- Total check-ins: ${total_checkins}
-- Days logged: ${stats.days_with_logs}
-- Current streak: ${streak} days
-- Overall mood average: ${overall_avg}/4 (scale: 1=low, 2=okay, 3=good, 4=great)
-- Overall anxiety average: ${overall_anxiety}/5
+User profile:
+- Primary challenge: ${primaryChallenge}
+- Triggers they identified at setup: ${setupTriggers || 'not specified'}
+- Goals: ${setupGoals || 'general wellbeing'}
+- Worst time of day (self-reported at setup): ${worstSetupTime || 'varies'}
+
+Check-in data so far:
+- Total check-ins: ${total_checkins} across ${days_with_logs} day${days_with_logs === 1 ? '' : 's'}
+- Current streak: ${streak} day${streak === 1 ? '' : 's'}
+- Mood average: ${overall_avg != null ? `${overall_avg.toFixed(1)}/4` : '—'} (1=low, 2=okay, 3=good, 4=great)
+- Anxiety average: ${overall_anxiety != null ? `${overall_anxiety.toFixed(1)}/5` : '—'}
 - Peak anxiety time: ${anxiety_peak_time || 'unclear'}
 - Top emotions: ${emotion_freq.slice(0, 4).map(e => `${e.name}×${e.count}`).join(', ') || 'none yet'}
 - Top triggers: ${trigger_freq.slice(0, 3).map(t => `${t.name}×${t.count}`).join(', ') || 'none yet'}
-- Time of day: morning ${time_breakdown.morning ?? '—'}/4, afternoon ${time_breakdown.afternoon ?? '—'}/4, evening ${time_breakdown.evening ?? '—'}/4, night ${time_breakdown.night ?? '—'}/4
+- Mood by time of day: ${['morning','afternoon','evening','night'].map(s => `${s} ${time_breakdown[s] != null ? time_breakdown[s].toFixed(1) : '—'}/4`).join(', ')}
 
 TASK: ${taskLine}
 
 RULES:
-- Reference actual numbers and real patterns — never say "you seem to" when you have data
-- Prioritize anxiety regulation, emotional safety, and trigger loops before generic mood language
-- Sound like a sharp therapist-like coach who knows this person, not an app feature
-- 2–4 sentences for the insight
-- Avoid "great job", "keep it up", "amazing", or any empty encouragement
-- Return valid JSON only: { "insight": "...", "formula": "..." }
-  (formula only for stage 5 / personal formula — otherwise set to null)`;
+- Reference real numbers — never say "you seem to" when you have data
+- Cross-reference what they said at setup against what the data actually shows (e.g. setup trigger matches logged trigger → name it)
+- Sound like a sharp, warm therapist-coach who did their homework overnight — not an app notification
+- 2–4 sentences (tighter is better)
+- Zero empty encouragement ("great job", "keep it up", "amazing", "well done")
+- Return valid JSON only: { "insight": "...", "formula": null }
+  (formula field: only include a non-null value if 15+ check-ins and a formula was explicitly generated)`;
 
   try {
     const completion = await openai.chat.completions.create({
-      model:       'gpt-4o',
-      temperature:  0.58,
-      max_tokens:   350,
+      model:       'gpt-4.1',
+      temperature:  0.62,
+      max_tokens:   420,
       messages:    [{ role: 'user', content: prompt }],
     });
 
@@ -1697,7 +1933,7 @@ RULES:
     return { insight: parsed.insight || null, formula: parsed.formula || null };
   } catch (err) {
     console.error('[mind] insight gen error:', err.message);
-    return { insight: null, formula: null };
+    return { insight: buildEarlyMindInsight(stats), formula: null };
   }
 }
 
@@ -1886,7 +2122,7 @@ Write ONE short message (2-3 sentences max). Rules:
 
   try {
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4o', temperature: 0.65, max_tokens: 160,
+      model: 'gpt-4.1', temperature: 0.65, max_tokens: 160,
       messages: [{ role: 'user', content: prompt }],
     });
     return completion.choices[0].message.content.trim();
@@ -1912,7 +2148,7 @@ Write ONE short message (2-3 sentences max). Rules:
 
   try {
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4o', temperature: 0.65, max_tokens: 130,
+      model: 'gpt-4.1', temperature: 0.65, max_tokens: 130,
       messages: [{ role: 'user', content: prompt }],
     });
     return completion.choices[0].message.content.trim();
@@ -1959,7 +2195,7 @@ Return only the message text, no quotes, no explanation.`;
 
   try {
     const completion = await openai.chat.completions.create({
-      model:       'gpt-4o',
+      model:       'gpt-4.1',
       temperature:  0.7,
       max_tokens:   120,
       messages:    [{ role: 'user', content: prompt }],
