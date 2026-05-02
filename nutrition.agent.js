@@ -857,6 +857,36 @@ router.get('/chat-prompts', async (req, res) => {
   }
 });
 
+// ─── Food Quality scoring (0-100, deterministic from macros + name) ──────
+// Higher = nutrient-dense, lower = ultra-processed. No AI call needed.
+function _computeFoodQuality({ calories = 0, protein = 0, carbs = 0, fat = 0, food_name = '' }) {
+  if (calories < 5) return 50;
+  const totalMacroCal = protein * 4 + carbs * 4 + fat * 9;
+  if (totalMacroCal < 5) return 50;
+
+  // 1. Protein density (g/100kcal): >=8 elite, 5-8 great, 3-5 ok, <3 low
+  const pDensity = (protein * 100) / Math.max(calories, 1);
+  let pScore = pDensity >= 8 ? 100 : pDensity >= 5 ? 80 : pDensity >= 3 ? 60 : pDensity >= 1.5 ? 40 : 20;
+
+  // 2. Macro balance — penalize extreme skew (e.g., pure sugar = high carb only)
+  const pCal = protein * 4, cCal = carbs * 4, fCal = fat * 9;
+  const minCal = Math.min(pCal, cCal, fCal);
+  const balanceRatio = minCal / totalMacroCal;
+  let bScore = balanceRatio >= 0.20 ? 100 : balanceRatio >= 0.12 ? 75 : balanceRatio >= 0.05 ? 50 : 30;
+
+  // 3. Name-based heuristic — penalize known junk, reward whole foods
+  const name = (food_name || '').toLowerCase();
+  const junkPatterns = /\b(soda|coke|pepsi|sprite|candy|chip|crisp|donut|doughnut|cookie|cake|pastry|fries|burger king|mcdonald|kfc|cheeto|dorito|pop ?tart|ice cream|gummy|sugar|syrup|sweetened)\b/;
+  const wholePatterns = /\b(salmon|chicken breast|tuna|cod|tilapia|egg|broccoli|spinach|kale|quinoa|oats|oatmeal|lentil|bean|chickpea|tofu|tempeh|sweet potato|brown rice|avocado|berries|blueberr|strawberr|nuts|almond|walnut|greek yogurt|cottage cheese|sardine)\b/;
+  let nScore = 60;
+  if (junkPatterns.test(name)) nScore = 25;
+  if (wholePatterns.test(name)) nScore = 95;
+
+  // Weighted blend: 50% protein density, 25% balance, 25% name signal
+  const score = Math.round(pScore * 0.50 + bScore * 0.25 + nScore * 0.25);
+  return Math.max(0, Math.min(100, score));
+}
+
 async function refreshNutritionScore(deviceId) {
   try {
     const [logsSnap, nutSnap] = await Promise.all([
@@ -887,8 +917,18 @@ async function refreshNutritionScore(deviceId) {
     const daysLogged = dates.length;
     const recent7 = dates.slice(-7);
 
-    const calHit  = recent7.filter(d => { const r = byDate[d].cals / calTarget; return r >= 0.9 && r <= 1.1; }).length;
-    const protHit = recent7.filter(d => byDate[d].protein >= protTarget * 0.9).length;
+    // Partial adherence — score reflects PROGRESS toward target, not just binary hit.
+    // calorie: 0% at 0 logged, 100% at 90-110% of target, decays back to 0 over 130%.
+    const calProgress = recent7.map(d => {
+      const r = byDate[d].cals / calTarget;
+      if (r >= 0.9 && r <= 1.1) return 100;
+      if (r < 0.9)              return Math.round((r / 0.9) * 100);
+      if (r > 1.3)              return 0;
+      return Math.round(100 - ((r - 1.1) / 0.2) * 100);
+    });
+    const protProgress = recent7.map(d =>
+      Math.round(Math.min(byDate[d].protein / (protTarget || 1), 1) * 100)
+    );
     const n = recent7.length || 1;
     const avgP   = recent7.reduce((s, d) => s + byDate[d].protein, 0) / n;
     const avgC   = recent7.reduce((s, d) => s + byDate[d].carbs, 0) / n;
@@ -898,8 +938,8 @@ async function refreshNutritionScore(deviceId) {
       ? Math.min((Math.min(avgP * 4, avgC * 4, avgF * 9) / totalMacroCal) / 0.2, 1) * 100 : 50;
 
     const result = _computeNutritionScore({
-      calorie_adherence: Math.round((calHit / n) * 100),
-      protein_adherence: Math.round((protHit / n) * 100),
+      calorie_adherence: Math.round(calProgress.reduce((a, b) => a + b, 0) / calProgress.length),
+      protein_adherence: Math.round(protProgress.reduce((a, b) => a + b, 0) / protProgress.length),
       streak,
       macro_balance: Math.round(macroBalance),
       days_logged: daysLogged,
@@ -932,19 +972,26 @@ router.post('/log', async (req, res) => {
     if (!deviceId || !food_name) return res.status(400).json({ error: 'deviceId and food_name required' });
 
     const today = logDate || dateStr();
+    const cal = Math.round(calories || 0);
+    const p   = Math.round((protein || 0) * 10) / 10;
+    const c   = Math.round((carbs || 0) * 10) / 10;
+    const f   = Math.round((fat || 0) * 10) / 10;
+    const food_quality_score = _computeFoodQuality({ calories: cal, protein: p, carbs: c, fat: f, food_name });
+
     const ref = await logsCol(deviceId).add({
       food_name,
       emoji:     emoji || '🍽️',
       meal_type: meal_type || 'snack',
-      calories:  Math.round(calories || 0),
-      protein:   Math.round((protein || 0) * 10) / 10,
-      carbs:     Math.round((carbs || 0) * 10) / 10,
-      fat:       Math.round((fat || 0) * 10) / 10,
+      calories:  cal,
+      protein:   p,
+      carbs:     c,
+      fat:       f,
       quantity:  quantity || 100,
       unit:      unit || 'g',
       food_id:   food_id || null,
       source:    source || 'manual',
       date_str:  today,
+      food_quality_score,
       logged_at: admin.firestore.FieldValue.serverTimestamp(),
     });
 
@@ -1043,12 +1090,26 @@ router.get('/logs', async (req, res) => {
     const targetDate = date || dateStr();
     const snap = await logsCol(deviceId).where('date_str', '==', targetDate).get();
 
-    const logs = snap.docs.map(d => ({
-      ...mapSnapDoc(d),
-      logged_at: toIsoString(d.data().logged_at),
-    })).sort((a, b) => (a.logged_at || '') > (b.logged_at || '') ? 1 : -1);
+    const logs = snap.docs.map(d => {
+      const data = d.data();
+      // Backfill food_quality_score for legacy logs missing it
+      const fq = data.food_quality_score != null
+        ? data.food_quality_score
+        : _computeFoodQuality({
+            calories: data.calories || 0,
+            protein:  data.protein  || 0,
+            carbs:    data.carbs    || 0,
+            fat:      data.fat      || 0,
+            food_name: data.food_name || '',
+          });
+      return {
+        ...mapSnapDoc(d),
+        food_quality_score: fq,
+        logged_at: toIsoString(data.logged_at),
+      };
+    }).sort((a, b) => (a.logged_at || '') > (b.logged_at || '') ? 1 : -1);
 
-    // Fetch targets + water
+    // Fetch targets + water + score cache
     const nutSnap = await nutDoc(deviceId).get();
     const nutData = nutSnap.data() || {};
     const waterCups = nutData.water_today === targetDate ? (nutData.water_cups_today || 0) : 0;
@@ -1059,6 +1120,28 @@ router.get('/logs', async (req, res) => {
       carbs:    acc.carbs    + (l.carbs    || 0),
       fat:      acc.fat      + (l.fat      || 0),
     }), { calories: 0, protein: 0, carbs: 0, fat: 0 });
+
+    // ── Hourly breakdown (24-hour calorie distribution for today) ──
+    const hourlyBreakdown = Array(24).fill(0);
+    logs.forEach(l => {
+      if (!l.logged_at) return;
+      const hr = new Date(l.logged_at).getHours();
+      if (hr >= 0 && hr < 24) hourlyBreakdown[hr] += Math.round(l.calories || 0);
+    });
+
+    // ── Food quality average ──
+    const food_quality_avg = logs.length
+      ? Math.round(logs.reduce((s, l) => s + (l.food_quality_score || 0), 0) / logs.length)
+      : null;
+
+    // ── Total distinct days logged (for new-user gating) ──
+    let days_logged = 0;
+    try {
+      const allLogsSnap = await logsCol(deviceId).select('date_str').get();
+      const dateSet = new Set();
+      allLogsSnap.docs.forEach(d => { const ds = d.data().date_str; if (ds) dateSet.add(ds); });
+      days_logged = dateSet.size;
+    } catch { /* non-fatal */ }
 
     res.json({
       logs,
@@ -1077,6 +1160,12 @@ router.get('/logs', async (req, res) => {
         water_target_cups: nutData.water_target_cups || 8,
       },
       streak: nutData.streak || 0,
+      days_logged,
+      hourly_breakdown: hourlyBreakdown,
+      food_quality_avg,
+      nutrition_score:    nutData.current_score    || null,
+      score_label:        nutData.score_label      || null,
+      score_components:   nutData.score_components || null,
     });
   } catch (err) {
     console.error('[nutrition] /logs error:', err);
@@ -1284,15 +1373,24 @@ router.get('/analysis', async (req, res) => {
     // ── Nutrition Score — use shared agent-scores formula for cross-screen consistency ──
     const _scoreDays = Math.min(daysWithLogs, 7);
     const _recentDates = dates.slice(-_scoreDays);
-    const _calHit = _recentDates.filter(d => { const r = byDate[d].cals / calTarget; return r >= 0.9 && r <= 1.1; }).length;
-    const _protHit = _recentDates.filter(d => byDate[d].protein >= protTarget * 0.9).length;
+    // Partial progress (matches refreshNutritionScore)
+    const _calProgress = _recentDates.map(d => {
+      const r = byDate[d].cals / calTarget;
+      if (r >= 0.9 && r <= 1.1) return 100;
+      if (r < 0.9)              return Math.round((r / 0.9) * 100);
+      if (r > 1.3)              return 0;
+      return Math.round(100 - ((r - 1.1) / 0.2) * 100);
+    });
+    const _protProgress = _recentDates.map(d =>
+      Math.round(Math.min(byDate[d].protein / (protTarget || 1), 1) * 100)
+    );
     const totalMacroCal = avgProt * 4 + avgCarbs * 4 + avgFat * 9;
     const _macroBalance = totalMacroCal > 100
       ? Math.min((Math.min(avgProt * 4, avgCarbs * 4, avgFat * 9) / totalMacroCal) / 0.2, 1) * 100
       : 0;
     const nutrition_score = _computeNutritionScore({
-      calorie_adherence: _scoreDays > 0 ? Math.round((_calHit / _scoreDays) * 100) : 0,
-      protein_adherence: _scoreDays > 0 ? Math.round((_protHit / _scoreDays) * 100) : 0,
+      calorie_adherence: _calProgress.length ? Math.round(_calProgress.reduce((a,b)=>a+b,0) / _calProgress.length) : 0,
+      protein_adherence: _protProgress.length ? Math.round(_protProgress.reduce((a,b)=>a+b,0) / _protProgress.length) : 0,
       macro_balance:     Math.round(_macroBalance),
       streak:            nutData.streak || 0,
       days_logged:       daysWithLogs,
@@ -2149,6 +2247,687 @@ Return ONLY valid JSON:
   } catch (err) {
     console.error('[nutrition] /food/parse-text error:', err);
     res.status(500).json({ error: 'Text parsing failed' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// DESCRIBE PIPELINE — Whisper + GPT-4o structured output
+// POST /describe         — audio OR text → parsed items (NOT logged)
+// POST /describe/confirm — log the user-confirmed items
+// ═══════════════════════════════════════════════════════════════
+
+// Strict JSON schema for GPT-4o structured outputs
+const DESCRIBE_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['meal_name', 'items'],
+  properties: {
+    meal_name: { type: 'string', description: 'Short descriptive name for the whole meal (e.g., "Chicken Caesar Salad", "Greek Yogurt Bowl")' },
+    items: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['name', 'emoji', 'quantity', 'unit', 'calories', 'protein', 'carbs', 'fat', 'confidence'],
+        properties: {
+          name:        { type: 'string', description: 'Specific food item name in English' },
+          emoji:       { type: 'string', description: 'Single most relevant food emoji' },
+          quantity:    { type: 'number', description: 'Numeric portion (use grams when possible)' },
+          unit:        { type: 'string', enum: ['g', 'ml', 'piece', 'pieces', 'cup', 'tbsp', 'tsp', 'oz', 'slice', 'slices', 'serving', 'servings'] },
+          calories:    { type: 'number', description: 'Total kcal for THIS quantity (whole number)' },
+          protein:     { type: 'number', description: 'Grams of protein, 1 decimal' },
+          carbs:       { type: 'number', description: 'Grams of carbs, 1 decimal' },
+          fat:         { type: 'number', description: 'Grams of fat, 1 decimal' },
+          confidence:  { type: 'string', enum: ['high', 'medium', 'low'] },
+        },
+      },
+    },
+  },
+};
+
+function _buildDescribeSystemPrompt(setup = {}) {
+  const diet     = setup.dietary_style || 'no_restrictions';
+  const allergies= Array.isArray(setup.allergies) ? setup.allergies.join(', ') : 'none';
+  const goal     = setup.goal || 'maintain';
+
+  return `You are an elite nutritionist parsing natural-language food descriptions into precise structured nutrition data. Accuracy matters — users trust your numbers.
+
+USER CONTEXT:
+- Goal: ${goal}
+- Dietary style: ${diet}
+- Allergies/avoids: ${allergies}
+
+CORE RULES:
+1. STRIP NARRATIVE: ignore "I had", "I ate", "for breakfast", "today", "this morning", "with my friend", etc. These are NOT food.
+2. Identify EVERY distinct food/drink item. "chicken caesar salad" is 4 items: chicken, romaine, parmesan, dressing — not one merged item. "Eggs and toast" is 2 items.
+3. CONNECTOR WORDS = SEPARATE ITEMS: "with", "and", "&", "plus", "+", commas → always split.
+   - "toast with butter" → toast + butter
+   - "coffee with milk and sugar" → coffee + milk + sugar
+   - "chicken and rice" → chicken + rice
+4. Use grams (g) / milliliters (ml) by default. 'piece' / 'slice' / 'cup' only when clearly indicated.
+5. Default to STANDARD ADULT PORTIONS when quantity is unspecified:
+   - chicken breast → 150g | scrambled eggs → 2 large (100g) | fried egg → 1 large (50g)
+   - white rice cooked → 1 cup (158g) | brown rice cooked → 1 cup (195g)
+   - pasta cooked → 1 cup (140g) | salad greens → 80g
+   - pizza slice → 107g | bread slice → 30g | toast slice → 30g
+   - coffee → 240ml | tea → 240ml | smoothie → 480ml
+   - latte (no size) → tall = 354ml | soda (no size) → 1 can = 355ml
+   - beer → 355ml | wine → 150ml | water → 0 kcal
+   - fish/salmon/cod (no weight) → 150g | tuna can → 85g
+   - banana medium → 118g | apple medium → 182g
+6. BRANDED DRINKS — common ones to recognize without ambiguity:
+   - "Coca-Cola" / "Coke" → 1 can (355ml) = 140 kcal C39 | "Diet Coke" → 0 kcal
+   - "Pepsi" → 355ml = 150 kcal | "Sprite" → 355ml = 140 kcal
+   - "Red Bull" → 250ml = 110 kcal | "Monster" → 473ml = 210 kcal
+   - "Gatorade" → 591ml = 140 kcal
+7. INDIAN/REGIONAL FOODS — common defaults:
+   - roti/chapati (1 medium 40g) → 120 kcal P3 C20 F3
+   - paratha (1 medium 80g) → 260 kcal P5 C32 F12
+   - dal (1 cup) → 230 kcal P18 C40 F1
+   - gulab jamun (1 piece 30g) → 140 kcal P2 C20 F6
+   - samosa (1 piece) → 260 kcal P4 C25 F16
+   - idli (1) → 39 kcal P2 C8 F0 | dosa plain → 170 kcal
+   - paneer (100g) → 265 kcal P18 C1 F21
+   - biryani veg (1 cup) → 280 kcal | chicken biryani (1 cup) → 350 kcal
+8. Brand recognition (Starbucks, Chipotle, McDonald's, Subway, Sweetgreen, etc.) → use brand published values.
+9. Caloric math sanity: protein × 4 + carbs × 4 + fat × 9 must be within 10% of calories. Audit before returning.
+10. Confidence rubric:
+    - "high": specific weight, brand, or unambiguous food
+    - "medium": common food, default portion used
+    - "low": vague/composite (e.g. "leftovers", "snack", "drink")
+11. NEVER invent precision: protein 1 decimal, calories whole numbers, never zero unless truly zero (water).
+12. Honor dietary style: vegetarian → no meat unless explicit; vegan → no animal products unless explicit.
+13. Meal name: 2–5 words, Title Case (e.g. "Eggs & Toast", "Chicken Rice Bowl").
+14. Pick the most relevant food emoji (🍳🥚🍞🍚🍗🥗☕🥤🥖🍌🍎🥛🧀🥩🐟🍣🍕🌮🍜🍝).
+
+EXAMPLES:
+
+Input: "two scrambled eggs and a slice of toast with butter for breakfast"
+Output:
+{
+  "meal_name": "Eggs & Toast",
+  "items": [
+    { "name": "Scrambled eggs", "emoji": "🍳", "quantity": 2, "unit": "pieces", "calories": 182, "protein": 12.6, "carbs": 1.4, "fat": 13.8, "confidence": "high" },
+    { "name": "Toast (white bread)", "emoji": "🍞", "quantity": 1, "unit": "slice", "calories": 75, "protein": 2.6, "carbs": 14.0, "fat": 1.0, "confidence": "high" },
+    { "name": "Butter", "emoji": "🧈", "quantity": 7, "unit": "g", "calories": 50, "protein": 0.1, "carbs": 0, "fat": 5.7, "confidence": "medium" }
+  ]
+}
+
+Input: "chicken caesar salad for lunch"
+Output:
+{
+  "meal_name": "Chicken Caesar Salad",
+  "items": [
+    { "name": "Grilled chicken breast", "emoji": "🍗", "quantity": 150, "unit": "g", "calories": 248, "protein": 46.5, "carbs": 0, "fat": 5.4, "confidence": "high" },
+    { "name": "Romaine lettuce", "emoji": "🥬", "quantity": 80, "unit": "g", "calories": 14, "protein": 1.0, "carbs": 2.6, "fat": 0.2, "confidence": "high" },
+    { "name": "Parmesan cheese", "emoji": "🧀", "quantity": 20, "unit": "g", "calories": 79, "protein": 7.1, "carbs": 0.7, "fat": 5.3, "confidence": "high" },
+    { "name": "Caesar dressing", "emoji": "🥗", "quantity": 30, "unit": "g", "calories": 158, "protein": 0.9, "carbs": 1.1, "fat": 16.7, "confidence": "high" },
+    { "name": "Croutons", "emoji": "🥖", "quantity": 15, "unit": "g", "calories": 62, "protein": 1.6, "carbs": 11.5, "fat": 1.0, "confidence": "medium" }
+  ]
+}
+
+Input: "tall starbucks latte with oat milk"
+Output:
+{
+  "meal_name": "Starbucks Oat Milk Latte",
+  "items": [
+    { "name": "Starbucks Tall Latte (oat milk)", "emoji": "☕", "quantity": 354, "unit": "ml", "calories": 180, "protein": 6.0, "carbs": 23.0, "fat": 7.0, "confidence": "high" }
+  ]
+}`;
+}
+
+// ─── Brand grounding DB — top chains where AI hallucinates portions ──
+const _BRAND_DB = {
+  chipotle: 'Chipotle bowl/burrito ≈ 700–1000 kcal. Default bowl: white rice 185g (242 kcal) + black beans 130g (170 kcal) + chicken 113g (180 kcal P32) + salsa + cheese 28g (110 kcal) + lettuce. Tortilla adds 320 kcal.',
+  starbucks: 'Starbucks Tall=354ml, Grande=473ml, Venti=591ml. Latte (Grande, whole milk)≈190 kcal P12 C18 F8. Oat milk latte (Grande)≈200 kcal P5 C30 F7. Caramel macchiato (Grande)≈250 kcal.',
+  mcdonalds: 'Big Mac 540 kcal P25 C46 F28. Quarter Pounder 520 kcal. McChicken 400 kcal. 10pc Nuggets 410 kcal. Medium fries 320 kcal P5 C43 F15. Egg McMuffin 310 kcal P17 C30 F13.',
+  sweetgreen: 'Sweetgreen bowl ≈ 500–650 kcal. Harvest bowl 705 kcal P17. Kale Caesar 570 kcal. Add-ins: chicken +210 kcal P32, salmon +330 kcal.',
+  cava: 'CAVA bowl ≈ 600–900 kcal. Greens+grains base + protein (chicken 280 kcal, lamb 350 kcal) + dips (hummus 70, tzatziki 50) + toppings.',
+  subway: 'Subway 6-inch Italian BMT ≈ 410 kcal. Turkey breast 6-inch 280 kcal P18. Tuna 6-inch 480 kcal. Footlongs are 2× values.',
+  'chick-fil-a': 'Chicken Sandwich 440 kcal P28 C41 F19. Spicy Sandwich 450 kcal. 8pc Nuggets 250 kcal P27. Waffle Fries (medium) 420 kcal.',
+  panera: 'Panera bowls 500–800 kcal. Mediterranean 600 kcal. Soup cup 240–340 kcal. Half sandwich 250–400 kcal.',
+  'taco bell': 'Crunchy taco 170 kcal. Soft taco 180 kcal. Crunchwrap Supreme 530 kcal P16. Burrito Supreme 390 kcal.',
+  kfc: 'Original Recipe drumstick 130 kcal P10 F8. Breast 320 kcal P39. Mashed potatoes (small) 110 kcal. Biscuit 180 kcal.',
+  dominos: 'Domino\'s pizza per slice (large hand-tossed cheese) ≈ 290 kcal P12 C36 F11. Pepperoni slice 320 kcal.',
+  'pizza hut': 'Pizza Hut large pan cheese slice ≈ 300 kcal. Pepperoni 340 kcal. Personal pan pizza 590 kcal whole.',
+  shake_shack: 'ShackBurger 480 kcal P26 F29. Cheese fries 470 kcal. Vanilla shake 700 kcal.',
+  'in-n-out': 'Double-Double 670 kcal P37 F41. Cheeseburger 480 kcal. Fries (regular) 395 kcal.',
+  dunkin: 'Dunkin medium iced coffee w/ cream+sugar ≈ 130 kcal. Glazed donut 240 kcal. Bacon Egg Cheese sandwich 520 kcal.',
+};
+const _BRAND_REGEX = new RegExp(
+  '\\b(' + Object.keys(_BRAND_DB).map(k => k.replace(/[-]/g, '[- ]?')).join('|') + ')\\b',
+  'gi'
+);
+function _detectBrands(text = '') {
+  const hits = new Set();
+  const matches = (text || '').toLowerCase().matchAll(_BRAND_REGEX);
+  for (const m of matches) {
+    const norm = m[0].toLowerCase().replace(/[- ]/g, key => key);
+    const key = Object.keys(_BRAND_DB).find(k => norm.includes(k.replace(/[- ]/g, '')) || k.replace(/[- ]/g, '').includes(norm.replace(/[- ]/g, '')));
+    if (key) hits.add(key);
+  }
+  return Array.from(hits);
+}
+
+// Vague terms that need clarification chips downstream
+const _VAGUE_TERMS = new Set([
+  'snack','snacks','something','food','stuff','things','meal','lunch','dinner','breakfast',
+  'drink','beverage','dessert','leftovers','a bite','bites','some food',
+]);
+function _detectVague(items = []) {
+  const flagged = [];
+  for (const it of items) {
+    const key = (it.name || '').toLowerCase().trim();
+    if (_VAGUE_TERMS.has(key) || it.confidence === 'low') {
+      flagged.push({
+        item_name:  it.name,
+        item_emoji: it.emoji || '🍽️',
+        question:   `What kind of ${it.name?.toLowerCase()}? Be specific for accuracy.`,
+      });
+    }
+  }
+  return flagged;
+}
+
+// Macro-math sanity: kcal should ≈ P*4 + C*4 + F*9 within 15%.
+// Returns { ok, drift_pct, item_drifts[] } so we can decide on a retry.
+function _checkMacroSanity(items = []) {
+  const drifts = [];
+  let totalDrift = 0;
+  for (const it of items) {
+    const expected = (it.protein || 0) * 4 + (it.carbs || 0) * 4 + (it.fat || 0) * 9;
+    const cal = it.calories || 0;
+    if (cal < 5) continue;
+    const drift = Math.abs(cal - expected) / cal;
+    drifts.push({ name: it.name, drift_pct: Math.round(drift * 100) });
+    totalDrift = Math.max(totalDrift, drift);
+  }
+  return { ok: totalDrift < 0.15, drift_pct: Math.round(totalDrift * 100), item_drifts: drifts };
+}
+
+// Concurrency lock — at most one /describe job in-flight per deviceId
+const _describeLocks = new Map();
+function _acquireLock(deviceId) {
+  if (_describeLocks.has(deviceId)) return false;
+  _describeLocks.set(deviceId, Date.now());
+  return true;
+}
+function _releaseLock(deviceId) {
+  _describeLocks.delete(deviceId);
+}
+// Auto-release stale locks (>30s)
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, t] of _describeLocks.entries()) {
+    if (now - t > 30_000) _describeLocks.delete(k);
+  }
+}, 10_000).unref?.();
+
+async function _runDescribePipeline({ deviceId, transcript, onProgress = null }) {
+  const emit = (stage, message, extra = {}) => {
+    if (typeof onProgress === 'function') {
+      try { onProgress({ stage, message, ...extra }); } catch {}
+    }
+  };
+
+  emit('reading', 'Reading your meal…');
+
+  // Load user setup for personalized prompt
+  const nutSnap = await nutDoc(deviceId).get();
+  const setup   = nutSnap.exists ? (nutSnap.data() || {}) : {};
+
+  // Brand pre-flight (free regex, no extra LLM cost)
+  const brandHits = _detectBrands(transcript);
+  let brandGrounding = '';
+  if (brandHits.length) {
+    brandGrounding = '\n\nBrand context: ' +
+      brandHits.map(b => _BRAND_DB[b].split('.')[0]).join(' | ');
+  }
+
+  emit('calculating', 'Calculating macros…');
+
+  const systemPrompt = _buildDescribeSystemPrompt(setup) + brandGrounding;
+
+  // Single LLM call — no sanity-retry loop (was doubling latency).
+  let completion;
+  try {
+    completion = await openai.chat.completions.create({
+      model: MODELS.fast,
+      max_completion_tokens: 450,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user',   content: `Parse: "${transcript}"` },
+      ],
+      response_format: {
+        type: 'json_schema',
+        json_schema: { name: 'meal_parse', strict: true, schema: DESCRIBE_SCHEMA },
+      },
+    });
+  } catch (err) {
+    console.error('[describe] LLM call failed:', err?.message);
+    throw err;
+  }
+  const parsed = safeJSON(completion.choices[0].message.content, { meal_name: '', items: [] });
+  const sanity = _checkMacroSanity(parsed.items || []);
+
+  // Enrich each item with food_quality_score (deterministic)
+  const items = (parsed.items || []).map((it, idx) => ({
+    ...it,
+    _id: `tmp_${Date.now()}_${idx}`,
+    food_quality_score: _computeFoodQuality({
+      calories: it.calories || 0,
+      protein:  it.protein  || 0,
+      carbs:    it.carbs    || 0,
+      fat:      it.fat      || 0,
+      food_name: it.name    || '',
+    }),
+  }));
+
+  // Aggregate totals + average quality
+  const total = items.reduce((acc, it) => ({
+    calories: acc.calories + (it.calories || 0),
+    protein:  acc.protein  + (it.protein  || 0),
+    carbs:    acc.carbs    + (it.carbs    || 0),
+    fat:      acc.fat      + (it.fat      || 0),
+  }), { calories: 0, protein: 0, carbs: 0, fat: 0 });
+
+  const food_quality_avg = items.length
+    ? Math.round(items.reduce((s, it) => s + (it.food_quality_score || 0), 0) / items.length)
+    : null;
+
+  // Aggregate confidence — lowest wins (worst-case)
+  const confOrder = { low: 0, medium: 1, high: 2 };
+  const overallConfidence = items.reduce(
+    (lowest, it) => confOrder[it.confidence] < confOrder[lowest] ? it.confidence : lowest,
+    'high'
+  );
+
+  // Allergen check against user setup
+  const userAllergies = Array.isArray(setup.allergies) ? setup.allergies.map(a => String(a).toLowerCase()) : [];
+  const allergenHits = [];
+  if (userAllergies.length) {
+    for (const it of items) {
+      const name = (it.name || '').toLowerCase();
+      for (const a of userAllergies) {
+        if (a !== 'none' && name.includes(a)) {
+          allergenHits.push({ item_name: it.name, allergen: a });
+        }
+      }
+    }
+  }
+
+  emit('finalizing', 'Almost there…', { item_count: items.length });
+
+  return {
+    meal_name:        parsed.meal_name || 'Meal',
+    transcript,
+    items,
+    total: {
+      calories: Math.round(total.calories),
+      protein:  Math.round(total.protein * 10) / 10,
+      carbs:    Math.round(total.carbs   * 10) / 10,
+      fat:      Math.round(total.fat     * 10) / 10,
+    },
+    food_quality_avg,
+    confidence:      overallConfidence,
+    brand_hits:      brandHits,
+    clarifications:  _detectVague(items),
+    allergen_hits:   allergenHits,
+    sanity_drift_pct: sanity.drift_pct,
+  };
+}
+
+// POST /describe — audio (base64 wav/m4a) OR transcript → parsed meal
+// ═══════════════════════════════════════════════════════════════
+// GET /describe/dg-token — mints a short-lived Deepgram token so
+// the mobile client can connect directly to Deepgram WebSocket
+// without exposing the master API key. Returns 503 if not configured;
+// frontend gracefully falls back to iOS Voice.
+// ═══════════════════════════════════════════════════════════════
+router.get('/describe/dg-token', async (req, res) => {
+  const t0 = Date.now();
+  const key = process.env.DEEPGRAM_API_KEY;
+  console.log('[⏱ DEEPGRAM] /dg-token requested. Key configured:', !!key);
+  if (!key) {
+    console.log('[⏱ DEEPGRAM] ❌ DEEPGRAM_API_KEY not set in .env — returning 503');
+    return res.status(503).json({ error: 'deepgram_not_configured' });
+  }
+  try {
+    const r = await fetch('https://api.deepgram.com/v1/auth/grant', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Token ${key}`,
+        'Content-Type':  'application/json',
+      },
+      body: JSON.stringify({ ttl_seconds: 60 }),
+    });
+    const elapsed = Date.now() - t0;
+    if (!r.ok) {
+      const txt = await r.text();
+      console.error(`[⏱ DEEPGRAM] ❌ token grant FAILED (${elapsed}ms): ${r.status} ${txt}`);
+      return res.status(502).json({ error: 'deepgram_grant_failed', detail: txt });
+    }
+    const data = await r.json();
+    console.log(`[⏱ DEEPGRAM] ✅ token minted in ${elapsed}ms. TTL=${data.expires_in}s`);
+    res.json({
+      access_token: data.access_token,
+      expires_in:   data.expires_in || 60,
+    });
+  } catch (err) {
+    console.error('[⏱ DEEPGRAM] dg-token exception:', err);
+    res.status(500).json({ error: 'dg_token_failed' });
+  }
+});
+
+// ─── /describe/dg-test — proves Deepgram is reachable + measures latency ──
+// Curl from terminal:  curl http://localhost:5001/api/nutrition/describe/dg-test
+router.get('/describe/dg-test', async (req, res) => {
+  const t0 = Date.now();
+  const key = process.env.DEEPGRAM_API_KEY;
+  console.log('[⏱ DEEPGRAM-TEST] Running connectivity test…');
+  if (!key) {
+    return res.status(503).json({
+      ok: false,
+      error: 'DEEPGRAM_API_KEY not in .env',
+      hint: 'Add DEEPGRAM_API_KEY=<your_key> to stillalive-backend/.env and restart server',
+    });
+  }
+  try {
+    // Test 1: token grant latency (auth roundtrip)
+    const tokenT0 = Date.now();
+    const tokenR = await fetch('https://api.deepgram.com/v1/auth/grant', {
+      method: 'POST',
+      headers: { 'Authorization': `Token ${key}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ttl_seconds: 60 }),
+    });
+    const tokenMs = Date.now() - tokenT0;
+    if (!tokenR.ok) {
+      const txt = await tokenR.text();
+      return res.status(502).json({
+        ok: false,
+        error: `Token grant failed: ${tokenR.status}`,
+        detail: txt,
+        elapsed_ms: Date.now() - t0,
+      });
+    }
+    const tokenData = await tokenR.json();
+
+    // Test 2: transcribe a tiny test audio URL to prove the service responds
+    const testAudioUrl = 'https://static.deepgram.com/examples/Bueller-Life-moves-pretty-fast.wav';
+    const transT0 = Date.now();
+    const transR = await fetch(
+      'https://api.deepgram.com/v1/listen?model=nova-3&smart_format=true',
+      {
+        method: 'POST',
+        headers: { 'Authorization': `Token ${key}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: testAudioUrl }),
+      }
+    );
+    const transMs = Date.now() - transT0;
+    if (!transR.ok) {
+      const txt = await transR.text();
+      return res.status(502).json({
+        ok: false,
+        error: `Transcription failed: ${transR.status}`,
+        detail: txt,
+        token_grant_ms: tokenMs,
+        elapsed_ms: Date.now() - t0,
+      });
+    }
+    const transData = await transR.json();
+    const transcript = transData.results?.channels?.[0]?.alternatives?.[0]?.transcript || '(none)';
+    const totalMs = Date.now() - t0;
+
+    console.log(`[⏱ DEEPGRAM-TEST] ✅ token=${tokenMs}ms, transcribe=${transMs}ms, total=${totalMs}ms`);
+    console.log(`[⏱ DEEPGRAM-TEST] Sample audio transcribed: "${transcript}"`);
+
+    res.json({
+      ok: true,
+      message: 'Deepgram is configured and reachable',
+      timings_ms: {
+        token_grant: tokenMs,
+        sample_transcription: transMs,
+        total: totalMs,
+      },
+      sample_audio_url: testAudioUrl,
+      sample_transcription: transcript,
+      tts_token_expires_in: tokenData.expires_in,
+      next_step: 'Frontend can now connect to Deepgram WebSocket using a fresh token.',
+    });
+  } catch (err) {
+    console.error('[⏱ DEEPGRAM-TEST] exception:', err);
+    res.status(500).json({ ok: false, error: String(err?.message || err) });
+  }
+});
+
+// ─── /describe/transcribe — audio → clean transcript only ──
+// Used as Layer 2 of the voice flow: Apple recognizer gives a rough live
+// preview, then we upload the WAV to OpenAI's gpt-4o-transcribe (4.1% WER)
+// for an accurate final transcript. NO food parsing here — that's Layer 3.
+router.post('/describe/transcribe', async (req, res) => {
+  const t0 = Date.now();
+  try {
+    const { audio_base64, audio_mime } = req.body;
+    if (!audio_base64) return res.status(400).json({ error: 'audio_base64 required' });
+
+    const buffer = Buffer.from(audio_base64, 'base64');
+    const ext = (audio_mime || 'audio/wav').split('/').pop().replace('mpeg', 'mp3');
+    const file = await OpenAI.toFile(buffer, `audio.${ext}`);
+    const result = await openai.audio.transcriptions.create({
+      file,
+      model:    'gpt-4o-transcribe',  // 4.1% WER, 22% better than whisper-1, same price
+      language: 'en',
+      response_format: 'json',
+    });
+    const transcript = (result.text || '').trim();
+    if (!transcript) return res.status(400).json({ error: 'No speech detected' });
+
+    res.json({
+      transcript,
+      latency_ms: Date.now() - t0,
+      model: 'gpt-4o-transcribe',
+    });
+  } catch (err) {
+    console.error('[nutrition] /describe/transcribe error:', err);
+    res.status(500).json({ error: err.message || 'Transcription failed' });
+  }
+});
+
+router.post('/describe', async (req, res) => {
+  const { deviceId } = req.body || {};
+  if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+  if (!_acquireLock(deviceId)) {
+    return res.status(429).json({ error: 'analyze_in_progress', message: 'Already analyzing — please wait.' });
+  }
+  try {
+    const { audio_base64, audio_mime, transcript: providedTranscript } = req.body;
+    if (!audio_base64 && !providedTranscript) {
+      return res.status(400).json({ error: 'audio_base64 or transcript required' });
+    }
+
+    // ── Step 1: Get transcript ──
+    let transcript = (providedTranscript || '').trim();
+    if (!transcript && audio_base64) {
+      const buffer = Buffer.from(audio_base64, 'base64');
+      const ext    = (audio_mime || 'audio/wav').split('/').pop().replace('mpeg', 'mp3');
+      const file   = await OpenAI.toFile(buffer, `audio.${ext}`);
+      const result = await openai.audio.transcriptions.create({
+        file,
+        model: 'gpt-4o-transcribe',
+        language: 'en',
+        response_format: 'json',
+      });
+      transcript = (result.text || '').trim();
+    }
+
+    if (!transcript) {
+      return res.status(400).json({ error: 'Could not understand audio. Please try again.' });
+    }
+
+    const result = await _runDescribePipeline({ deviceId, transcript });
+    const hr = new Date().getHours();
+    const meal_type = hr < 11 ? 'breakfast' : hr < 15 ? 'lunch' : hr < 21 ? 'dinner' : 'snack';
+
+    res.json({ ...result, meal_type });
+  } catch (err) {
+    console.error('[nutrition] /describe error:', err);
+    res.status(500).json({ error: err.message || 'Describe failed' });
+  } finally {
+    _releaseLock(deviceId);
+  }
+});
+
+// ─── /describe/preflight — instant inspection (no LLM) ──
+// Lets the FE adjust UI before paying for an analyze call.
+router.post('/describe/preflight', (req, res) => {
+  try {
+    const { text } = req.body || {};
+    const t = (text || '').trim();
+    const word_count = t ? t.split(/\s+/).length : 0;
+    const brand_hits = _detectBrands(t);
+    const lc = t.toLowerCase();
+    const has_vague = Array.from(_VAGUE_TERMS).some(v => new RegExp(`\\b${v}\\b`).test(lc));
+    // Rough item estimate from "and"/comma separators
+    const est_items = Math.max(1, t.split(/(,| and | with | & |\\+)/i).filter(s => s && s.trim().length > 2).length / 2 | 0);
+    res.json({
+      word_count,
+      has_brand: brand_hits.length > 0,
+      brand_hits,
+      has_vague,
+      est_items: Math.min(est_items, 8),
+      ready_to_analyze: word_count >= 2,
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'preflight_failed' });
+  }
+});
+
+// ─── /describe/stream — SSE: real progress events from the pipeline ──
+// Frontend opens an EventSource (or fetch+streaming reader) and gets:
+//   event: stage   data: {"stage":"reading","message":"..."}
+//   event: result  data: <full result>
+//   event: error   data: {"error":"..."}
+router.post('/describe/stream', async (req, res) => {
+  const { deviceId, transcript } = req.body || {};
+  if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+  const t = (transcript || '').trim();
+  if (!t) return res.status(400).json({ error: 'transcript required' });
+
+  if (!_acquireLock(deviceId)) {
+    return res.status(429).json({ error: 'analyze_in_progress' });
+  }
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders?.();
+
+  const send = (event, payload) => {
+    try {
+      res.write(`event: ${event}\n`);
+      res.write(`data: ${JSON.stringify(payload)}\n\n`);
+    } catch {}
+  };
+  // Heartbeat every 10s in case of intermediary buffering
+  const hb = setInterval(() => { try { res.write(': hb\n\n'); } catch {} }, 10_000);
+
+  try {
+    const result = await _runDescribePipeline({
+      deviceId,
+      transcript: t,
+      onProgress: (e) => send('stage', e),
+    });
+    const hr = new Date().getHours();
+    const meal_type = hr < 11 ? 'breakfast' : hr < 15 ? 'lunch' : hr < 21 ? 'dinner' : 'snack';
+    send('result', { ...result, meal_type });
+  } catch (err) {
+    console.error('[nutrition] /describe/stream error:', err);
+    send('error', { error: err.message || 'Describe failed' });
+  } finally {
+    clearInterval(hb);
+    _releaseLock(deviceId);
+    try { res.end(); } catch {}
+  }
+});
+
+// ─── /describe/feedback — telemetry to improve prompts over time ──
+// FE sends: { deviceId, jobId, items_kept, items_edited, items_deleted, transcript_edited, brand_hits, sanity_drift_pct }
+router.post('/describe/feedback', async (req, res) => {
+  try {
+    const { deviceId, ...payload } = req.body || {};
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+    await nutDoc(deviceId).collection('describe_feedback').add({
+      ...payload,
+      created_at: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[nutrition] /describe/feedback error:', err);
+    res.status(500).json({ error: 'feedback_failed' });
+  }
+});
+
+// POST /describe/confirm — log all confirmed items in one shot
+router.post('/describe/confirm', async (req, res) => {
+  try {
+    const { deviceId, items, meal_type, meal_name, date_str: logDate } = req.body;
+    if (!deviceId || !Array.isArray(items) || !items.length) {
+      return res.status(400).json({ error: 'deviceId and items required' });
+    }
+    const today = logDate || dateStr();
+    const mealType = meal_type || 'snack';
+
+    // Write all items in parallel
+    const writes = await Promise.all(items.map(it => {
+      const cal = Math.round(it.calories || 0);
+      const p   = Math.round((it.protein || 0) * 10) / 10;
+      const c   = Math.round((it.carbs   || 0) * 10) / 10;
+      const f   = Math.round((it.fat     || 0) * 10) / 10;
+      const fq  = it.food_quality_score != null
+        ? it.food_quality_score
+        : _computeFoodQuality({ calories: cal, protein: p, carbs: c, fat: f, food_name: it.name || '' });
+      return logsCol(deviceId).add({
+        food_name: it.name || 'Food',
+        emoji:     it.emoji || '🍽️',
+        meal_type: mealType,
+        calories:  cal,
+        protein:   p,
+        carbs:     c,
+        fat:       f,
+        quantity:  it.quantity || 1,
+        unit:      it.unit || 'serving',
+        food_id:   null,
+        source:    'describe',
+        date_str:  today,
+        food_quality_score: fq,
+        meal_name: meal_name || null,
+        logged_at: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    }));
+
+    // Update streak (single update for the meal, not per-item)
+    const nutSnap = await nutDoc(deviceId).get();
+    const nutData = nutSnap.data() || {};
+    const lastLog = nutData.last_log_date;
+    const yesterday = dateStr(new Date(Date.now() - 86400000));
+    const newStreak = (lastLog === yesterday || lastLog === today)
+      ? (lastLog === today ? (nutData.streak || 1) : (nutData.streak || 0) + 1)
+      : 1;
+    await nutDoc(deviceId).set({ last_log_date: today, streak: newStreak }, { merge: true });
+
+    _onNutritionLog(deviceId);
+    refreshNutritionScore(deviceId).catch(() => {});
+
+    res.json({
+      success: true,
+      logged_count: writes.length,
+      ids: writes.map(w => w.id),
+      streak: newStreak,
+    });
+  } catch (err) {
+    console.error('[nutrition] /describe/confirm error:', err);
+    res.status(500).json({ error: 'Confirm failed' });
   }
 });
 
