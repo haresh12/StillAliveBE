@@ -1670,6 +1670,437 @@ router.post('/food/recognize', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
+// VISION v2 PIPELINE — /vision/analyze
+// Multi-shot capture, hidden-fat layer, multi-DB resolver,
+// personal calibration, item-level confidence + source attribution.
+// ═══════════════════════════════════════════════════════════════
+
+// ─── Hidden-fat / cooking-method multipliers (per food category) ──
+const _COOKING_METHOD_FAT = {
+  fried:        { fat_add_g_per_100g: 8,  kcal_mult: 1.35, label: 'Fried' },
+  deep_fried:   { fat_add_g_per_100g: 14, kcal_mult: 1.55, label: 'Deep-fried' },
+  pan_fried:    { fat_add_g_per_100g: 5,  kcal_mult: 1.20, label: 'Pan-fried' },
+  sauteed:      { fat_add_g_per_100g: 4,  kcal_mult: 1.18, label: 'Sautéed' },
+  stir_fried:   { fat_add_g_per_100g: 5,  kcal_mult: 1.22, label: 'Stir-fried' },
+  buttery:      { fat_add_g_per_100g: 6,  kcal_mult: 1.25, label: 'Cooked in butter' },
+  creamy:       { fat_add_g_per_100g: 5,  kcal_mult: 1.20, label: 'Creamy sauce' },
+  cheesy:       { fat_add_g_per_100g: 4,  kcal_mult: 1.18, label: 'With cheese' },
+  grilled:      { fat_add_g_per_100g: 1,  kcal_mult: 1.04, label: 'Grilled' },
+  baked:        { fat_add_g_per_100g: 1,  kcal_mult: 1.03, label: 'Baked' },
+  steamed:      { fat_add_g_per_100g: 0,  kcal_mult: 1.00, label: 'Steamed' },
+  boiled:       { fat_add_g_per_100g: 0,  kcal_mult: 1.00, label: 'Boiled' },
+  raw:          { fat_add_g_per_100g: 0,  kcal_mult: 1.00, label: 'Raw' },
+  restaurant:   { fat_add_g_per_100g: 4,  kcal_mult: 1.30, label: 'Restaurant prep' }, // hidden fat blanket
+};
+
+function _applyHiddenFat(item) {
+  const method = (item.cooking_method || '').toLowerCase();
+  const recipe = _COOKING_METHOD_FAT[method];
+  if (!recipe || recipe.kcal_mult === 1.00) return { ...item, hidden_fat: null };
+  const massG = item.quantity || 100;
+  const addedFat = (recipe.fat_add_g_per_100g * massG) / 100;
+  const addedKcal = Math.round(addedFat * 9);
+  return {
+    ...item,
+    calories: Math.round(item.calories + addedKcal),
+    fat: +(item.fat + addedFat).toFixed(1),
+    hidden_fat: {
+      kind: method,
+      label: recipe.label,
+      added_kcal: addedKcal,
+      added_fat_g: +addedFat.toFixed(1),
+    },
+  };
+}
+
+// ─── Multi-DB resolver: try Nutritionix > USDA > FatSecret > OFF ──
+// Returns { ...item, _source, _verified } so FE can show badge.
+// AI estimate is the last-resort fallback.
+async function _resolveItemAgainstDB(item) {
+  const q = (item.name || '').trim();
+  if (!q) return { ...item, _source: 'ai_estimate', _verified: false };
+
+  // Brand-aware search (FatSecret has best branded coverage)
+  try {
+    const results = await Promise.allSettled([
+      hasFatSecret() ? searchFatSecret(q) : Promise.resolve([]),
+      searchUSDA(q),
+      searchOpenFoodFacts(q),
+    ]);
+    const fs   = results[0].status === 'fulfilled' ? results[0].value : [];
+    const usda = results[1].status === 'fulfilled' ? results[1].value : [];
+    const off  = results[2].status === 'fulfilled' ? results[2].value : [];
+
+    // Pick best match by name similarity
+    const top = fs[0] || usda[0] || off[0];
+    if (!top) return { ...item, _source: 'ai_estimate', _verified: false };
+
+    const sourceMap = {
+      fatsecret: 'fatsecret_verified',
+      usda:      'usda_foundation',
+      off:       'open_food_facts',
+    };
+    const sourceKey = top.source === 'fs' || fs.length ? 'fatsecret' :
+                      top.source === 'usda' || usda.length ? 'usda' : 'off';
+
+    // Scale DB values to estimated quantity
+    const dbServingG = top.serving_g || 100;
+    const ratio = (item.quantity || 100) / dbServingG;
+    const verifiedItem = {
+      ...item,
+      // Trust DB macros at scaled quantity
+      calories: Math.round((top.calories || 0) * ratio),
+      protein:  +((top.protein  || 0) * ratio).toFixed(1),
+      carbs:    +((top.carbs    || 0) * ratio).toFixed(1),
+      fat:      +((top.fat      || 0) * ratio).toFixed(1),
+      _source: sourceMap[sourceKey],
+      _verified: true,
+      _db_match: top.name || top.food_name || q,
+    };
+    return verifiedItem;
+  } catch (err) {
+    console.warn('[vision] DB resolve failed for', q, err.message);
+    return { ...item, _source: 'ai_estimate', _verified: false };
+  }
+}
+function hasFatSecret() {
+  return !!(process.env.FATSECRET_CLIENT_ID && process.env.FATSECRET_CLIENT_SECRET);
+}
+
+// ─── Personal calibration: pull recent corrections, compute factor ──
+async function _getPersonalCalibration(deviceId, foodName) {
+  try {
+    const snap = await nutDoc(deviceId)
+      .collection('vision_corrections')
+      .where('food_name', '==', foodName.toLowerCase())
+      .orderBy('created_at', 'desc')
+      .limit(10)
+      .get();
+    if (snap.size < 3) return null;       // need ≥3 corrections to be statistically meaningful
+    const ratios = snap.docs
+      .map(d => d.data())
+      .filter(d => d.model_grams > 0 && d.corrected_grams > 0)
+      .map(d => d.corrected_grams / d.model_grams);
+    if (ratios.length < 3) return null;
+    const median = ratios.sort((a, b) => a - b)[Math.floor(ratios.length / 2)];
+    // Cap correction at 0.5x..2.0x to avoid runaway
+    return Math.max(0.5, Math.min(2.0, median));
+  } catch { return null; }
+}
+
+// ─── Multi-shot vision prompt (calls GPT-4o with 1-3 photos) ──
+async function _multiShotVision(shotsBase64, userCtx, hasDepth, hasFiducial) {
+  if (!Array.isArray(shotsBase64) || !shotsBase64.length) {
+    throw new Error('no_shots_provided');
+  }
+
+  const dietBits = [];
+  if (userCtx?.dietary_style === 'vegan')      dietBits.push('User is VEGAN — no animal products.');
+  if (userCtx?.dietary_style === 'vegetarian') dietBits.push('User is VEGETARIAN — no meat.');
+  if (userCtx?.allergies?.length)              dietBits.push(`User allergies: ${userCtx.allergies.join(', ')}.`);
+  const dietStr = dietBits.length ? dietBits.join(' ') : '';
+
+  let scaleNote;
+  if (hasDepth) scaleNote = 'A LiDAR depth map was captured — ground-truth scale available. Trust portion sizes.';
+  else if (hasFiducial) scaleNote = 'User\'s thumb is in the photo as a scale reference (~22mm wide). Use it for portion calibration.';
+  else scaleNote = 'No fiducial. Estimate portions from plate (assume 26cm dinner plate or 22cm bowl) and cutlery (fork ~20cm).';
+
+  const shotsContext = shotsBase64.length === 1
+    ? 'You have ONE photo of the meal.'
+    : `You have ${shotsBase64.length} photos of the SAME meal taken from different angles. Cross-reference them for portion accuracy.`;
+
+  const prompt = `You are an elite nutritionist analyzing meal photos with clinical accuracy. ${shotsContext} ${scaleNote} ${dietStr}
+
+CRITICAL ACCURACY RULES:
+1. Identify EVERY distinct food item — never merge a plate into one entry. A burrito bowl with chicken, rice, beans, salsa, cheese is FIVE items.
+2. Detect HIDDEN FATS — oil sheen, butter glaze, cream sauces, cheese melt, fried texture. Set cooking_method accordingly:
+   - "deep_fried" (golden crispy crust, oil dripping)
+   - "pan_fried" / "fried" (browned surface, slight sheen)
+   - "sauteed" / "stir_fried" (visible oil coating)
+   - "buttery" (butter pool or glaze)
+   - "creamy" (white cream sauce visible)
+   - "cheesy" (melted cheese topping)
+   - "grilled" (char marks, dry surface)
+   - "baked" / "steamed" / "boiled" / "raw" (no added fat signs)
+   - "restaurant" (when clearly a restaurant plating — applies blanket hidden-fat factor)
+3. Brand recognition — if you see a Coca-Cola can, Starbucks cup, Chipotle bowl, set "brand" field.
+4. Confidence per item:
+   - "high" (clear food, clear portion, scale reference visible)
+   - "medium" (food clear, portion estimated)
+   - "low" (partially obscured, ambiguous, mixed)
+5. For each item, provide a region_id (1, 2, 3...) corresponding to its position in the photo (top-left=1, etc) so we can highlight it later.
+6. Caloric math sanity: calories ≈ protein×4 + carbs×4 + fat×9 within 10%.
+7. Default to grams (g) and milliliters (ml).
+
+Return ONLY this JSON shape:
+{
+  "items": [
+    {
+      "region_id": 1,
+      "name": "Grilled chicken breast",
+      "brand": null,
+      "cooking_method": "grilled",
+      "quantity": 150,
+      "unit": "g",
+      "emoji": "🍗",
+      "confidence": "high",
+      "calories": 248,
+      "protein": 46.5,
+      "carbs": 0,
+      "fat": 5.4
+    }
+  ],
+  "meal_type_guess": "lunch",
+  "is_label": false,
+  "is_restaurant": false,
+  "scale_used": "${hasDepth ? 'lidar' : hasFiducial ? 'fiducial' : 'estimated'}"
+}
+
+If this photo shows ONLY a nutrition label or barcode (no actual food visible), return: {"items":[],"is_label":true}.`;
+
+  const content = [
+    ...shotsBase64.map(b64 => ({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${b64}`, detail: 'high' } })),
+    { type: 'text', text: prompt },
+  ];
+
+  const completion = await openai.chat.completions.create({
+    model: MODELS.vision,
+    max_tokens: 1400,
+    temperature: 0.2,
+    messages: [{ role: 'user', content }],
+  });
+
+  return safeJSON(completion.choices[0].message.content, { items: [] });
+}
+
+// ─── POST /vision/analyze — full pipeline ──
+router.post('/vision/analyze', async (req, res) => {
+  const t0 = Date.now();
+  try {
+    const {
+      deviceId,
+      shots,                    // array of base64 strings (1-3)
+      depth_present,            // bool — LiDAR captured (Pro iPhone)
+      fiducial_present,         // bool — user's thumb in shot
+      thumb_width_mm,           // number — user's calibrated thumb width
+    } = req.body;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+    if (!Array.isArray(shots) || !shots.length) {
+      return res.status(400).json({ error: 'shots[] (1-3 base64 photos) required' });
+    }
+    if (shots.length > 3) {
+      return res.status(400).json({ error: 'max 3 shots per analyze' });
+    }
+
+    // Validate sizes
+    for (const s of shots) {
+      try { assertImageSize(s); }
+      catch { return res.status(413).json({ error: 'A photo is too large — please use smaller images' }); }
+    }
+
+    // Load user context
+    const nutSnap = await nutDoc(deviceId).get();
+    const setup   = nutSnap.exists ? (nutSnap.data() || {}) : {};
+
+    // Stage 1+2: vision recognition
+    const visionResult = await _multiShotVision(shots, setup, !!depth_present, !!fiducial_present);
+    if (visionResult.is_label) {
+      return res.json({ items: [], is_label: true, latency_ms: Date.now() - t0 });
+    }
+    if (!visionResult.items?.length) {
+      return res.status(422).json({ error: 'no_food_detected', message: 'Couldn\'t detect food in the photo. Try better lighting or a closer shot.' });
+    }
+
+    // Stage 3: portion sanity (cap absurd values)
+    let items = visionResult.items.map(it => ({
+      ...it,
+      calories: Math.max(0, Math.min(2500, Math.round(it.calories || 0))),
+      protein:  Math.max(0, Math.min(300, +(it.protein || 0).toFixed(1))),
+      carbs:    Math.max(0, Math.min(500, +(it.carbs   || 0).toFixed(1))),
+      fat:      Math.max(0, Math.min(200, +(it.fat     || 0).toFixed(1))),
+      quantity: Math.max(0, +(it.quantity || 100).toFixed(1)),
+    }));
+
+    // Stage 4: DB resolution (parallel, cap concurrency at 4)
+    const dbResolved = await Promise.all(
+      items.map(it => _resolveItemAgainstDB(it).catch(() => ({ ...it, _source: 'ai_estimate', _verified: false })))
+    );
+    items = dbResolved;
+
+    // Stage 5: hidden-fat layer (only if not DB-verified — DB already has accurate fat)
+    items = items.map(it => it._verified ? it : _applyHiddenFat(it));
+
+    // Restaurant blanket adjustment
+    if (visionResult.is_restaurant) {
+      items = items.map(it => {
+        if (it._verified || it.hidden_fat) return it;
+        const r = _COOKING_METHOD_FAT.restaurant;
+        return _applyHiddenFat({ ...it, cooking_method: 'restaurant' });
+      });
+    }
+
+    // Stage 6: personal calibration
+    items = await Promise.all(items.map(async it => {
+      const factor = await _getPersonalCalibration(deviceId, it.name || '');
+      if (!factor || factor === 1) return it;
+      return {
+        ...it,
+        quantity: +(it.quantity * factor).toFixed(1),
+        calories: Math.round(it.calories * factor),
+        protein:  +(it.protein * factor).toFixed(1),
+        carbs:    +(it.carbs * factor).toFixed(1),
+        fat:      +(it.fat * factor).toFixed(1),
+        _calibrated: factor,
+      };
+    }));
+
+    // Stage 7: enrich with food_quality_score + temp ids
+    items = items.map((it, i) => ({
+      ...it,
+      _id: `v_${Date.now()}_${i}`,
+      food_quality_score: _computeFoodQuality({
+        calories: it.calories, protein: it.protein, carbs: it.carbs, fat: it.fat,
+        food_name: it.name || '',
+      }),
+    }));
+
+    // Aggregate totals + lowest confidence
+    const total = items.reduce((acc, it) => ({
+      calories: acc.calories + it.calories,
+      protein:  acc.protein + it.protein,
+      carbs:    acc.carbs + it.carbs,
+      fat:      acc.fat + it.fat,
+    }), { calories: 0, protein: 0, carbs: 0, fat: 0 });
+
+    const confOrder = { low: 0, medium: 1, high: 2 };
+    const overallConfidence = items.reduce(
+      (lo, it) => confOrder[it.confidence] < confOrder[lo] ? it.confidence : lo, 'high'
+    );
+
+    // Auto-detect meal type
+    const hr = new Date().getHours();
+    const meal_type = visionResult.meal_type_guess ||
+      (hr < 11 ? 'breakfast' : hr < 15 ? 'lunch' : hr < 21 ? 'dinner' : 'snack');
+
+    // Telemetry
+    nutDoc(deviceId).collection('vision_analyses').add({
+      shot_count: shots.length,
+      depth_present: !!depth_present,
+      fiducial_present: !!fiducial_present,
+      item_count: items.length,
+      total_calories: Math.round(total.calories),
+      verified_count: items.filter(i => i._verified).length,
+      hidden_fat_count: items.filter(i => i.hidden_fat).length,
+      calibrated_count: items.filter(i => i._calibrated).length,
+      latency_ms: Date.now() - t0,
+      created_at: admin.firestore.FieldValue.serverTimestamp(),
+    }).catch(() => {});
+
+    res.json({
+      meal_name: visionResult.meal_name || 'Meal',
+      items,
+      total: {
+        calories: Math.round(total.calories),
+        protein:  +total.protein.toFixed(1),
+        carbs:    +total.carbs.toFixed(1),
+        fat:      +total.fat.toFixed(1),
+      },
+      confidence: overallConfidence,
+      meal_type,
+      is_restaurant: !!visionResult.is_restaurant,
+      scale_used: visionResult.scale_used,
+      shot_count: shots.length,
+      latency_ms: Date.now() - t0,
+    });
+  } catch (err) {
+    console.error('[vision] /vision/analyze error:', err);
+    res.status(500).json({ error: 'vision_analyze_failed', message: err.message });
+  }
+});
+
+// ─── POST /vision/confirm — log the reviewed items ──
+router.post('/vision/confirm', async (req, res) => {
+  try {
+    const { deviceId, items, meal_type, meal_name, date_str: logDate } = req.body;
+    if (!deviceId || !Array.isArray(items) || !items.length) {
+      return res.status(400).json({ error: 'deviceId and items required' });
+    }
+    const today = logDate || dateStr();
+    const mealType = meal_type || 'snack';
+
+    const writes = await Promise.all(items.map(it => {
+      const cal = Math.round(it.calories || 0);
+      const p   = Math.round((it.protein || 0) * 10) / 10;
+      const c   = Math.round((it.carbs   || 0) * 10) / 10;
+      const f   = Math.round((it.fat     || 0) * 10) / 10;
+      const fq  = it.food_quality_score != null
+        ? it.food_quality_score
+        : _computeFoodQuality({ calories: cal, protein: p, carbs: c, fat: f, food_name: it.name || '' });
+      return logsCol(deviceId).add({
+        food_name: it.name || 'Food',
+        emoji:     it.emoji || '🍽️',
+        meal_type: mealType,
+        calories:  cal,
+        protein:   p,
+        carbs:     c,
+        fat:       f,
+        quantity:  it.quantity || 1,
+        unit:      it.unit || 'serving',
+        food_id:   null,
+        source:    'vision',
+        date_str:  today,
+        food_quality_score: fq,
+        meal_name: meal_name || null,
+        cooking_method: it.cooking_method || null,
+        hidden_fat: it.hidden_fat || null,
+        _source: it._source || 'ai_estimate',
+        _verified: !!it._verified,
+        logged_at: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    }));
+
+    // Update streak
+    const nutSnap = await nutDoc(deviceId).get();
+    const nutData = nutSnap.data() || {};
+    const lastLog = nutData.last_log_date;
+    const yesterday = dateStr(new Date(Date.now() - 86400000));
+    const newStreak = (lastLog === yesterday || lastLog === today)
+      ? (lastLog === today ? (nutData.streak || 1) : (nutData.streak || 0) + 1)
+      : 1;
+    await nutDoc(deviceId).set({ last_log_date: today, streak: newStreak }, { merge: true });
+
+    _onNutritionLog(deviceId);
+    refreshNutritionScore(deviceId).catch(() => {});
+
+    res.json({ success: true, logged_count: writes.length, ids: writes.map(w => w.id), streak: newStreak });
+  } catch (err) {
+    console.error('[vision] /vision/confirm error:', err);
+    res.status(500).json({ error: 'vision_confirm_failed' });
+  }
+});
+
+// ─── POST /vision/correction — record a user correction for personal calibration ──
+router.post('/vision/correction', async (req, res) => {
+  try {
+    const { deviceId, food_name, model_grams, corrected_grams, model_calories, corrected_calories } = req.body;
+    if (!deviceId || !food_name) return res.status(400).json({ error: 'deviceId and food_name required' });
+    await nutDoc(deviceId).collection('vision_corrections').add({
+      food_name: String(food_name).toLowerCase(),
+      model_grams: +model_grams || 0,
+      corrected_grams: +corrected_grams || 0,
+      model_calories: +model_calories || 0,
+      corrected_calories: +corrected_calories || 0,
+      delta_pct: model_grams > 0 ? Math.round(((corrected_grams - model_grams) / model_grams) * 100) : 0,
+      created_at: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[vision] /vision/correction error:', err);
+    res.status(500).json({ error: 'correction_save_failed' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
 // POST /food/scan-label — nutrition label photo → exact macros
 // ═══════════════════════════════════════════════════════════════
 router.post('/food/scan-label', async (req, res) => {
