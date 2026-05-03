@@ -13,6 +13,8 @@ const { OpenAI } = require('openai');
 const cron    = require('node-cron');
 const { fetchAgentSnapshot } = require('./lib/cross-agent-context');
 const { computeMindScore: _computeMindScore } = require('./lib/agent-scores');
+const mindAnalytics = require('./lib/mind-analytics');
+const { detectCrisis, crisisEnvelope } = require('./lib/safety');
 
 const openai  = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const db      = () => admin.firestore();
@@ -627,124 +629,10 @@ router.patch('/checkin/:id', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// GET /actions
-// Returns today's AI-generated actions, user intentions,
-// and yesterday's completed/skipped actions for the review card.
+// (legacy /actions removed — superseded by actions-engine v2 mounted
+//  at top of file. v2 owns /actions, /action/:id/{complete,skip,
+//  snooze,feedback}.)
 // ═══════════════════════════════════════════════════════════════
-router.get('/_legacy/actions', async (req, res) => {
-  try {
-    const { deviceId } = req.query;
-    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
-
-    const [activeSnap, recentSnap, mindSnap] = await Promise.all([
-      // Current live batch — no date dependency
-      actionsCol(deviceId).where('status', '==', 'active').get(),
-      // Last 20 actions for completed + past context
-      actionsCol(deviceId).orderBy('generated_at', 'desc').limit(20).get(),
-      mindDoc(deviceId).get(),
-    ]);
-
-    const format = (action) => ({
-      ...action,
-      generated_at: toIsoString(action.generated_at),
-      completed_at: toIsoString(action.completed_at),
-    });
-
-    const mindData      = mindSnap.data() || {};
-    const totalCheckins = mindData.checkin_count || 0;
-    const lastGenAt     = mindData.last_action_gen_at_checkin || 0;
-    const sinceLast     = totalCheckins - lastGenAt;
-    const untilRefresh  = Math.max(0, 3 - sinceLast);
-
-    // Active: current live batch (AI-generated only)
-    const active = sortByTimestampField(
-      activeSnap.docs.map(mapSnapDoc).filter(a => a.source !== 'user_intention'),
-      'generated_at', 'asc'
-    ).map(format);
-
-    // Find current gen_index so we can show done/skipped from this same batch
-    const currentGenIndex = active.length > 0
-      ? Math.max(...active.map(a => a.gen_index || 0))
-      : lastGenAt;
-
-    const recent = recentSnap.docs.map(mapSnapDoc).map(format);
-
-    // Completed = done/skipped from the current batch
-    const completed = recent.filter(a =>
-      a.source !== 'user_intention' &&
-      ['done', 'skipped'].includes(a.status) &&
-      (a.gen_index || 0) === currentGenIndex
-    );
-
-    // Past = last retired batch (previous gen_index)
-    const prevGenIndex = currentGenIndex > 0
-      ? Math.max(0, ...recent
-          .filter(a => a.source !== 'user_intention' && a.status === 'past')
-          .map(a => a.gen_index || 0))
-      : 0;
-    const past = prevGenIndex > 0
-      ? recent.filter(a => a.status === 'past' && (a.gen_index || 0) === prevGenIndex)
-      : [];
-
-    res.json({
-      active,
-      completed,
-      past,
-      until_refresh:  untilRefresh,
-      total_checkins: totalCheckins,
-    });
-  } catch (err) {
-    console.error('[mind] /actions error:', err);
-    res.status(500).json({ error: 'Failed to get actions' });
-  }
-});
-
-// ═══════════════════════════════════════════════════════════════
-// POST /action/:id/complete  |  POST /action/:id/skip
-// ═══════════════════════════════════════════════════════════════
-router.post('/_legacy/action/:id/complete', async (req, res) => {
-  try {
-    const { deviceId } = req.body;
-    const { id }       = req.params;
-    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
-    await actionsCol(deviceId).doc(id).update({
-      status:       'done',
-      completed_at: admin.firestore.FieldValue.serverTimestamp(),
-    });
-    res.json({ success: true });
-  } catch (err) {
-    console.error('[mind] complete action error:', err);
-    res.status(500).json({ error: 'Failed' });
-  }
-});
-
-router.post('/_legacy/action/:id/skip', async (req, res) => {
-  try {
-    const { deviceId } = req.body;
-    const { id }       = req.params;
-    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
-
-    // Read action text before marking skipped — used for skip learning
-    const actionSnap = await actionsCol(deviceId).doc(id).get();
-    const actionText = actionSnap.exists ? actionSnap.data().text : null;
-
-    await actionsCol(deviceId).doc(id).update({ status: 'skipped' });
-
-    // Append to skip_history so future generation avoids similar actions
-    if (actionText) {
-      const mindSnap    = await mindDoc(deviceId).get();
-      const existing    = (mindSnap.data()?.skip_history || []);
-      const updated     = [...existing, actionText].slice(-20); // keep last 20
-      await mindDoc(deviceId).update({ skip_history: updated });
-    }
-
-    res.json({ success: true });
-  } catch (err) {
-    console.error('[mind] skip action error:', err);
-    res.status(500).json({ error: 'Failed' });
-  }
-});
-
 // ═══════════════════════════════════════════════════════════════
 // POST /intention
 // User adds their own intention (not AI-generated).
@@ -916,13 +804,219 @@ router.get('/analysis', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
+// GET /analysis/v2 — full Insights tab payload (10/10 reference)
+// Range: 7|30|90|365 days. Returns 7 aha cards + AI reads + score.
+// ═══════════════════════════════════════════════════════════════
+router.get('/analysis/v2', async (req, res) => {
+  try {
+    const { deviceId, range } = req.query;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+
+    const daysNum = (() => {
+      const n = parseInt(range, 10);
+      if (Number.isFinite(n) && n > 0 && n <= 730) return n;
+      return null; // all-time
+    })();
+
+    const payload = await mindAnalytics.loadAnalysisV2(deviceId, daysNum, { openai });
+    if (!payload) return res.json({ stats: null, signal_points: [], aha_moments: [] });
+    res.json(payload);
+  } catch (err) {
+    console.error('[mind] /analysis/v2 error:', err);
+    res.status(500).json({ error: 'Analysis V2 failed' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// POST /reframe — single CBT reframe of a thought (Track tab inline)
+// Body: { deviceId, thought, region? }. Crisis-routed.
+// ═══════════════════════════════════════════════════════════════
+router.post('/reframe', async (req, res) => {
+  try {
+    const { deviceId, thought, region } = req.body;
+    if (!deviceId || !thought) return res.status(400).json({ error: 'deviceId and thought required' });
+
+    const crisis = detectCrisis(thought);
+    if (crisis) return res.json(crisisEnvelope(region));
+
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      response_format: { type: 'json_object' },
+      max_completion_tokens: 220,
+      messages: [
+        { role: 'system', content: mindAnalytics.MIND_REFRAME_SYSTEM },
+        { role: 'user',   content: thought },
+      ],
+    });
+    const parsed = JSON.parse(completion.choices?.[0]?.message?.content || '{}');
+    res.json({ is_crisis: false, reframe: parsed?.reframe || null });
+  } catch (err) {
+    console.error('[mind] /reframe error:', err);
+    res.status(500).json({ error: 'Reframe failed' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// GET /track-context — single-shot Track tab payload
+// Returns today's logs, summary, smart defaults, contextual nudge,
+// streak (with grace), and 28-day calendar dots.
+// ═══════════════════════════════════════════════════════════════
+router.get('/track-context', async (req, res) => {
+  try {
+    const { deviceId } = req.query;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+    const payload = await mindAnalytics.loadTrackContext(deviceId);
+    res.json(payload || { today_logs: [], smart_defaults: null, streak: 0 });
+  } catch (err) {
+    console.error('[mind] /track-context error:', err);
+    res.status(500).json({ error: 'track context failed' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// GET /actions/v2 — 10/10 Actions tab payload (mind-native)
+// Wraps the actions-engine collection + adds cadence + history shape.
+// ═══════════════════════════════════════════════════════════════
+router.get('/actions/v2', async (req, res) => {
+  try {
+    const { deviceId } = req.query;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+
+    const [actSnap, mindSnap, recentCheckSnap] = await Promise.all([
+      actionsCol(deviceId).orderBy('generated_at', 'desc').limit(20).get(),
+      mindDoc(deviceId).get(),
+      checkinsCol(deviceId).orderBy('logged_at', 'desc').limit(20).get(),
+    ]);
+
+    const allActions = actSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+    const mindData   = mindSnap.exists ? mindSnap.data() : {};
+    const recentCheckins = recentCheckSnap.docs.map(d => d.data());
+
+    // Cadence: 3 check-ins per refresh (mind cadence is checkin-count, not days)
+    const totalCheckins = mindData.checkin_count || recentCheckins.length || 0;
+    const lastGenAt     = mindData.last_action_gen_at_checkin || 0;
+    const sinceLast     = Math.max(0, totalCheckins - lastGenAt);
+    const untilRefresh  = Math.max(0, 3 - sinceLast);
+
+    // Active list — actions-engine writes status: 'active' | 'completed' | 'skipped' | 'cancelled' | 'past'
+    const active = allActions.filter(a =>
+      a.kind !== 'prescription' &&
+      a.source !== 'user_intention' &&
+      (!a.status || a.status === 'active' || a.status === 'pending')
+    );
+    // Engine writes a.proof as an OBJECT {metric, value, threshold, citation};
+    // a.proof_body / a.why / a.text hold the rendered strings. Always coerce.
+    const proofString = (a) => {
+      if (typeof a.proof_body === 'string' && a.proof_body) return a.proof_body;
+      if (typeof a.proof === 'string' && a.proof) return a.proof;
+      if (a.proof && typeof a.proof === 'object' && a.proof.citation) return `Tap ✓ when done — tracked vs ${a.proof.citation}.`;
+      return 'Tap ✓ when done — your coach tracks the hit-rate.';
+    };
+    const actions = active.slice(0, 3).map(a => ({
+      id: a.id,
+      title: (typeof a.title === 'string' && a.title) || a.text || a.surprise_hook || 'Action',
+      why:   (typeof a.why === 'string' && a.why) || a.proof_body || 'Cited from your recent check-ins.',
+      how:   (typeof a.how === 'string' && a.how) || a.micro_step || a.surprise_hook || 'Tap below to see the step.',
+      when:  a.when || a.when_to_do || 'Today',
+      proof: proofString(a),
+      archetype: typeof a.archetype === 'string' ? a.archetype : null,
+      status: 'active',
+      hit_rate:     a.hit_count || a.completed_count || 0,
+      target_count: a.target_count || 1,
+      created_at:   a.generated_at || null,
+    }));
+
+    // History
+    const isCancelled = (a) => a.status === 'cancelled' || a.status === 'skipped';
+    const history = allActions
+      .filter(a => a.status === 'completed' || a.status === 'done' || isCancelled(a))
+      .slice(0, 12)
+      .map(a => {
+        const ts = a.completed_at || a.cancelled_at || a.skipped_at;
+        const ms = ts?._seconds ? ts._seconds * 1000 : (ts ? new Date(ts).getTime() : null);
+        const cancelled = isCancelled(a);
+        return {
+          id: a.id,
+          title: a.title || a.text || 'Action',
+          date_label: ms ? new Date(ms).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '—',
+          completed_at: ms ? new Date(ms).toISOString() : null,
+          outcome: a.outcome_text || (cancelled ? 'Cancelled' : `${a.hit_count || 0}/${a.target_count || 1} hit`),
+          status: cancelled ? 'cancelled' : 'completed',
+        };
+      });
+
+    const completed_total = allActions.filter(a => a.status === 'completed' || a.status === 'done').length;
+    const skipped_total   = allActions.filter(isCancelled).length;
+
+    return res.json({
+      cadence: {
+        status: lastGenAt > 0 ? 'live' : 'pending',
+        checkins_so_far:  totalCheckins,
+        until_refresh:    untilRefresh,
+        last_gen_checkin: lastGenAt,
+      },
+      actions,
+      history,
+      stats: {
+        active_count:     active.length,
+        total_checkins:   totalCheckins,
+        completed_total,
+        skipped_total,
+        cancelled_total:  skipped_total,
+        follow_through_pct: (completed_total + skipped_total) > 0
+          ? Math.round((completed_total / (completed_total + skipped_total)) * 100)
+          : 0,
+      },
+    });
+  } catch (err) {
+    console.error('[mind] /actions/v2 error:', err);
+    return res.status(500).json({ error: 'server error' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// GET /chat-state — last 24h state for the Coach tab header
+// Returns { last_checkin: {ago_minutes, mood, anxiety, emotions, triggers}, streak }
+// ═══════════════════════════════════════════════════════════════
+router.get('/chat-state', async (req, res) => {
+  try {
+    const { deviceId } = req.query;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+    const snap = await checkinsCol(deviceId).orderBy('logged_at', 'desc').limit(1).get();
+    const mindSnap = await mindDoc(deviceId).get();
+    const mind = mindSnap.exists ? mindSnap.data() : {};
+    if (snap.empty) return res.json({ last_checkin: null, streak: 0 });
+    const c = snap.docs[0].data();
+    const at = c.logged_at?.toMillis?.() || new Date(c.logged_at || 0).getTime();
+    const ago = Math.max(0, Math.round((Date.now() - at) / 60000));
+    res.json({
+      last_checkin: {
+        ago_minutes: ago,
+        mood:        Number(c.mood_score || 2),
+        mood_label:  c.mood,
+        anxiety:     Number(c.anxiety || 1),
+        emotions:    (c.emotions || []).slice(0, 3),
+        triggers:    (c.triggers || []).slice(0, 2),
+      },
+      streak: (() => {
+        // simple streak from last_checkin_date — derived earlier in checkin path
+        return mind.streak || 0;
+      })(),
+    });
+  } catch (err) {
+    console.error('[mind] /chat-state error:', err);
+    res.status(500).json({ error: 'state failed' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
 // POST /chat
 // Builds full context pipeline, sends to GPT-4o, saves both
 // sides of the conversation.
 // ═══════════════════════════════════════════════════════════════
 router.post('/chat', async (req, res) => {
   try {
-    const { deviceId, message } = req.body;
+    const { deviceId, message, region } = req.body;
     if (!deviceId || !message) return res.status(400).json({ error: 'deviceId and message required' });
 
     // Save user message first so it appears immediately client-side
@@ -934,6 +1028,23 @@ router.post('/chat', async (req, res) => {
       is_read:        true,
       created_at:     admin.firestore.FieldValue.serverTimestamp(),
     });
+
+    // ── CRISIS ROUTING ──────────────────────────────────────────
+    // Never call OpenAI for crisis content — return the warm template.
+    const crisis = detectCrisis(message);
+    if (crisis) {
+      const env = crisisEnvelope(region);
+      const msgRef = await chatsCol(deviceId).add({
+        role:           'assistant',
+        content:        env.reply,
+        is_proactive:   false,
+        proactive_type: 'crisis_safe',
+        is_crisis:      true,
+        is_read:        true,
+        created_at:     admin.firestore.FieldValue.serverTimestamp(),
+      });
+      return res.json({ success: true, reply: env.reply, message_id: msgRef.id, ...env });
+    }
 
     // Build personalised system context
     const systemContext = await buildContext(deviceId);
@@ -949,9 +1060,8 @@ router.post('/chat', async (req, res) => {
     }));
 
     const completion = await openai.chat.completions.create({
-      model:      'gpt-4.1',
-      temperature: 0.72,
-      max_tokens:  1000,
+      model: 'gpt-4.1',
+      max_completion_tokens: 1000,
       messages: [
         { role: 'system', content: systemContext },
         ...history,
@@ -985,7 +1095,6 @@ _mountChatStreamMind(router, {
   openai, admin, chatsCol,
   model: 'gpt-4.1',
   maxTokens: 650,
-  temperature: 0.72,
   buildPrompt: async (deviceId /* , message */) => {
     const systemPrompt = await buildContext(deviceId);
     const historySnap = await chatsCol(deviceId).orderBy('created_at', 'desc').limit(14).get();
@@ -1179,10 +1288,9 @@ Return ONLY valid JSON — an array of ${count} objects. No markdown, no explana
 
   try {
     const completion = await openai.chat.completions.create({
-      model:       'gpt-4.1',
-      temperature:  0.48,
-      max_tokens:   700,
-      messages:    [{ role: 'user', content: prompt }],
+      model: 'gpt-4.1',
+      max_completion_tokens: 700,
+      messages: [{ role: 'user', content: prompt }],
     });
 
     const raw = completion.choices[0].message.content.trim();
@@ -1921,10 +2029,9 @@ RULES:
 
   try {
     const completion = await openai.chat.completions.create({
-      model:       'gpt-4.1',
-      temperature:  0.62,
-      max_tokens:   420,
-      messages:    [{ role: 'user', content: prompt }],
+      model: 'gpt-4.1',
+      max_completion_tokens: 420,
+      messages: [{ role: 'user', content: prompt }],
     });
 
     const raw     = completion.choices[0].message.content.trim();
@@ -2122,7 +2229,8 @@ Write ONE short message (2-3 sentences max). Rules:
 
   try {
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4.1', temperature: 0.65, max_tokens: 160,
+      model: 'gpt-4.1',
+      max_completion_tokens: 160,
       messages: [{ role: 'user', content: prompt }],
     });
     return completion.choices[0].message.content.trim();
@@ -2148,7 +2256,8 @@ Write ONE short message (2-3 sentences max). Rules:
 
   try {
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4.1', temperature: 0.65, max_tokens: 130,
+      model: 'gpt-4.1',
+      max_completion_tokens: 130,
       messages: [{ role: 'user', content: prompt }],
     });
     return completion.choices[0].message.content.trim();
@@ -2195,10 +2304,9 @@ Return only the message text, no quotes, no explanation.`;
 
   try {
     const completion = await openai.chat.completions.create({
-      model:       'gpt-4.1',
-      temperature:  0.7,
-      max_tokens:   120,
-      messages:    [{ role: 'user', content: prompt }],
+      model: 'gpt-4.1',
+      max_completion_tokens: 120,
+      messages: [{ role: 'user', content: prompt }],
     });
     return completion.choices[0].message.content.trim();
   } catch {
@@ -2315,6 +2423,28 @@ async function runStreakReminders() {
 cron.schedule('0 10 * * *', () => { runProactiveChecks(); });
 cron.schedule('0 20 * * *', () => { runStreakReminders(); });
 
-console.log('[mind] agent loaded ✓ — proactive cron active at 10am (full) / 8pm (streak)');
+// Pre-warm /analysis/v2 cache for active users every night at 02:30.
+// Skips users with 0 check-ins. Best-effort, never blocks startup.
+async function preWarmAnalysisV2() {
+  try {
+    const usersSnap = await db().collection('wellness_users').limit(500).get();
+    let warmed = 0;
+    for (const u of usersSnap.docs) {
+      const id = u.id;
+      try {
+        const checkSnap = await mindDoc(id).collection('mind_checkins').limit(1).get();
+        if (checkSnap.empty) continue;
+        await mindAnalytics.loadAnalysisV2(id, 30, { openai });
+        warmed++;
+      } catch { /* per-user non-fatal */ }
+    }
+    console.log(`[mind] pre-warm: ${warmed}/${usersSnap.size} users analysis_v2 refreshed`);
+  } catch (err) {
+    console.error('[mind] pre-warm error:', err.message);
+  }
+}
+cron.schedule('30 2 * * *', preWarmAnalysisV2);
+
+console.log('[mind] agent loaded ✓ — proactive 10am · streak 8pm · analysis pre-warm 2:30am');
 
 module.exports = router;
