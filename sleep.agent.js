@@ -18,8 +18,10 @@ const router  = express.Router();
 const admin   = require('firebase-admin');
 const { OpenAI } = require('openai');
 const cron    = require('node-cron');
-const { fetchAgentSnapshot } = require('./lib/cross-agent-context');
+// ABSOLUTE LAW: single agents never read sibling-agent data via fetchAgentSnapshot.
 const { computeSleepScore: _computeSleepScore } = require('./lib/agent-scores');
+const sleepAnalytics = require('./lib/sleep-analytics');
+const sleepDescribe  = require('./lib/sleep-describe');
 
 const openai  = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const db      = () => admin.firestore();
@@ -578,14 +580,14 @@ router.post('/log', async (req, res) => {
     const sinceLast  = totalCount - lastGenAt;
 
     // ── Every 3 logs → retire active → generate fresh batch ──
+    // ABSOLUTE LAW: single agents never read sibling-agent data.
+    // Cross-agent insights flow ONLY through the cross-agent engine.
     let newActions = null;
     if (sinceLast >= 3) {
-      const [recentLogsSnap, recentChatSnap, profileSnap, mindSnap, fitnessSnap] = await Promise.all([
+      const [recentLogsSnap, recentChatSnap, profileSnap] = await Promise.all([
         logsCol(deviceId).orderBy('logged_at', 'desc').limit(10).get(),
         chatsCol(deviceId).orderBy('created_at', 'desc').limit(10).get(),
         userDoc(deviceId).get(),
-        fetchAgentSnapshot(deviceId, 'mind', 3).catch(() => null),
-        fetchAgentSnapshot(deviceId, 'fitness', 1).catch(() => null),
       ]);
 
       const recentLogs     = recentLogsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
@@ -593,26 +595,14 @@ router.post('/log', async (req, res) => {
       const profile        = profileSnap.exists ? profileSnap.data() : {};
       const recentlySkipped = (sleepDataBefore.skip_history || []).slice(-8);
 
-      let crossAgentCtx = '';
-      if (mindSnap?.logs?.length) {
-        const avgAnxiety = (mindSnap.logs.reduce((s, l) => s + (l.anxiety_level || 0), 0) / mindSnap.logs.length).toFixed(1);
-        crossAgentCtx += `Mood last 3 days: avg anxiety ${avgAnxiety}/5. `;
-        if (parseFloat(avgAnxiety) >= 3) crossAgentCtx += 'High anxiety likely causing sleep onset issues. ';
-      }
-      if (fitnessSnap?.logs?.length) {
-        const w = fitnessSnap.logs[0];
-        const hour = w.logged_at?.toDate ? w.logged_at.toDate().getHours() : null;
-        if (hour !== null && hour >= 19) crossAgentCtx += `Late evening workout logged (${hour}:00) — may delay sleep onset. `;
-      }
-
       newActions = await generateActions({
         profile,
         setup:     sleepDataBefore,
         recentLogs,
         recentChat,
         recentlySkipped,
-        isFirstGen:    false,
-        crossAgentCtx,
+        isFirstGen: false,
+        crossAgentCtx: '',
       });
 
       const activeSnap = await actionsCol(deviceId).where('status', '==', 'active').get();
@@ -832,103 +822,169 @@ router.patch('/log/:id', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// GET /actions
+// (legacy /actions removed — actions-engine v2 owns /actions and
+//  /action/:id/{complete,skip,snooze,feedback} via mountActionRoutes.)
 // ═══════════════════════════════════════════════════════════════
-router.get('/_legacy/actions', async (req, res) => {
+
+// ═══════════════════════════════════════════════════════════════
+// GET /track-context — single-shot Track tab payload
+// ═══════════════════════════════════════════════════════════════
+router.get('/track-context', async (req, res) => {
+  try {
+    const { deviceId } = req.query;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+    const sleepSnap = await sleepDoc(deviceId).get();
+    const target = Number(sleepSnap.data()?.target_hours || sleepSnap.data()?.sleep_target_hours || 8);
+    const payload = await sleepAnalytics.loadTrackContext(deviceId, { targetHours: target });
+    res.json(payload || { last_night: null, calendar_dots: {}, streak: 0 });
+  } catch (err) {
+    console.error('[sleep] /track-context error:', err);
+    res.status(500).json({ error: 'track context failed' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// GET /analysis/v2 — Insights V4 payload (10/10)
+// ═══════════════════════════════════════════════════════════════
+router.get('/analysis/v2', async (req, res) => {
+  try {
+    const { deviceId, range } = req.query;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+    const days = (() => {
+      const n = parseInt(range, 10);
+      if (Number.isFinite(n) && n > 0 && n <= 730) return n;
+      return null;
+    })();
+    const sleepSnap = await sleepDoc(deviceId).get();
+    const target = Number(sleepSnap.data()?.target_hours || sleepSnap.data()?.sleep_target_hours || 8);
+    const payload = await sleepAnalytics.loadAnalysisV2(deviceId, days, { openai, targetHours: target });
+    res.json(payload || { stats: null, signal_points: [], aha_moments: [] });
+  } catch (err) {
+    console.error('[sleep] /analysis/v2 error:', err);
+    res.status(500).json({ error: 'analysis v2 failed' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// GET /actions/v2 — Actions V2 payload
+// ═══════════════════════════════════════════════════════════════
+router.get('/actions/v2', async (req, res) => {
   try {
     const { deviceId } = req.query;
     if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
 
-    const [activeSnap, recentSnap, sleepSnap] = await Promise.all([
-      actionsCol(deviceId).where('status', '==', 'active').get(),
+    const [actSnap, sleepSnap] = await Promise.all([
       actionsCol(deviceId).orderBy('generated_at', 'desc').limit(20).get(),
       sleepDoc(deviceId).get(),
     ]);
 
-    const format = (action) => ({
-      ...action,
-      generated_at: toIsoString(action.generated_at),
-      completed_at: toIsoString(action.completed_at),
-    });
+    const allActions = actSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+    const sleepData  = sleepSnap.exists ? sleepSnap.data() : {};
+    const totalLogs  = sleepData.log_count || 0;
+    const lastGenAt  = sleepData.last_action_gen_at_log || 0;
+    const sinceLast  = Math.max(0, totalLogs - lastGenAt);
+    const untilRefresh = Math.max(0, 3 - sinceLast);
 
-    const sleepData      = sleepSnap.data() || {};
-    const totalLogs      = sleepData.log_count || 0;
-    const lastGenAt      = sleepData.last_action_gen_at_log || 0;
-    const sinceLast      = totalLogs - lastGenAt;
-    const untilRefresh   = Math.max(0, 3 - sinceLast);
+    const proofString = (a) => {
+      if (typeof a.proof_body === 'string' && a.proof_body) return a.proof_body;
+      if (typeof a.proof === 'string' && a.proof) return a.proof;
+      if (a.proof && typeof a.proof === 'object' && a.proof.citation) return `Tap ✓ when done — tracked vs ${a.proof.citation}.`;
+      return 'Tap ✓ when done — your coach tracks the hit-rate.';
+    };
 
-    const active = sortByTimestampField(
-      activeSnap.docs.map(mapSnapDoc).filter(a => a.source !== 'user_intention'),
-      'generated_at', 'asc'
-    ).map(format);
-
-    const currentGenIndex = active.length > 0
-      ? Math.max(...active.map(a => a.gen_index || 0))
-      : lastGenAt;
-
-    const recent = recentSnap.docs.map(mapSnapDoc).map(format);
-
-    const completed = recent.filter(a =>
+    const active = allActions.filter(a =>
+      a.kind !== 'prescription' &&
       a.source !== 'user_intention' &&
-      ['done', 'skipped'].includes(a.status) &&
-      (a.gen_index || 0) === currentGenIndex
+      (!a.status || a.status === 'active' || a.status === 'pending')
     );
+    const actions = active.slice(0, 3).map(a => ({
+      id: a.id,
+      title: (typeof a.title === 'string' && a.title) || a.text || a.surprise_hook || 'Action',
+      why:   (typeof a.why === 'string' && a.why) || a.proof_body || 'Cited from your recent sleep logs.',
+      how:   (typeof a.how === 'string' && a.how) || a.micro_step || a.surprise_hook || 'Tap below to see the step.',
+      when:  a.when || a.when_to_do || 'Tonight',
+      proof: proofString(a),
+      archetype: typeof a.archetype === 'string' ? a.archetype : null,
+      status: 'active',
+      hit_rate:     a.hit_count || a.completed_count || 0,
+      target_count: a.target_count || 1,
+      created_at:   a.generated_at || null,
+    }));
 
-    const prevGenIndex = currentGenIndex > 0
-      ? Math.max(0, ...recent
-          .filter(a => a.source !== 'user_intention' && a.status === 'past')
-          .map(a => a.gen_index || 0))
-      : 0;
-    const past = prevGenIndex > 0
-      ? recent.filter(a => a.status === 'past' && (a.gen_index || 0) === prevGenIndex)
-      : [];
+    const isCancelled = (a) => a.status === 'cancelled' || a.status === 'skipped';
+    const history = allActions
+      .filter(a => a.status === 'completed' || a.status === 'done' || isCancelled(a))
+      .slice(0, 12)
+      .map(a => {
+        const ts = a.completed_at || a.cancelled_at || a.skipped_at;
+        const ms = ts?._seconds ? ts._seconds * 1000 : (ts ? new Date(ts).getTime() : null);
+        const cancelled = isCancelled(a);
+        return {
+          id: a.id,
+          title: a.title || a.text || 'Action',
+          date_label: ms ? new Date(ms).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '—',
+          completed_at: ms ? new Date(ms).toISOString() : null,
+          outcome: a.outcome_text || (cancelled ? 'Cancelled' : `${a.hit_count || 0}/${a.target_count || 1} hit`),
+          status: cancelled ? 'cancelled' : 'completed',
+        };
+      });
 
-    res.json({ active, completed, past, until_refresh: untilRefresh, total_logs: totalLogs });
-  } catch (err) {
-    console.error('[sleep] /actions error:', err);
-    res.status(500).json({ error: 'Failed to get actions' });
-  }
-});
+    const completed_total = allActions.filter(a => a.status === 'completed' || a.status === 'done').length;
+    const skipped_total   = allActions.filter(isCancelled).length;
 
-// ─── Action complete / skip ───────────────────────────────────
-router.post('/_legacy/action/:id/complete', async (req, res) => {
-  try {
-    const { deviceId } = req.body;
-    const { id }       = req.params;
-    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
-    await actionsCol(deviceId).doc(id).update({
-      status:       'done',
-      completed_at: admin.firestore.FieldValue.serverTimestamp(),
+    res.json({
+      cadence: {
+        status: lastGenAt > 0 ? 'live' : 'pending',
+        logs_so_far:    totalLogs,
+        until_refresh:  untilRefresh,
+      },
+      actions,
+      history,
+      stats: {
+        active_count:      active.length,
+        total_logs:        totalLogs,
+        completed_total,
+        skipped_total,
+        cancelled_total:   skipped_total,
+        follow_through_pct:(completed_total + skipped_total) > 0
+          ? Math.round((completed_total / (completed_total + skipped_total)) * 100)
+          : 0,
+      },
     });
-    res.json({ success: true });
   } catch (err) {
-    console.error('[sleep] complete action error:', err);
-    res.status(500).json({ error: 'Failed' });
+    console.error('[sleep] /actions/v2 error:', err);
+    res.status(500).json({ error: 'actions v2 failed' });
   }
 });
 
-router.post('/_legacy/action/:id/skip', async (req, res) => {
+// ═══════════════════════════════════════════════════════════════
+// GET /chat-state — Coach tab header
+// ═══════════════════════════════════════════════════════════════
+router.get('/chat-state', async (req, res) => {
   try {
-    const { deviceId } = req.body;
-    const { id }       = req.params;
+    const { deviceId } = req.query;
     if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
-
-    const actionSnap = await actionsCol(deviceId).doc(id).get();
-    const actionText = actionSnap.exists ? actionSnap.data().text : null;
-
-    await actionsCol(deviceId).doc(id).update({ status: 'skipped' });
-
-    if (actionText) {
-      const snap    = await sleepDoc(deviceId).get();
-      const existing = (snap.data()?.skip_history || []);
-      const updated  = [...existing, actionText].slice(-20);
-      await sleepDoc(deviceId).update({ skip_history: updated });
-    }
-
-    res.json({ success: true });
+    const snap = await logsCol(deviceId).orderBy('logged_at', 'desc').limit(1).get();
+    const sleepSnap = await sleepDoc(deviceId).get();
+    if (snap.empty) return res.json({ last_night: null, streak: 0 });
+    const l = snap.docs[0].data();
+    const at = millis(l.logged_at);
+    const ago = Math.max(0, Math.round((Date.now() - at) / 60000));
+    res.json({
+      last_night: {
+        ago_minutes:       ago,
+        date_str:          l.date_str,
+        bedtime:           l.bedtime,
+        wake_time:         l.wake_time,
+        total_sleep_hours: Number(l.total_sleep_hours || 0),
+        sleep_quality:     Number(l.sleep_quality || 3),
+        morning_energy:    Number(l.morning_energy || 3),
+      },
+      streak: sleepSnap.data()?.streak || 0,
+    });
   } catch (err) {
-    console.error('[sleep] skip action error:', err);
-    res.status(500).json({ error: 'Failed' });
+    console.error('[sleep] /chat-state error:', err);
+    res.status(500).json({ error: 'state failed' });
   }
 });
 
@@ -1085,9 +1141,8 @@ router.post('/chat', async (req, res) => {
       });
 
     const completion = await openai.chat.completions.create({
-      model:       'gpt-4.1',
-      temperature:  0.60,
-      max_tokens:   1000,
+      model: 'gpt-4.1',
+      max_completion_tokens: 1000,
       messages: [
         { role: 'system', content: systemContext },
         ...history,
@@ -1119,24 +1174,15 @@ _mountChatStreamSleep(router, {
   agentName: 'sleep',
   openai, admin, chatsCol,
   rateLimitCheck: _checkChatRateLimit,
-  model: 'gpt-4.1', maxTokens: 1000, temperature: 0.6,
+  model: 'gpt-4.1', maxTokens: 1000,
   buildPrompt: async (deviceId, message, { proactive_context } = {}) => {
     let systemPrompt = await getCachedContext(deviceId);
     if (proactive_context) {
       systemPrompt += `\n\n[THREAD CONTEXT] User is following up on a proactive message of type: ${proactive_context}. Briefly acknowledge then focus on what they asked.`;
     }
 
-    // ── Cross-agent: fitness context ──────────────────────────────
-    try {
-      const fitnessSnap = await fetchAgentSnapshot(deviceId, 'fitness', 7);
-      if (fitnessSnap.logs && fitnessSnap.logs.length > 0) {
-        const workoutLines = fitnessSnap.logs
-          .map(l => `${l.date || l.date_str || 'unknown'}: ${l.duration_min != null ? l.duration_min + 'min' : 'duration unknown'}`)
-          .join(', ');
-        systemPrompt += `\n\nCROSS-AGENT CONTEXT (last 7 days):\nRecent training: ${workoutLines}\nNote: High training load typically increases sleep pressure but may reduce sleep quality if >60min sessions 3+ days running.`;
-      }
-    } catch (_e) { /* non-fatal — skip cross-agent block */ }
-    // ─────────────────────────────────────────────────────────────
+    // ABSOLUTE LAW: single agents never read sibling-agent data.
+    // Cross-agent insights flow ONLY through the cross-agent engine.
 
     const historySnap = await chatsCol(deviceId).orderBy('created_at', 'desc').limit(16).get();
     const history = historySnap.docs.reverse()
@@ -1427,10 +1473,9 @@ Return ONLY valid JSON array of 3 objects — no markdown, no explanation:
 
   try {
     const completion = await openai.chat.completions.create({
-      model:       'gpt-4.1',
-      temperature:  0.35,
-      max_tokens:   800,
-      messages:    [{ role: 'user', content: prompt }],
+      model: 'gpt-4.1',
+      max_completion_tokens: 800,
+      messages: [{ role: 'user', content: prompt }],
     });
 
     const raw     = completion.choices[0].message.content.trim();
@@ -1520,7 +1565,7 @@ Hard rules:
 
   try {
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4.1', temperature: 0.7, max_tokens: 200,
+      model: 'gpt-4.1', max_completion_tokens: 200,
       messages: [{ role: 'user', content: prompt }],
     });
     // Store msg type for next rotation (fire-and-forget)
@@ -1557,7 +1602,7 @@ ${severity === 'urgent' ? 'Urgency: be direct — this is a real problem affecti
 
   try {
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4.1', temperature: 0.55, max_tokens: 200,
+      model: 'gpt-4.1', max_completion_tokens: 200,
       messages: [{ role: 'user', content: prompt }],
     });
     return completion.choices[0].message.content.trim();
@@ -1578,7 +1623,7 @@ Use AFFIRMATION + CHALLENGE format:
 
   try {
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4.1', temperature: 0.7, max_tokens: 120,
+      model: 'gpt-4.1', max_completion_tokens: 120,
       messages: [{ role: 'user', content: prompt }],
     });
     return completion.choices[0].message.content.trim();
@@ -1604,7 +1649,7 @@ Rules:
 
   try {
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4.1', temperature: 0.6, max_tokens: 80,
+      model: 'gpt-4.1', max_completion_tokens: 80,
       messages: [{ role: 'user', content: prompt }],
     });
     return completion.choices[0].message.content.trim();
@@ -1629,7 +1674,7 @@ Rules:
 
   try {
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4.1', temperature: 0.6, max_tokens: 80,
+      model: 'gpt-4.1', max_completion_tokens: 80,
       messages: [{ role: 'user', content: prompt }],
     });
     return completion.choices[0].message.content.trim();
@@ -2273,7 +2318,7 @@ Return ONLY valid JSON, no markdown:
 
   try {
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4.1', temperature: 0.5, max_tokens: 280,
+      model: 'gpt-4.1', max_completion_tokens: 280,
       messages: [{ role: 'user', content: prompt }],
     });
     const raw     = completion.choices[0].message.content.trim();
@@ -2421,5 +2466,132 @@ cron.schedule('*/10 * * * *', async () => {
     console.error('[sleep] cron error:', err);
   }
 });
+
+// Pre-warm /analysis/v2 cache for active users every night at 02:30.
+async function preWarmSleepAnalysisV2() {
+  try {
+    const usersSnap = await db().collection('wellness_users').limit(500).get();
+    let warmed = 0;
+    for (const u of usersSnap.docs) {
+      const id = u.id;
+      try {
+        const checkSnap = await sleepDoc(id).collection('sleep_logs').limit(1).get();
+        if (checkSnap.empty) continue;
+        await sleepAnalytics.loadAnalysisV2(id, 30, { openai });
+        warmed++;
+      } catch { /* per-user non-fatal */ }
+    }
+    console.log(`[sleep] pre-warm: ${warmed}/${usersSnap.size} users analysis_v2 refreshed`);
+  } catch (err) {
+    console.error('[sleep] pre-warm error:', err.message);
+  }
+}
+cron.schedule('30 2 * * *', preWarmSleepAnalysisV2);
+
+// ════════════════════════════════════════════════════════════════════
+// VOICE DESCRIBE — audio → transcript → parsed sleep object.
+// 4 routes mirror nutrition's proven /describe pipeline. Confirmation
+// modal on FE handles gap-fill + edits before saving via /api/sleep/log.
+// Audio bytes never persisted (transcribe → discard buffer).
+// ════════════════════════════════════════════════════════════════════
+const _sleepDescribeLocks = new Map();
+function _acquireSleepDescribeLock(deviceId) {
+  if (_sleepDescribeLocks.has(deviceId)) return false;
+  _sleepDescribeLocks.set(deviceId, Date.now());
+  return true;
+}
+function _releaseSleepDescribeLock(deviceId) {
+  _sleepDescribeLocks.delete(deviceId);
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, t] of _sleepDescribeLocks.entries()) {
+    if (now - t > 30_000) _sleepDescribeLocks.delete(k);
+  }
+}, 10_000).unref?.();
+
+// GET /describe/dg-token — short-lived Deepgram token for live partials.
+// Frontend gracefully falls back to Apple SFSpeechAnalyzer when 503.
+router.get('/describe/dg-token', async (req, res) => {
+  const key = process.env.DEEPGRAM_API_KEY;
+  if (!key) return res.status(503).json({ error: 'deepgram_not_configured' });
+  try {
+    const r = await fetch('https://api.deepgram.com/v1/auth/grant', {
+      method: 'POST',
+      headers: { 'Authorization': `Token ${key}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ttl_seconds: 60 }),
+    });
+    if (!r.ok) {
+      const txt = await r.text();
+      return res.status(502).json({ error: 'deepgram_grant_failed', detail: txt });
+    }
+    const data = await r.json();
+    res.json({ access_token: data.access_token, expires_in: data.expires_in || 60 });
+  } catch (err) {
+    console.error('[sleep] /describe/dg-token error:', err?.message);
+    res.status(500).json({ error: 'dg_token_failed' });
+  }
+});
+
+// POST /describe/preflight — instant text inspection (no LLM).
+router.post('/describe/preflight', (req, res) => {
+  try {
+    const { text } = req.body || {};
+    res.json(sleepDescribe.preflight(text));
+  } catch (err) {
+    res.status(500).json({ error: 'preflight_failed' });
+  }
+});
+
+// POST /describe/transcribe — audio → clean transcript only.
+router.post('/describe/transcribe', async (req, res) => {
+  const t0 = Date.now();
+  try {
+    const { audio_base64, audio_mime } = req.body || {};
+    if (!audio_base64) return res.status(400).json({ error: 'audio_base64 required' });
+    const transcript = await sleepDescribe.transcribeAudio(openai, audio_base64, audio_mime);
+    if (!transcript) return res.status(400).json({ error: 'No speech detected' });
+    res.json({ transcript, latency_ms: Date.now() - t0, model: 'gpt-4o-transcribe' });
+  } catch (err) {
+    console.error('[sleep] /describe/transcribe error:', err?.message);
+    res.status(500).json({ error: err.message || 'Transcription failed' });
+  }
+});
+
+// POST /describe — audio OR transcript → parsed sleep object with confidence.
+router.post('/describe', async (req, res) => {
+  const { deviceId } = req.body || {};
+  if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+  if (!_acquireSleepDescribeLock(deviceId)) {
+    return res.status(429).json({ error: 'analyze_in_progress', message: 'Already analyzing — please wait.' });
+  }
+  const t0 = Date.now();
+  try {
+    const { audio_base64, audio_mime, transcript: providedTranscript } = req.body || {};
+    if (!audio_base64 && !providedTranscript) {
+      return res.status(400).json({ error: 'audio_base64 or transcript required' });
+    }
+    let transcript = (providedTranscript || '').trim();
+    if (!transcript && audio_base64) {
+      transcript = await sleepDescribe.transcribeAudio(openai, audio_base64, audio_mime);
+    }
+    if (!transcript) {
+      return res.status(400).json({ error: 'Could not understand audio. Please try again.' });
+    }
+    const parsed = await sleepDescribe.parseSleepText(openai, transcript);
+    res.json({
+      transcript,
+      ...parsed,
+      latency_ms: Date.now() - t0,
+    });
+  } catch (err) {
+    console.error('[sleep] /describe error:', err?.message);
+    res.status(500).json({ error: err.message || 'Describe failed' });
+  } finally {
+    _releaseSleepDescribeLock(deviceId);
+  }
+});
+
+console.log('[sleep] agent loaded ✓ — analysis-v2 pre-warm 2:30am, proactive cron */10 min, voice-describe routes mounted');
 
 module.exports = router;
