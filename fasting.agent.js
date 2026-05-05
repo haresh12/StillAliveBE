@@ -18,6 +18,10 @@ const admin   = require('firebase-admin');
 const { OpenAI } = require('openai');
 const cron    = require('node-cron');
 const crypto  = require('crypto');
+const {
+  generateAiReads, computeEFH, computeCircadian,
+  computeDayOfWeek, computeAhaMoments, scoreGrade,
+} = require('./lib/fasting-analytics');
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const db     = () => admin.firestore();
@@ -607,8 +611,7 @@ router.post('/setup', async (req, res) => {
       const batchKey = `${dateStr()}_${Date.now()}`;
       const actRes  = await openai.chat.completions.create({
         model: 'gpt-4.1-mini',
-        max_tokens: 420,
-        temperature: 0.4,
+        max_completion_tokens: 420,
         messages: [{
           role: 'system',
           content: [
@@ -863,14 +866,31 @@ router.post('/session/start', async (req, res) => {
     const data   = fSnap.data() || {};
     const setup  = data.setup || {};
 
-    // Block if user already broke a session today — one session per day rule
-    const todayKey    = dateStr();
-    const todaySnap   = await sessionsCol(deviceId).where('date', '==', todayKey).limit(5).get();
-    const alreadyBrokenToday = todaySnap.docs.some(d => d.data().broken_early === true);
+    // ── ONE FAST PER DAY RULE — guard against duplicate sessions ─────
+    // Allow only if there are NO sessions yet today AND no active session.
+    const todayKey  = dateStr();
+    const todaySnap = await sessionsCol(deviceId).where('date', '==', todayKey).limit(5).get();
+    const todayDocs = todaySnap.docs.map(d => d.data());
+    const alreadyBrokenToday    = todayDocs.some(d => d.broken_early === true);
+    const alreadyCompletedToday = todayDocs.some(d => d.completed === true);
+    const hasActiveToday        = todayDocs.some(d => d.ended_at == null);
     if (alreadyBrokenToday) {
       return res.status(409).json({
         error:   'already_broken_today',
-        message: 'You already ended a fast early today. Come back tomorrow for a fresh start.',
+        message: "You ended a fast early today. Come back tomorrow for a fresh start.",
+      });
+    }
+    if (alreadyCompletedToday) {
+      return res.status(409).json({
+        error:   'already_completed_today',
+        message: "Today's fast is already complete. New fast unlocks tomorrow.",
+      });
+    }
+    if (hasActiveToday && !data.active_session_id) {
+      // Orphaned: a non-ended session exists but doc lost its pointer — block to avoid duplicates.
+      return res.status(409).json({
+        error:   'session_in_progress',
+        message: 'A fast is already running. Open the app again or restart to refresh.',
       });
     }
 
@@ -916,32 +936,51 @@ router.post('/session/start', async (req, res) => {
     } catch { /* non-fatal */ }
 
     const sessionRef = sessionsCol(deviceId).doc();
+    let raceError = null;
 
-    await db().runTransaction(async (tx) => {
-      tx.set(sessionRef, {
-        created_at:      admin.firestore.FieldValue.serverTimestamp(),
-        started_at:      firestoreStartedAt,
-        ended_at:        null,
-        target_hours:    setup.target_fast_hours || 16,
-        actual_hours:    null,
-        completed:       false,
-        broken_early:    false,
-        broken_reason:   null,
-        metabolic_stage_reached: 'fed',
-        notes:           notes || '',
-        mood_at_start:   moodAtStart,
-        mood_at_end:     null,
-        sleep_quality_prior: null,
-        water_ml_during_fast: 0,
-        date:            startDate,
-      });
+    try {
+      await db().runTransaction(async (tx) => {
+        // Re-read user doc INSIDE the transaction so concurrent calls can't both win
+        const txSnap = await tx.get(fastingDoc(deviceId));
+        const txData = txSnap.exists ? txSnap.data() : {};
+        if (txData.active_session_id) {
+          raceError = 'session_in_progress';
+          return;
+        }
+        tx.set(sessionRef, {
+          created_at:      admin.firestore.FieldValue.serverTimestamp(),
+          started_at:      firestoreStartedAt,
+          ended_at:        null,
+          target_hours:    setup.target_fast_hours || 16,
+          actual_hours:    null,
+          completed:       false,
+          broken_early:    false,
+          broken_reason:   null,
+          metabolic_stage_reached: 'fed',
+          notes:           notes || '',
+          mood_at_start:   moodAtStart,
+          mood_at_end:     null,
+          sleep_quality_prior: null,
+          water_ml_during_fast: 0,
+          date:            startDate,
+        });
 
-      tx.update(fastingDoc(deviceId), {
-        active_session_id:       sessionRef.id,
-        total_sessions_started:  admin.firestore.FieldValue.increment(1),
-        analysis_cache:          null,
+        tx.update(fastingDoc(deviceId), {
+          active_session_id:       sessionRef.id,
+          total_sessions_started:  admin.firestore.FieldValue.increment(1),
+          analysis_cache:          null,
+        });
       });
-    });
+    } catch (txErr) {
+      console.error('[fasting] session/start transaction:', txErr);
+      return res.status(500).json({ error: 'Failed to start session' });
+    }
+    if (raceError === 'session_in_progress') {
+      return res.status(409).json({
+        error:   'session_in_progress',
+        message: 'A fast is already running. Refresh and try again.',
+      });
+    }
 
     invalidateCtx(deviceId);
 
@@ -1030,12 +1069,41 @@ router.post('/session/end', async (req, res) => {
     const data   = fSnap.data() || {};
     const setup  = data.setup || {};
     const sessId = data.active_session_id;
-    if (!sessId) return res.status(400).json({ error: 'No active session' });
+    // Idempotent: if no active session, treat as "already ended" — don't error,
+    // return current streak so the UI can confirm and stay coherent.
+    if (!sessId) {
+      return res.json({
+        success: true,
+        already_ended: true,
+        new_streak: data.current_streak || 0,
+        current_streak: data.current_streak || 0,
+      });
+    }
 
     const sessSnap = await sessionsCol(deviceId).doc(sessId).get();
-    if (!sessSnap.exists) return res.status(400).json({ error: 'Session not found' });
+    if (!sessSnap.exists) {
+      // Pointer dangling — clear it and return success
+      await fastingDoc(deviceId).update({ active_session_id: null });
+      return res.json({
+        success: true,
+        already_ended: true,
+        new_streak: data.current_streak || 0,
+        current_streak: data.current_streak || 0,
+      });
+    }
 
-    const sess         = sessSnap.data();
+    const sess = sessSnap.data();
+    // If session already ended in DB, don't double-write
+    if (sess.ended_at) {
+      await fastingDoc(deviceId).update({ active_session_id: null });
+      return res.json({
+        success: true,
+        already_ended: true,
+        new_streak: data.current_streak || 0,
+        current_streak: data.current_streak || 0,
+      });
+    }
+
     const elapsed      = getElapsedHours(sess.started_at);
     const target       = sess.target_hours || setup.target_fast_hours || 16;
     const completed    = !broken_reason && elapsed >= target;
@@ -1860,7 +1928,7 @@ router.get('/analysis', async (req, res) => {
           'No filler, no hype, no generic fasting advice.',
         ].join(' ');
         const aiRes = await openai.chat.completions.create({
-          model: 'gpt-4.1-mini', max_tokens: 180, temperature: 0.25,
+          model: 'gpt-4.1-mini', max_completion_tokens: 180,
           messages: [
             { role: 'system', content: insightPrompt },
             { role: 'user',   content: context },
@@ -1969,6 +2037,350 @@ router.get('/analysis', async (req, res) => {
     });
   } catch (e) {
     console.error('[fasting] analysis:', e);
+    return res.status(500).json({ error: 'Failed' });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════
+// GET /analysis/v2 — V4-compatible payload for FastingAnalysisTabV4
+// Shape: score / score_grade / score_gates / efh_per_day / signal_points /
+//        daily_logs / stage_breakdown / ai_reads / aha_moments / circadian /
+//        best_day / worst_day / streak / completion / avg_hours / best_fast /
+//        total_fast_hours / personal_formula / observations / ready_for_upgrade
+// ════════════════════════════════════════════════════════════════
+router.get('/analysis/v2', async (req, res) => {
+  try {
+    const { deviceId, range = '30' } = req.query;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+
+    const fSnap = await fastingDoc(deviceId).get();
+    if (!fSnap.exists) return res.json({ setup_completed: false });
+
+    const data  = fSnap.data() || {};
+    const setup = data.setup   || {};
+
+    const sessSnap = await sessionsCol(deviceId).orderBy('started_at', 'desc').limit(400).get();
+    const allSessions = sessSnap.docs.map(mapDoc);
+    const rangeMeta   = buildRangeMeta(range, allSessions);
+    const sessions    = filterSessionsToRange(allSessions, rangeMeta);
+
+    const previousRangeMeta = rangeMeta.isAllTime ? null : {
+      ...rangeMeta,
+      startKey: shiftDayKey(rangeMeta.startKey, -rangeMeta.days),
+      endKey:   shiftDayKey(rangeMeta.startKey, -1),
+    };
+    const previousSessions = previousRangeMeta ? filterSessionsToRange(allSessions, previousRangeMeta) : [];
+
+    const streak         = computeStreak(allSessions);
+    const longestStreak  = computeLongestStreak(allSessions);
+    const completion     = computeCompletionFromSessions(sessions);
+    const avgH           = computeAvgHoursFromSessions(sessions);
+    const targetHours    = setup.target_fast_hours || 16;
+    const completedSess  = sessions.filter(s => s.completed && s.actual_hours);
+    const totalFastH     = completedSess.reduce((sum, s) => sum + (s.actual_hours || 0), 0);
+    const bestFastH      = completedSess.reduce((max, s) => Math.max(max, s.actual_hours || 0), 0);
+
+    // EFH — hero metric
+    const efh_per_day = computeEFH(sessions);
+
+    // Daily map (range)
+    const byDate = {};
+    for (const s of sessions) {
+      const key = s.date || dateStr(new Date(getMillis(s.started_at)));
+      if (!byDate[key]) byDate[key] = { hours: 0, completed: false, stage: null };
+      if ((s.actual_hours || 0) >= (byDate[key].hours || 0)) {
+        byDate[key].hours     = s.actual_hours || 0;
+        byDate[key].completed = s.completed || false;
+        byDate[key].stage     = s.metabolic_stage_reached || getStage(s.actual_hours || 0).id;
+      }
+    }
+
+    // Signal points (full range)
+    const rangeKeys = buildDayKeysInRange(rangeMeta.startKey, rangeMeta.endKey);
+    const hasLogs   = rangeKeys.some(k => byDate[k]?.hours > 0);
+    const signal_points = hasLogs ? rangeKeys.map(key => {
+      const [y, m, d] = key.split('-').map(Number);
+      const dayLog = byDate[key] || null;
+      return {
+        value:     round(dayLog?.hours || 0, 1),
+        completed: !!dayLog?.completed,
+        skipped:   !dayLog,
+        date:      key,
+        label:     new Date(y, m - 1, d).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
+      };
+    }) : [];
+
+    // 28-day heatmap
+    const daily_logs = {};
+    for (let i = 27; i >= 0; i--) {
+      const d = new Date(); d.setDate(d.getDate() - i);
+      const key = dateStr(d);
+      if (byDate[key]) daily_logs[key] = byDate[key];
+    }
+
+    // Stage breakdown
+    const stageCounts = {};
+    for (const s of completedSess) {
+      const id = s.metabolic_stage_reached || getStage(s.actual_hours || 0).id;
+      stageCounts[id] = (stageCounts[id] || 0) + 1;
+    }
+    const STAGE_META = {
+      fed:             { label: 'Fed State',        order: 0 },
+      post_absorptive: { label: 'Post-Absorptive',  order: 1 },
+      glycogen:        { label: 'Glycogen Burning', order: 2 },
+      fat_burning:     { label: 'Fat Burning',      order: 3 },
+      ketosis_entry:   { label: 'Ketosis Entry',    order: 4 },
+      autophagy:       { label: 'Autophagy Active', order: 5 },
+      deep_fast:       { label: 'Deep Fast',        order: 6 },
+    };
+    const stage_breakdown = Object.entries(stageCounts)
+      .map(([id, count]) => ({
+        id, count,
+        label: STAGE_META[id]?.label || id,
+        order: STAGE_META[id]?.order ?? 99,
+        pct: completedSess.length > 0 ? Math.round(count / completedSess.length * 100) : 0,
+      }))
+      .sort((a, b) => b.count - a.count);
+
+    // Fasting score
+    const _cutoff7d = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
+    const _sess7d   = allSessions.filter(s => (s.date || '') >= _cutoff7d);
+    const _comp7d   = _sess7d.filter(s => s.completed);
+    const _cr7d     = _sess7d.length > 0 ? _comp7d.length / _sess7d.length : completion;
+    const _avgH7    = _comp7d.length ? _comp7d.reduce((s, x) => s + (x.actual_hours || 0), 0) / _comp7d.length : avgH;
+    const _withH    = completedSess.filter(s => s.actual_hours > 0);
+    const _pctFB    = _withH.length ? _withH.filter(s => s.actual_hours >= 12).length / _withH.length : 0;
+    const _pctKT    = _withH.length ? _withH.filter(s => s.actual_hours >= 16).length / _withH.length : 0;
+
+    const fasting_score = _computeFastingScore({
+      completion_rate: completion, completion_rate_7d: _cr7d,
+      streak, avg_hours: avgH, avg_hours_7d: _avgH7, target_hours: targetHours,
+      pct_reaching_fat_burn: _pctFB, pct_reaching_ketosis: _pctKT,
+      days_logged: Object.keys(byDate).length,
+    });
+
+    const score       = fasting_score?.score ?? 0;
+    const grade       = scoreGrade(score);
+    const score_gates = {
+      adherence:       { label: 'Adherence',       pts: round(fasting_score?.components?.adherence  ?? 0), weight: 35 },
+      metabolic_depth: { label: 'Metabolic Depth', pts: round(fasting_score?.components?.depth      ?? 0), weight: 25 },
+      metabolic_qual:  { label: 'Stage Quality',   pts: round(fasting_score?.components?.metabolic  ?? 0), weight: 20 },
+      consistency:     { label: 'Consistency',     pts: round(fasting_score?.components?.consistency ?? 0), weight: 20 },
+    };
+
+    // Circadian + day-of-week
+    const circadian  = computeCircadian(sessions);
+    const { best_day, worst_day } = computeDayOfWeek(sessions);
+
+    // AI reads — cached per analysis key
+    const latestMarker = allSessions[0]
+      ? (allSessions[0].date || toIso(allSessions[0].started_at) || 'latest')
+      : 'none';
+    const aiCacheKey = ['v2reads', rangeMeta.key, rangeMeta.startKey, rangeMeta.endKey,
+      targetHours, streak, Math.round(completion * 100), avgH, latestMarker].join('|');
+    const aiCacheId = crypto.createHash('sha1').update(aiCacheKey).digest('hex');
+
+    let ai_reads = { champion: null, drag: null, pattern: null };
+    const cachedReads = data.ai_reads_cache?.entries?.[aiCacheId];
+    if (cachedReads?.key === aiCacheKey) {
+      ai_reads = { champion: cachedReads.champion, drag: cachedReads.drag, pattern: cachedReads.pattern };
+    } else {
+      ai_reads = await generateAiReads(sessions, setup, rangeMeta, fasting_score, openai);
+      if (ai_reads.champion || ai_reads.drag || ai_reads.pattern) {
+        const existingEntries = data.ai_reads_cache?.entries || {};
+        fastingDoc(deviceId).update({
+          ai_reads_cache: {
+            entries: {
+              ...existingEntries,
+              [aiCacheId]: { key: aiCacheKey, ...ai_reads, generated_at: new Date().toISOString() },
+            },
+          },
+        }).catch(() => {});
+      }
+    }
+
+    // Aha moments (programmatic fallback cards)
+    const aha_moments = computeAhaMoments(sessions, setup, { ...fasting_score, streak });
+
+    // Observations (prose cards)
+    const observations = [];
+    if (completion >= 0.8) {
+      observations.push({ title: `${Math.round(completion * 100)}% completion — elite`, body: 'At 80%+ consistency, metabolic flexibility is actively building. Fat oxidation is becoming your default fuel.' });
+    } else if (completion < 0.5 && sessions.length >= 3) {
+      observations.push({ title: `${Math.round(completion * 100)}% completion — room to grow`, body: 'Most early breaks happen in the 8–12h glycogen window. Push through once and the next fast gets measurably easier.' });
+    }
+    if (streak >= 7) {
+      observations.push({ title: `${streak}-day streak — ghrelin adapting`, body: 'After 7+ consecutive fasts, hunger cues shift to become predictable and weaker during fast hours.' });
+    }
+    if (bestFastH >= 20) {
+      observations.push({ title: `Personal best: ${round(bestFastH, 1)}h`, body: 'A 20h+ fast reaches deep autophagy territory. That cellular repair event is now in your biological history.' });
+    }
+
+    // ai_insight + personal_formula (reuse legacy analysis cache for the formula line)
+    const legacyCache  = data.analysis_cache;
+    const personal_formula = legacyCache?.formula || legacyCache?.entries
+      ? (Object.values(legacyCache.entries || {}).sort((a, b) =>
+          new Date(b.generated_at) - new Date(a.generated_at))[0]?.formula || null)
+      : null;
+
+    return res.json({
+      setup_completed: true,
+      range,
+      score,
+      score_grade:  grade,
+      score_gates,
+      fasting_score,
+      efh_per_day,
+      signal_points,
+      daily_logs,
+      stage_breakdown,
+      ai_reads,
+      aha_moments,
+      circadian,
+      best_day,
+      worst_day,
+      streak,
+      longest_streak:  longestStreak,
+      completion:      round(completion, 2),
+      avg_hours:       round(avgH, 1),
+      best_fast:       round(bestFastH, 1),
+      total_fast_hours:round(totalFastH, 1),
+      target_hours:    targetHours,
+      personal_formula,
+      observations,
+      ready_for_upgrade: _cr7d >= 0.85 && _avgH7 >= (targetHours - 0.5),
+      upgrade_suggestion: _cr7d >= 0.85 && _avgH7 >= (targetHours - 0.5)
+        ? (targetHours < 16 ? '16:8' : targetHours < 18 ? '18:6' : targetHours < 20 ? '20:4' : null)
+        : null,
+    });
+  } catch (e) {
+    console.error('[fasting] /analysis/v2:', e);
+    return res.status(500).json({ error: 'Failed' });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════
+// GET /actions/v2 — V2-compatible payload for FastingActionsTabV2
+// Shape: cadence / prescription / actions[] / history[] / stats
+// Cadence is fasting-specific: "Coach reviews every 3 fasts"
+// ════════════════════════════════════════════════════════════════
+router.get('/actions/v2', async (req, res) => {
+  try {
+    const { deviceId } = req.query;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+
+    const [actSnap, fSnap, sessSnap] = await Promise.all([
+      actionsCol(deviceId).orderBy('generated_at', 'desc').limit(30).get(),
+      fastingDoc(deviceId).get(),
+      sessionsCol(deviceId).orderBy('started_at', 'desc').limit(60).get(),
+    ]);
+
+    const allActions = actSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+    const fData      = fSnap.exists ? fSnap.data() : {};
+    const sessions   = sessSnap.docs.map(d => d.data());
+
+    // Cadence: fasting is event-based — count completed fasts since last batch
+    const lastBatchAt = allActions[0]?.generated_at;
+    const lastBatchMs = lastBatchAt?._seconds
+      ? lastBatchAt._seconds * 1000
+      : (lastBatchAt ? new Date(lastBatchAt).getTime() : null);
+    const completedSinceLastBatch = lastBatchMs
+      ? sessions.filter(s => s.completed && s.actual_hours && getMillis(s.ended_at) > lastBatchMs).length
+      : 0;
+    const fastsUntilRefresh = Math.max(0, 3 - completedSinceLastBatch);
+    const totalCompleted = sessions.filter(s => s.completed).length;
+
+    const cadence = lastBatchMs ? {
+      status:               'live',
+      last_review_at:       new Date(lastBatchMs).toISOString(),
+      fasts_until_refresh:  fastsUntilRefresh,
+      total_fasts_logged:   totalCompleted,
+    } : {
+      status:             'pending',
+      total_fasts_logged: totalCompleted,
+    };
+
+    // Prescription
+    const prescriptionDoc = allActions.find(a => a.kind === 'prescription' || a.diagnosis || a.summary);
+    const prescription = prescriptionDoc
+      ? {
+          diagnosis:       prescriptionDoc.diagnosis || prescriptionDoc.summary || null,
+          generated_at:    lastBatchMs ? new Date(lastBatchMs).toISOString() : null,
+          generated_label: lastBatchMs
+            ? new Date(lastBatchMs).toLocaleString('en-US', { weekday: 'short', hour: 'numeric', minute: '2-digit' })
+            : null,
+          evidence: prescriptionDoc.evidence || [],
+        }
+      : null;
+
+    // Active actions
+    const isCancelled = (a) => a.status === 'cancelled' || a.status === 'skipped';
+    const active = allActions.filter(a =>
+      a.kind !== 'prescription' &&
+      (!a.status || a.status === 'active' || a.status === 'pending')
+    );
+    const WHEN_LABEL = {
+      morning:   'This morning',
+      afternoon: 'This afternoon',
+      evening:   'This evening',
+      anytime:   'Today',
+      now:       'Right now',
+      today:     'Today',
+      next:      'Next fast',
+    };
+    const actions = active.slice(0, 4).map(a => {
+      const rawWhen = a.when || a.cadence_text || a.when_to_do || a.priority || 'today';
+      const when    = WHEN_LABEL[String(rawWhen).toLowerCase()] || rawWhen;
+      return {
+        id:           a.id,
+        title:        a.title || a.text || 'Action',
+        why:          a.why   || a.evidence_text || a.reasoning || 'Based on your recent fasting data.',
+        how:          a.how   || a.micro_step    || a.action_text || a.text || '',
+        when,
+        proof:        a.proof || a.science || '',
+        status:       'active',
+        hit_rate:     a.hit_count      || a.completed_count || 0,
+        target_count: a.target_count   || 1,
+        archetype:    a.archetype      || null,
+        created_at:   a.generated_at   || null,
+      };
+    });
+
+    // History
+    const history = allActions
+      .filter(a => a.status === 'completed' || isCancelled(a))
+      .slice(0, 12)
+      .map(a => {
+        const tsCandidate = a.completed_at || a.cancelled_at || a.skipped_at;
+        const ms = tsCandidate?._seconds
+          ? tsCandidate._seconds * 1000
+          : (tsCandidate ? new Date(tsCandidate).getTime() : null);
+        return {
+          id:             a.id,
+          title:          a.title || a.text || 'Action',
+          date_label:     ms ? new Date(ms).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '—',
+          completed_at:   ms ? new Date(ms).toISOString() : null,
+          status:         isCancelled(a) ? 'cancelled' : 'completed',
+          outcome_grade:  a.outcome_grade  || (isCancelled(a) ? 'abandoned' : 'kept'),
+          outcome_reason: a.outcome_reason || null,
+        };
+      });
+
+    // Stats
+    const completed_total = allActions.filter(a => a.status === 'completed').length;
+    const cancelled_total = allActions.filter(isCancelled).length;
+    const decided = completed_total + cancelled_total;
+    const stats = {
+      active_count:       active.length,
+      completed_total,
+      cancelled_total,
+      skipped_total:      cancelled_total, // alias — frontend reads either
+      follow_through_pct: decided ? Math.round((completed_total / decided) * 100) : 0,
+    };
+
+    return res.json({ cadence, prescription, actions, history, stats });
+  } catch (e) {
+    console.error('[fasting] /actions/v2:', e);
     return res.status(500).json({ error: 'Failed' });
   }
 });
@@ -2445,44 +2857,56 @@ router.post('/_legacy/actions/refresh', async (req, res) => {
 });
 
 // ================================================================
-// POST /action/:id/complete
+// POST /action/:id/complete  (canonical — frontend uses this path)
+// Also reachable via /_legacy/action/:id/complete for forward compat.
 // ================================================================
-router.post('/_legacy/action/:id/complete', async (req, res) => {
+async function _completeAction(req, res) {
   try {
-    const { deviceId } = req.body;
+    const { deviceId, outcome_grade, outcome_source, outcome_reason } = req.body;
     const { id }       = req.params;
     if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
 
     await actionsCol(deviceId).doc(id).update({
-      status:       'completed',
-      completed_at: admin.firestore.FieldValue.serverTimestamp(),
+      status:         'completed',
+      completed_at:   admin.firestore.FieldValue.serverTimestamp(),
+      outcome_grade:  outcome_grade  || 'kept',
+      outcome_source: outcome_source || 'user_confirmed',
+      outcome_reason: outcome_reason || null,
     });
     return res.json({ success: true });
   } catch (e) {
     console.error('[fasting] action/complete:', e);
     return res.status(500).json({ error: 'Failed' });
   }
-});
+}
+router.post('/action/:id/complete',         _completeAction);
+router.post('/_legacy/action/:id/complete', _completeAction);
 
 // ================================================================
-// POST /action/:id/skip
+// POST /action/:id/skip  (canonical)
 // ================================================================
-router.post('/_legacy/action/:id/skip', async (req, res) => {
+async function _skipAction(req, res) {
   try {
-    const { deviceId } = req.body;
+    const { deviceId, outcome_grade, outcome_source, outcome_reason } = req.body;
     const { id }       = req.params;
     if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
 
     await actionsCol(deviceId).doc(id).update({
-      status:    'skipped',
-      skipped_at:admin.firestore.FieldValue.serverTimestamp(),
+      status:         'cancelled',
+      cancelled_at:   admin.firestore.FieldValue.serverTimestamp(),
+      skipped_at:     admin.firestore.FieldValue.serverTimestamp(), // legacy alias
+      outcome_grade:  outcome_grade  || 'abandoned',
+      outcome_source: outcome_source || 'user_skipped',
+      outcome_reason: outcome_reason || null,
     });
     return res.json({ success: true });
   } catch (e) {
     console.error('[fasting] action/skip:', e);
     return res.status(500).json({ error: 'Failed' });
   }
-});
+}
+router.post('/action/:id/skip',         _skipAction);
+router.post('/_legacy/action/:id/skip', _skipAction);
 
 // ================================================================
 // POST /chat
