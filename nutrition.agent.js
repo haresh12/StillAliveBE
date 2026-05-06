@@ -13,6 +13,7 @@ const { OpenAI } = require('openai');
 const cron    = require('node-cron');
 
 const { MODELS, OPENAI_TIMEOUT_MS, safeJSON, assertImageSize } = require('./lib/model-router');
+const { callGeminiVision, isGeminiAvailable } = require('./lib/vision-router');
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, timeout: OPENAI_TIMEOUT_MS });
 const db = () => admin.firestore();
@@ -2015,6 +2016,24 @@ async function _multiShotVision(shotsBase64, userCtx, hasDepth, hasFiducial) {
   ];
 
   console.log(`[vision] _multiShotVision → model=${modelUsed} detail=${detail} shots=${shotsBase64.length} avg_size_kb=${Math.round(shotsBase64.reduce((s, b) => s + b.length, 0) / shotsBase64.length / 1024)}`);
+
+  // ── Path A: Gemini 2.5 Pro (preferred for food vision when key set) ──
+  // Deterministic config (temperature 0) means re-shooting the same plate
+  // returns the same macros. Falls through to OpenAI on any failure.
+  if (isGeminiAvailable()) {
+    const geminiParsed = await callGeminiVision({
+      systemPrompt: _SYSTEM_PROMPT_CACHED,
+      userText:     userMsgText,
+      images:       shotsBase64,
+      maxOutputTokens: 5000,
+      label:        'nutrition-vision',
+    });
+    if (geminiParsed && (Array.isArray(geminiParsed.items) || geminiParsed.is_label)) {
+      console.log('[vision] ✓ gemini parsed items count:', geminiParsed.items?.length || 0);
+      return geminiParsed;
+    }
+    console.log('[vision] gemini path empty — falling back to OpenAI');
+  }
 
   let completion;
   try {

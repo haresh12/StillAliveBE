@@ -16,9 +16,31 @@ const router  = express.Router();
 const admin   = require('firebase-admin');
 const { OpenAI } = require('openai');
 const cron    = require('node-cron');
+const crypto  = require('crypto');
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const db     = () => admin.firestore();
+
+// Gemini 2.5 Pro is preferred for water-photo vision (deterministic, cheaper,
+// stays consistent across re-shoots of the same glass). OpenAI is the fallback.
+const { callGeminiVision, hashImages } = require('./lib/vision-router');
+
+// Image-hash cache — same photo bytes ⇒ same response. Kills the "10 different
+// answers for the same glass" bug at the root. 30-min TTL, capped 200 entries.
+const _photoCache = new Map();
+function _photoCacheKey(deviceId, b64) {
+  return `${deviceId}:${hashImages(null, [b64])}`;
+}
+function _photoCacheGet(key) {
+  const v = _photoCache.get(key);
+  if (!v) return null;
+  if (Date.now() - v.t > 30 * 60 * 1000) { _photoCache.delete(key); return null; }
+  return v.data;
+}
+function _photoCacheSet(key, data) {
+  _photoCache.set(key, { t: Date.now(), data });
+  if (_photoCache.size > 200) _photoCache.delete(_photoCache.keys().next().value);
+}
 
 // ─── Context cache (5-min TTL, invalidated on write) ─────────
 const _ctxCache = new Map();
@@ -61,7 +83,7 @@ const { mountActionRoutes, gradeActions: _gradeActionsShared } = require('./lib/
 const { computeWaterCandidates, waterGraders } = require('./lib/candidates/water');
 const { assertNoCrossAgent } = require('./lib/sandbox');
 const { computeWaterScore: _computeWaterScore } = require('./lib/agent-scores');
-const { fetchAgentSnapshot } = require('./lib/cross-agent-context');
+// Cross-agent reads are handled by wellness.cross.js — water.agent.js never reads sibling agents.
 assertNoCrossAgent('water', computeWaterCandidates);
 const _v2Hooks = mountActionRoutes(router, {
   agentName: 'water',
@@ -70,15 +92,22 @@ const _v2Hooks = mountActionRoutes(router, {
   computeCandidates: computeWaterCandidates,
   graders: waterGraders,
   openai, admin, db,
+  // Cross-agent rule: water.agent.js MUST NOT read sibling agents directly.
+  // Instead it reads from `cross_agent/today_signals`, which is written by
+  // wellness.cross.js (the only place allowed to read across all 6 agents).
   crossAgentEnricher: async (deviceId) => {
-    const fitnessSnap = await fetchAgentSnapshot(deviceId, 'fitness', 1).catch(() => null);
-    const parts = [];
-    if (fitnessSnap?.logs?.length) {
-      const w = fitnessSnap.logs[0];
-      const mins = w.duration_min || 0;
-      if (mins >= 30) parts.push(`Workout logged today (${mins} min) → increase hydration goal by ~500ml.`);
+    try {
+      const xSnap = await userDoc(deviceId).collection('cross_agent').doc('today_signals').get();
+      if (!xSnap.exists) return '';
+      const x = xSnap.data() || {};
+      const parts = [];
+      if (x.water_target_bonus_ml > 0 && x.water_target_bonus_reason) {
+        parts.push(`Cross-signal: ${x.water_target_bonus_reason} → +${x.water_target_bonus_ml}ml today.`);
+      }
+      return parts.join(' ');
+    } catch {
+      return '';
     }
-    return parts.join(' ');
   },
 });
 function _onWaterLog(deviceId) {
@@ -90,7 +119,11 @@ function _onWaterLog(deviceId) {
     agentName: 'water', deviceId, actionsCol, logsCol,
     graders: waterGraders, admin, db,
   }).catch(() => {});
-  try { require('./wellness.cross').invalidateWellnessCache?.(deviceId); } catch {}
+  try {
+    const cross = require('./wellness.cross');
+    cross.invalidateWellnessCache?.(deviceId);
+    cross.recomputeTodaySignals?.(deviceId).catch(() => {});
+  } catch {}
 }
 // ════════════════════════════════════════════════════════════════
 
@@ -723,67 +756,38 @@ function buildPatternInsights({ byDate, rangeKeys, goalByDate, goalMl }) {
 
 async function buildCrossAgentInsights(deviceId, byDate, goalMl, goalByDate, rangeKeys, streak) {
   const insights = [];
-  const rangeSet = new Set(rangeKeys);
 
-  // Sleep correlation
+  // Cross-agent rule: water never reads sibling-agent collections directly.
+  // wellness.cross.js writes pre-computed correlations into cross_agent/today_signals.
   try {
-    const sleepSnap = await userDoc(deviceId)
-      .collection('agents').doc('sleep')
-      .collection('sleep_logs')
-      .orderBy('date', 'desc')
-      .limit(21)
-      .get();
+    const xSnap = await userDoc(deviceId).collection('cross_agent').doc('today_signals').get();
+    const x = xSnap.exists ? (xSnap.data() || {}) : {};
 
-    const sleepDays = sleepSnap.docs.map(d => d.data()).filter(d => rangeSet.has(d.date));
-    const pairs     = sleepDays.filter(d => byDate[d.date]);
-
-    if (pairs.length >= 5) {
-      const good = pairs.filter(d => (d.quality_score || 0) >= 70);
-      const low  = pairs.filter(d => (d.quality_score || 0) < 70);
-
-      if (good.length >= 2 && low.length >= 2) {
-        const avgGood = Math.round(avg(good.map(d => byDate[d.date]?.effective_ml || 0)));
-        const avgLow  = Math.round(avg(low.map(d => byDate[d.date]?.effective_ml || 0)));
-
-        if (Math.abs(avgGood - avgLow) >= 250) {
-          const better = avgGood > avgLow ? 'better' : 'worse';
-          const avgGoodGoal = Math.round(avg(good.map(d => goalByDate[d.date] || goalMl)));
-          insights.push({
-            type: 'sleep',
-            emoji: '🌙',
-            title: 'SLEEP CORRELATION',
-            body: `On higher-quality sleep days, your average water intake is ${avgGood} ml versus ${avgLow} ml on lower-sleep days. Hydration appears ${better} when your recovery is better.`,
-            stat: `${Math.round(avgGood / Math.max(avgGoodGoal, 1) * 100)}% of goal on good-sleep days`,
-          });
-        }
-      }
+    // Sleep correlation — wellness.cross writes water_sleep_correlation: { good_avg_ml, low_avg_ml, good_avg_goal_ml, sample_size }
+    const sc = x.water_sleep_correlation;
+    if (sc && sc.sample_size >= 5 && Math.abs((sc.good_avg_ml || 0) - (sc.low_avg_ml || 0)) >= 250) {
+      const better = sc.good_avg_ml > sc.low_avg_ml ? 'better' : 'worse';
+      insights.push({
+        type: 'sleep',
+        emoji: '🌙',
+        title: 'SLEEP CORRELATION',
+        body: `On higher-quality sleep days, your average water intake is ${sc.good_avg_ml} ml versus ${sc.low_avg_ml} ml on lower-sleep days. Hydration appears ${better} when your recovery is better.`,
+        stat: `${Math.round(sc.good_avg_ml / Math.max(sc.good_avg_goal_ml || goalMl, 1) * 100)}% of goal on good-sleep days`,
+      });
     }
-  } catch { /* non-fatal */ }
 
-  // Mind correlation
-  try {
-    const mindSnap = await userDoc(deviceId)
-      .collection('agents').doc('mind')
-      .collection('mind_checkins')
-      .orderBy('logged_at', 'desc')
-      .limit(30)
-      .get();
-
-    const checkins = mindSnap.docs.map(d => d.data()).filter(d => rangeSet.has(d.date_str));
-    const anxious  = checkins.filter(d => (d.anxiety || 0) >= 4 && byDate[d.date_str]);
-
-    if (anxious.length >= 3) {
-      const avgWater = Math.round(avg(anxious.map(d => byDate[d.date_str]?.effective_ml || 0)));
-      const avgGoalForAnxious = Math.round(avg(anxious.map(d => goalByDate[d.date_str] || goalMl)));
+    // Mind correlation — wellness.cross writes water_mind_correlation: { anxious_avg_ml, anxious_avg_goal_ml, sample_size }
+    const mc = x.water_mind_correlation;
+    if (mc && mc.sample_size >= 3) {
       insights.push({
         type: 'mind',
         emoji: '🧠',
         title: 'MOOD LINK',
-        body: `On high-anxiety check-in days, your average intake is ${avgWater} ml. Thirst and agitation often stack together, so earlier hydration matters more than catch-up later.`,
-        stat: `${Math.round(avgWater / Math.max(avgGoalForAnxious, 1) * 100)}% of goal on high-anxiety days`,
+        body: `On high-anxiety check-in days, your average intake is ${mc.anxious_avg_ml} ml. Thirst and agitation often stack together, so earlier hydration matters more than catch-up later.`,
+        stat: `${Math.round(mc.anxious_avg_ml / Math.max(mc.anxious_avg_goal_ml || goalMl, 1) * 100)}% of goal on high-anxiety days`,
       });
     }
-  } catch { /* non-fatal */ }
+  } catch { /* non-fatal — degrade gracefully when signals missing */ }
 
   // Hunger / thirst confusion
   const lowWaterDays = rangeKeys.filter(key => (byDate[key]?.effective_ml || 0) < (goalByDate[key] || goalMl) * 0.7).length;
@@ -912,8 +916,7 @@ async function generateAnalysisInsight(setup, stats, hydrationScore, crossAgentI
 
     const completion = await openai.chat.completions.create({
       model: 'gpt-4.1-mini',
-      temperature: 0.45,
-      max_tokens: 220,
+      max_completion_tokens: 220,
       messages: [{ role: 'system', content: prompt }],
     });
 
@@ -1273,15 +1276,14 @@ async function buildWaterContext(deviceId) {
       .map(m => `[${m.proactive_type || 'check_in'} at ${toIso(m.created_at)?.slice(11,16) || '?'}]: ${m.content.slice(0, 100)}`)
       .join('\n');
 
+    // Cross-agent rule: water never reads sleep_logs directly. Pull a pre-computed
+    // recent-sleep summary from cross_agent/today_signals (written by wellness.cross.js).
     let sleepNote = '';
     try {
-      const sleepSnap = await userDoc(deviceId).collection('agents').doc('sleep')
-        .collection('sleep_logs').orderBy('date', 'desc').limit(3).get();
-      if (!sleepSnap.empty) {
-        const entries = sleepSnap.docs.map(d => d.data()).filter(d => d.quality_score);
-        if (entries.length) {
-          sleepNote = `Recent sleep quality (last ${entries.length} nights): ${entries.map(d => `${d.quality_score}/100 on ${d.date}`).join(', ')}.`;
-        }
+      const xSnap = await userDoc(deviceId).collection('cross_agent').doc('today_signals').get();
+      const recent = xSnap.exists ? (xSnap.data() || {}).recent_sleep_summary : null;
+      if (recent && recent.entries && recent.entries.length) {
+        sleepNote = `Recent sleep quality (last ${recent.entries.length} nights): ${recent.entries.map(e => `${e.quality_score}/100 on ${e.date}`).join(', ')}.`;
       }
     } catch { /* non-fatal */ }
 
@@ -1608,6 +1610,405 @@ router.post('/log', async (req, res) => {
   }
 });
 
+// ─── POST /log/from-photo ─────────────────────────────────────
+// Camera-driven log: client posts a base64 JPEG, backend asks GPT-vision
+// to estimate drink type / container / volume / fill / brand-label /
+// confidence. Returns structured payload. Frontend renders confirmation
+// sheet showing only the fields the AI is unsure about, then the user
+// taps Log → frontend calls existing POST /log with the resolved values.
+//
+// This endpoint is analysis-only — it never writes to Firestore. The
+// actual log write goes through /log so the existing optimistic UI,
+// streak math, and action grading pipeline are untouched.
+router.post('/log/from-photo', async (req, res) => {
+  try {
+    const { deviceId, shot_b64 } = req.body || {};
+    if (!deviceId)  return res.status(400).json({ error: 'deviceId required' });
+    if (!shot_b64)  return res.status(400).json({ error: 'shot_b64 required' });
+    if (shot_b64.length > 12 * 1024 * 1024) {
+      return res.status(413).json({ error: 'photo too large (max 12MB base64)' });
+    }
+
+    // Hash-based cache — identical photo bytes always return identical answer.
+    // Hard guarantee against the "10 different results for same glass" bug.
+    const cacheKey = _photoCacheKey(deviceId, shot_b64);
+    const cached   = _photoCacheGet(cacheKey);
+    if (cached) {
+      return res.json({ ...cached, cached: true });
+    }
+
+    // Pull the user's saved containers + setup so the prompt can reference
+    // brand-volume conventions and the user's typical drink type.
+    let savedContainersHint = '';
+    try {
+      const cSnap = await waterDoc(deviceId).collection('containers').orderBy('use_count', 'desc').limit(8).get();
+      if (!cSnap.empty) {
+        const list = cSnap.docs.map(d => {
+          const x = d.data();
+          return `${x.name} (${x.drink_type}, ${x.ml}ml)`;
+        }).join('; ');
+        savedContainersHint = `User's saved containers (prefer these volumes when one matches the photo): ${list}.`;
+      }
+    } catch { /* non-fatal */ }
+
+    // ─── Liquid-first prompt with worked examples + scale anchors ────────
+    // Goal: same glass always returns the same number, ±10ml ceiling.
+    // The model is forced through an explicit reasoning chain anchored to
+    // observable scale references (user's hand, plate, surrounding objects)
+    // and self-checks its own answer before emitting the final JSON.
+    const systemPrompt = [
+      'ROLE: You are a precise volumetric vision system for hydration logging.',
+      'TASK: Estimate the volume of LIQUID currently in the container in ONE photo.',
+      'Your output is what the user actually drank — the WATER, not the empty glass.',
+      'Return STRICT JSON only. No prose, no markdown, no code fences.',
+      '',
+      '════════════════════════════════════════════════════════════════',
+      'CORE PRINCIPLE: SAME PHOTO ⇒ SAME NUMBERS, ALWAYS.',
+      'Do not be probabilistic. Be a measurement instrument.',
+      '════════════════════════════════════════════════════════════════',
+      '',
+      '──── REASONING CHAIN (do all 7 steps internally before emitting JSON) ────',
+      '',
+      'STEP 1 — SCALE ANCHOR. Find a reference object in frame. Use the FIRST one that applies:',
+      '  (a) Printed brand label with volume (Evian 500ml, Smartwater 1L, Coca-Cola 330ml, Starbucks size). This is GOLD — confidence 95+.',
+      '  (b) User\'s hand wrapping or near the container. Adult male hand ≈ 19cm long / 9cm wide; adult female ≈ 17cm long / 8cm wide. Use width of fingers (1.8–2.2cm) for fine calibration.',
+      '  (c) Standard objects in scene: dinner plate (26cm), credit card (8.5cm), smartphone (~15cm), keyboard key (1.8cm), coaster (10cm).',
+      '  (d) NO scale reference visible → fall back to typical capacities table (Step 4).',
+      '  Note which anchor you used in `reasoning`.',
+      '',
+      'STEP 2 — VESSEL CLARITY. Is the container transparent (you can see the liquid surface through the wall) or opaque (you cannot)?',
+      '  Transparent: clear glass, clear plastic bottle, glass jar, ice tea pitcher, sparkling water bottle.',
+      '  Opaque: ceramic mug, metal bottle, paper cup, sports flask, soda can (label-only visibility).',
+      '  Set vessel_clarity accordingly.',
+      '',
+      'STEP 3 — CONTAINER GEOMETRY. Identify the shape:',
+      '  - cylinder (straight walls, e.g. pint glass, tumbler)',
+      '  - frustum (wider at top, e.g. drinking glass, paper cup)',
+      '  - bottle-with-neck (e.g. water bottle, beer bottle)',
+      '  - flared bowl on stem (wine glass)',
+      '  - mug (cylindrical with handle)',
+      '  - can (sealed cylinder with label)',
+      '',
+      'STEP 4 — CAPACITY (what a FULL vessel would hold):',
+      '  PRIORITY 1: Brand label if readable → use exact printed value.',
+      '  PRIORITY 2: Cross-reference scale anchor (Step 1) with shape (Step 3) to size the container in cm, then compute capacity from geometry. E.g. cylinder 8cm diameter × 10cm tall = π × 4² × 10 = 502cc ≈ 500ml.',
+      '  PRIORITY 3: Typical-capacity table (use only if no scale anchor):',
+      '    espresso=60 · shot=45 · small wine=180 · large wine=250 · drinking glass=250 · mug=300 · large mug=400 · soda can=330 · tumbler=400 · paper cup S/M/L=240/350/470 · pint=500 · water bottle=500 · sports bottle=700 · 1L bottle=1000 · 1.5L=1500',
+      '  Set container_capacity_ml. Round to nearest 10.',
+      '',
+      'STEP 5 — FILL PERCENT (the actual measurement):',
+      '  IF transparent vessel AND liquid surface visible:',
+      '    Locate the meniscus. Measure its height from the inside bottom.',
+      '    fill_percent = (liquid_height / interior_height) × 100, rounded to nearest 5.',
+      '    For tapered vessels (frustum, wine glass), DO NOT linearly map height to volume — top of glass holds more liquid per cm than bottom. Use:',
+      '      - Liquid in bottom half of frustum ≈ 25–35% of capacity',
+      '      - Liquid at midpoint ≈ 40–50% of capacity',
+      '      - Liquid in top half ≈ 65–80% of capacity',
+      '      - Liquid at rim ≈ 95–100%',
+      '    Confidence ≥85 — you can SEE the water; do NOT add "fill" to unsure_about.',
+      '  IF opaque vessel:',
+      '    Use external cues: steam visible → 70–90%; liquid at rim → 95–100%; ring marks indicating recent fill height; glass tilted but no spill → ≤80%.',
+      '    No cues at all → default to 90% (most users photograph drinks shortly after pouring).',
+      '    Confidence ≤80; add "fill" to unsure_about.',
+      '  IF empty / dry / residue-only:',
+      '    fill_percent = 0–10, reasoning = "empty / residue only".',
+      '',
+      'STEP 6 — DRINK TYPE. Color + container + context:',
+      '  Crystal clear, no bubbles → water',
+      '  Clear with rising bubbles → sparkling',
+      '  Pale yellow / amber → tea or herbal_tea (mug → tea; tea bag visible → tea; in clear pot → herbal_tea)',
+      '  Dark brown / black → coffee',
+      '  Cloudy white → milk',
+      '  Bright orange / red / purple → juice',
+      '  Caramel brown + fizz → soda',
+      '  Bright neon (cyan/green/red) → sport_drink',
+      '  Cloudy yellow + foam head → alcohol (beer)',
+      '  Deep red in wine glass → alcohol (wine)',
+      '  Container hint: mug → coffee or tea; wine glass → wine; can → soda or sport; sports bottle → water or sport',
+      '  Be DECISIVE. If you cannot tell coffee vs tea, pick coffee (more common) and add "drink_type" to unsure_about.',
+      '',
+      'STEP 7 — SELF-CHECK (DO NOT SKIP):',
+      '  Before emitting, verify:',
+      '  (a) Is estimated_ml within 5% of (container_capacity_ml × fill_percent / 100)? If not, recompute estimated_ml = capacity × fill / 100.',
+      '  (b) Is your number plausible for this container type? A coffee mug should be 50–400ml, not 800ml. A water bottle should be 250–1500ml.',
+      '  (c) If brand_label is set, does estimated_ml ≤ brand_label.ml? It cannot be more than the bottle holds.',
+      '  (d) Is your reasoning self-consistent? If you wrote "transparent glass, liquid 70%" but estimated_ml is 50% of capacity, fix the inconsistency.',
+      '',
+      '──── WORKED EXAMPLES (study format + reasoning style) ────',
+      '',
+      'EXAMPLE 1 — clear glass, 70% full water:',
+      '  Reasoning: cylinder ~8cm dia × 12cm tall (calibrated from hand width 8cm in frame). Capacity ≈ π·4²·12 = 600ml ≈ standard pint glass 500ml (closer match). Liquid surface at 70% height of straight cylinder ≈ 70% of capacity. 500 × 0.70 = 350ml. Clear, no bubbles → water. Confidence 88 (clear surface, hand fiducial).',
+      '  → {"drink_type":"water","container_type":"glass","vessel_clarity":"transparent","container_capacity_ml":500,"fill_percent":70,"estimated_ml":350,"confidence":88,"brand_label":null,"unsure_about":[],"reasoning":"pint-sized glass, hand fiducial, water surface at 70% — straight cylinder maps linearly"}',
+      '',
+      'EXAMPLE 2 — Evian bottle, label readable, half empty:',
+      '  Reasoning: brand label visible "Evian 500mL". Bottle, transparent. Liquid level at midline = ~50% (bottle has slight neck taper but middle 70% is straight). Crystal clear → water. Brand label dominates → confidence 96.',
+      '  → {"drink_type":"water","container_type":"bottle","vessel_clarity":"transparent","container_capacity_ml":500,"fill_percent":50,"estimated_ml":250,"confidence":96,"brand_label":{"name":"Evian 500ml","ml":500},"unsure_about":[],"reasoning":"Evian 500ml label visible, liquid surface at midline = 50%"}',
+      '',
+      'EXAMPLE 3 — ceramic mug with steam, no liquid surface visible:',
+      '  Reasoning: opaque white ceramic mug, ~9cm tall. Steam rising = recently filled. Cannot see surface. Default to 90% fill. Mug capacity ~300ml. Dark brown stain on inside rim → coffee. Confidence 70 (fill is inferred, not measured).',
+      '  → {"drink_type":"coffee","container_type":"mug","vessel_clarity":"opaque","container_capacity_ml":300,"fill_percent":90,"estimated_ml":270,"confidence":70,"brand_label":null,"unsure_about":["fill"],"reasoning":"opaque mug + steam → recently filled, default 90%; coffee ring confirms type"}',
+      '',
+      'EXAMPLE 4 — wine glass, ¼ full:',
+      '  Reasoning: flared bowl on stem = wine glass, ~250ml capacity. Frustum geometry: liquid in bottom quarter of bowl. For a flared wine glass, bottom-quarter height holds only ~10–15% of capacity. fill_percent = 12 → 250 × 0.12 = 30ml — but wait, that\'s less than a sip. Re-check: liquid extends slightly past quarter-height → bump to 18%. 250 × 0.18 ≈ 45ml. Deep red → wine. Confidence 84.',
+      '  → {"drink_type":"alcohol","container_type":"wine_glass","vessel_clarity":"transparent","container_capacity_ml":250,"fill_percent":18,"estimated_ml":45,"confidence":84,"brand_label":null,"unsure_about":[],"reasoning":"wine glass quarter-height — frustum geometry yields ~18% of capacity, not 25%"}',
+      '',
+      '──── OUTPUT SCHEMA (all keys required) ────',
+      '  drink_type           — enum: water | sparkling | herbal_tea | tea | milk | juice | coffee | sport_drink | soda | alcohol | other',
+      '  container_type       — enum: glass | bottle | mug | can | sports_bottle | wine_glass | paper_cup | tumbler | other',
+      '  vessel_clarity       — "transparent" | "opaque"',
+      '  container_capacity_ml — integer, full-vessel volume rounded to nearest 10',
+      '  fill_percent         — integer 0–100, rounded to nearest 5',
+      '  estimated_ml         — integer = round_10(capacity × fill / 100)',
+      '  confidence           — integer 0–100',
+      '  brand_label          — null OR {"name": string, "ml": integer}',
+      '  unsure_about         — subset of ["drink_type","capacity","fill"]',
+      '  reasoning            — ≤24 words: anchor used, vessel clarity, key visual evidence',
+      '',
+      savedContainersHint,
+      '',
+      'Return the JSON object only.',
+    ].filter(Boolean).join('\n');
+
+    const responseSchema = {
+      type: 'object',
+      properties: {
+        drink_type:           { type: 'string', enum: ['water','sparkling','herbal_tea','tea','milk','juice','coffee','sport_drink','soda','alcohol','other'] },
+        container_type:       { type: 'string', enum: ['glass','bottle','mug','can','sports_bottle','wine_glass','paper_cup','tumbler','other'] },
+        vessel_clarity:       { type: 'string', enum: ['transparent','opaque'] },
+        container_capacity_ml:{ type: 'integer' },
+        fill_percent:         { type: 'integer' },
+        estimated_ml:         { type: 'integer' },
+        confidence:           { type: 'integer' },
+        brand_label:          {
+          type: 'object',
+          nullable: true,
+          properties: { name: { type: 'string' }, ml: { type: 'integer' } },
+        },
+        unsure_about:         { type: 'array', items: { type: 'string', enum: ['drink_type','capacity','fill'] } },
+        reasoning:            { type: 'string' },
+      },
+      required: ['drink_type','container_type','vessel_clarity','container_capacity_ml','fill_percent','estimated_ml','confidence','unsure_about','reasoning'],
+    };
+
+    // ─── Personal calibration — pull the user's correction history ───────
+    // Each {drink_type, container_type} pair has a learned ratio (user_ml /
+    // ai_ml) from past corrections. Shrinks the range over time and applies
+    // a multiplier so the AI's estimate auto-corrects in this user's direction.
+    let personalCalibration = null;
+    try {
+      const calSnap = await waterDoc(deviceId).collection('calibration')
+        .orderBy('updated_at', 'desc').limit(20).get();
+      if (!calSnap.empty) {
+        const map = {};
+        calSnap.docs.forEach(d => {
+          const x = d.data();
+          if (x.drink_type && x.container_type && Number.isFinite(x.ratio) && Number.isFinite(x.sample_count)) {
+            map[`${x.drink_type}|${x.container_type}`] = {
+              ratio: x.ratio,
+              n:     x.sample_count,
+            };
+          }
+        });
+        personalCalibration = map;
+      }
+    } catch { /* non-fatal */ }
+
+    const t0 = Date.now();
+    let parsed = null;
+    // usedModel is set by exactly one of the paths below (Gemini success OR
+    // OpenAI fallback success). If both fail we return 502 before reading it.
+    let usedModel = 'unknown';
+
+    // ── Path A: Gemini 2.5 Flash (preferred — 3-5× faster than Pro, plenty
+    // accurate for the simple "what drink, how full" task. Pro is overkill
+    // for water and was the main reason logs were taking 6-10s on slow
+    // networks). Deterministic config (temp 0) is preserved by the router.
+    parsed = await callGeminiVision({
+      systemPrompt,
+      userText: 'Analyze this drink photo. Work through the 7-step reasoning chain internally, then emit the JSON.',
+      images: [shot_b64],
+      responseSchema,
+      // 1200 tokens lets the model reason through scale anchor → geometry →
+      // capacity → fill → self-check before emitting JSON. 400 was forcing
+      // it to skip steps, which is why the same glass gave 200 vs 560.
+      maxOutputTokens: 1200,
+      model: 'gemini-2.5-flash',
+      label: 'water-log',
+    });
+    if (parsed) usedModel = 'gemini-2.5-flash';
+
+    // ── Path B: OpenAI fallback ──
+    if (!parsed) {
+      const completion = await openai.chat.completions.create({
+        model: 'gpt-4.1-mini',
+        max_completion_tokens: 1200,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          {
+            role: 'user',
+            content: [
+              { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${shot_b64}`, detail: 'high' } },
+              { type: 'text', text: 'Analyze this drink photo. Work through the 7-step reasoning chain internally, then emit the JSON.' },
+            ],
+          },
+        ],
+        response_format: { type: 'json_object' },
+      });
+      const raw = completion.choices?.[0]?.message?.content?.trim() || '{}';
+      try { parsed = JSON.parse(raw); }
+      catch {
+        console.error('[water] /log/from-photo parse fail:', raw.slice(0, 200));
+        return res.status(502).json({ error: 'AI response unparseable, try again' });
+      }
+      usedModel = 'gpt-4.1-mini';
+    }
+    const latency_ms = Date.now() - t0;
+
+    // Whitelist + sanitize — never trust the model
+    const ALLOWED_TYPES   = ['water','sparkling','herbal_tea','tea','milk','juice','coffee','sport_drink','soda','alcohol','other'];
+    const ALLOWED_CONT    = ['glass','bottle','mug','can','sports_bottle','wine_glass','paper_cup','tumbler','other'];
+    const ALLOWED_CLARITY = ['transparent','opaque'];
+    const ALLOWED_UNS     = ['drink_type','capacity','fill'];
+
+    const drink_type     = ALLOWED_TYPES.includes(parsed.drink_type) ? parsed.drink_type : 'water';
+    const container_type = ALLOWED_CONT.includes(parsed.container_type) ? parsed.container_type : 'glass';
+    const vessel_clarity = ALLOWED_CLARITY.includes(parsed.vessel_clarity) ? parsed.vessel_clarity : 'opaque';
+
+    const cap_raw      = Number(parsed.container_capacity_ml);
+    const fill_raw     = Number(parsed.fill_percent);
+    const ml_raw       = Number(parsed.estimated_ml);
+
+    const container_capacity_ml = Number.isFinite(cap_raw)
+      ? Math.max(30, Math.min(2000, Math.round(cap_raw / 10) * 10))
+      : 250;
+    const fill_percent = Number.isFinite(fill_raw)
+      ? Math.max(0, Math.min(100, Math.round(fill_raw)))
+      : 80;
+
+    // Trust the model's estimated_ml if it's coherent (within 15% of capacity×fill).
+    // Otherwise compute it ourselves from capacity × fill — this prevents the
+    // model from returning bizarre standalone numbers like "container 250ml,
+    // 60% full, but estimated_ml: 480" (yes, it happens).
+    const computedMl = Math.round((container_capacity_ml * fill_percent) / 100 / 10) * 10;
+    let   estimated_ml = Number.isFinite(ml_raw)
+      ? Math.max(0, Math.min(2000, Math.round(ml_raw / 10) * 10))
+      : computedMl;
+    if (Math.abs(estimated_ml - computedMl) > Math.max(20, computedMl * 0.15)) {
+      estimated_ml = computedMl;
+    }
+
+    const conf_raw     = Number(parsed.confidence);
+    const confidence   = Number.isFinite(conf_raw) ? Math.max(0, Math.min(100, Math.round(conf_raw))) : 60;
+    const unsure_about = Array.isArray(parsed.unsure_about)
+      ? parsed.unsure_about.filter(x => ALLOWED_UNS.includes(x))
+      : [];
+    let brand_label = null;
+    if (parsed.brand_label && typeof parsed.brand_label === 'object') {
+      const bn = String(parsed.brand_label.name || '').slice(0, 60);
+      const bm = Number(parsed.brand_label.ml);
+      if (bn && Number.isFinite(bm) && bm >= 30 && bm <= 2000) {
+        brand_label = { name: bn, ml: Math.round(bm) };
+      }
+    }
+    const reasoning = String(parsed.reasoning || '').slice(0, 140);
+
+    // ─── Apply personal calibration (multiplier toward user's true volumes) ──
+    let calibrated_ml = estimated_ml;
+    let calibration_applied = null;
+    if (personalCalibration && !brand_label) {
+      const key  = `${drink_type}|${container_type}`;
+      const cal  = personalCalibration[key];
+      // Only trust calibration once we have ≥3 samples for this pair —
+      // single-correction noise can pull estimates the wrong way.
+      if (cal && cal.n >= 3 && cal.ratio > 0.5 && cal.ratio < 2.0) {
+        calibrated_ml = Math.round((estimated_ml * cal.ratio) / 10) * 10;
+        calibration_applied = { ratio: +cal.ratio.toFixed(3), samples: cal.n };
+      }
+    }
+
+    // ─── Volume buckets — give the user 3 quick-pick ranges ──
+    // BRAND-LABEL CASE: capacity is known exactly, but how much they drank
+    // isn't. Buckets become fill-level ranges of the labeled capacity:
+    //   [a sip] [half] [most/all]
+    // UNBRANDED CASE: AI estimate has uncertainty; buckets cover ±2× width
+    // around the calibrated estimate (less / AI's pick / more).
+    const samples = calibration_applied?.samples || 0;
+    const calShrink = Math.max(0.5, 1 - Math.min(samples, 10) / 20);
+    const round10 = (n) => Math.round(n / 10) * 10;
+    const makeBucket = (lowRaw, highRaw, isBest) => {
+      const low  = Math.max(10,   round10(lowRaw));
+      const high = Math.min(2000, round10(highRaw));
+      return {
+        ml_low:  low,
+        ml_high: high,
+        ml_mid:  round10((low + high) / 2),
+        label:   `${low}–${high}ml`,
+        is_best: !!isBest,
+      };
+    };
+
+    let volume_buckets;
+    if (brand_label) {
+      // Capacity is exact (e.g. 473ml). Offer fill-level buckets so the user
+      // can say "had a sip" / "half" / "all of it".
+      const cap = brand_label.ml;
+      const fillFromAi = fill_percent;
+      // Three buckets covering common drinking patterns:
+      //   sip:  0–25%
+      //   half: 25–75%
+      //   most: 75–100%
+      volume_buckets = [
+        makeBucket(0,        cap * 0.25, fillFromAi <= 25),
+        makeBucket(cap * 0.25, cap * 0.75, fillFromAi > 25 && fillFromAi <= 75),
+        makeBucket(cap * 0.75, cap,       fillFromAi > 75),
+      ];
+      // Ensure exactly one is_best
+      if (!volume_buckets.some(b => b.is_best)) volume_buckets[2].is_best = true;
+    } else {
+      // 95 → ±10ml; 80 → ±20ml; 65 → ±30ml; 50 → ±40ml
+      const base = Math.round((100 - Math.min(95, confidence)) * 0.7);
+      const w = Math.max(10, Math.min(60, Math.round(base * calShrink / 5) * 5));
+      volume_buckets = [
+        makeBucket(calibrated_ml - 3 * w, calibrated_ml - w,  false),
+        makeBucket(calibrated_ml - w,     calibrated_ml + w,  true),
+        makeBucket(calibrated_ml + w,     calibrated_ml + 3 * w, false),
+      ];
+    }
+
+    // Range bounds (kept for legacy callers + analytics)
+    const range_low_ml  = volume_buckets[0].ml_low;
+    const range_high_ml = volume_buckets[volume_buckets.length - 1].ml_high;
+
+    const result = {
+      drink_type,
+      container_type,
+      vessel_clarity,
+      container_capacity_ml,
+      fill_percent,
+      estimated_ml: calibrated_ml,
+      ai_raw_ml:    estimated_ml,        // pre-calibration; useful for analytics + correction logging
+      volume_buckets,                    // NEW — primary input for the UI
+      range_low_ml,                      // legacy; equals first bucket low
+      range_high_ml,                     // legacy; equals last bucket high
+      confidence,
+      brand_label,
+      unsure_about,
+      reasoning,
+      calibration_applied,
+      model: usedModel,
+      latency_ms,
+    };
+
+    // Cache the sanitized result so the same photo always returns the same answer.
+    _photoCacheSet(cacheKey, result);
+
+    return res.json({ ...result, cached: false });
+  } catch (e) {
+    console.error('[water] POST /log/from-photo:', e);
+    res.status(500).json({ error: e.message || 'vision call failed' });
+  }
+});
+
 // ─── GET /today ───────────────────────────────────────────────
 router.get('/today', async (req, res) => {
   try {
@@ -1671,6 +2072,143 @@ router.delete('/log/:id', async (req, res) => {
     res.json({ ok: true });
   } catch (e) {
     console.error('[water] DELETE /log:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── Saved Containers (Phase 2 — photo-log shortcuts) ─────────
+// One-shot containers a user has named after a photo identification.
+// Tap the chip → log instantly at the saved volume + drink type
+// (skips camera entirely). Subcollection: water_users/{id}/containers.
+
+const containersCol = (deviceId) => waterDoc(deviceId).collection('containers');
+
+router.get('/containers', async (req, res) => {
+  try {
+    const { deviceId } = req.query;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+    const snap = await containersCol(deviceId).orderBy('use_count', 'desc').limit(20).get();
+    const containers = snap.docs.map(d => {
+      const x = d.data();
+      return {
+        id:           d.id,
+        name:         x.name,
+        drink_type:   x.drink_type,
+        ml:           x.ml,
+        emoji:        x.emoji || '💧',
+        use_count:    x.use_count || 0,
+        last_used_at: x.last_used_at?.toMillis ? x.last_used_at.toMillis() : null,
+        created_at:   x.created_at?.toMillis  ? x.created_at.toMillis()  : null,
+      };
+    });
+    res.json({ containers });
+  } catch (e) {
+    console.error('[water] GET /containers:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.post('/containers', async (req, res) => {
+  try {
+    const { deviceId, name, drink_type = 'water', ml, emoji } = req.body || {};
+    if (!deviceId || !name || !ml) return res.status(400).json({ error: 'deviceId, name, ml required' });
+    const ALLOWED_TYPES = ['water','sparkling','herbal_tea','tea','milk','juice','coffee','sport_drink','soda','alcohol','other'];
+    const safeType = ALLOWED_TYPES.includes(drink_type) ? drink_type : 'water';
+    const safeMl   = Math.max(30, Math.min(2000, Math.round(Number(ml) || 0)));
+    if (!safeMl) return res.status(400).json({ error: 'invalid ml' });
+    const safeName = String(name).trim().slice(0, 40);
+    if (!safeName) return res.status(400).json({ error: 'name required' });
+
+    const ref = await containersCol(deviceId).add({
+      name:         safeName,
+      drink_type:   safeType,
+      ml:           safeMl,
+      emoji:        emoji ? String(emoji).slice(0, 4) : '💧',
+      use_count:    0,
+      last_used_at: null,
+      created_at:   admin.firestore.FieldValue.serverTimestamp(),
+    });
+    res.json({ ok: true, id: ref.id });
+  } catch (e) {
+    console.error('[water] POST /containers:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.post('/containers/:id/use', async (req, res) => {
+  // Bump use_count + last_used_at when a container is used to log.
+  try {
+    const { deviceId } = req.body || {};
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+    await containersCol(deviceId).doc(req.params.id).update({
+      use_count:    admin.firestore.FieldValue.increment(1),
+      last_used_at: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[water] POST /containers/:id/use:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.delete('/containers/:id', async (req, res) => {
+  try {
+    const { deviceId } = req.query;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+    await containersCol(deviceId).doc(req.params.id).delete();
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[water] DELETE /containers/:id:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── POST /calibration — log a user correction so future ranges shrink ──
+// Frontend calls this after the user adjusts an AI photo-log estimate.
+// We store a rolling per-{drink_type, container_type} ratio of (user_ml /
+// ai_ml). Subsequent /log/from-photo calls apply the ratio + shrink the
+// range proportional to sample count.
+router.post('/calibration', async (req, res) => {
+  try {
+    const { deviceId, drink_type, container_type, ai_ml, user_ml } = req.body || {};
+    if (!deviceId || !drink_type || !container_type) {
+      return res.status(400).json({ error: 'deviceId, drink_type, container_type required' });
+    }
+    const a = Number(ai_ml), u = Number(user_ml);
+    if (!Number.isFinite(a) || !Number.isFinite(u) || a < 10 || u < 10) {
+      return res.status(400).json({ error: 'invalid ai_ml or user_ml' });
+    }
+    const newRatio = u / a;
+    // Clamp to plausible range — protects against accidental adjustments
+    // that would otherwise poison the calibration (e.g. user logs 10ml when
+    // AI said 500ml because they tapped wrong).
+    if (newRatio < 0.3 || newRatio > 3.0) return res.json({ ok: true, skipped: 'ratio_out_of_range' });
+
+    const docId = `${drink_type}__${container_type}`;
+    const ref   = waterDoc(deviceId).collection('calibration').doc(docId);
+    await admin.firestore().runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      const existing = snap.exists ? snap.data() : null;
+      // Exponential moving average — newer corrections weighted more.
+      // Caps at 20 samples, so a user can't permanently bias an old container
+      // by re-correcting the same one 100 times.
+      const oldRatio = existing?.ratio ?? 1.0;
+      const oldN     = Math.min(existing?.sample_count ?? 0, 20);
+      const newN     = oldN + 1;
+      const blendedRatio = (oldRatio * oldN + newRatio) / newN;
+      tx.set(ref, {
+        drink_type,
+        container_type,
+        ratio:        +blendedRatio.toFixed(3),
+        sample_count: newN,
+        last_ai_ml:   Math.round(a),
+        last_user_ml: Math.round(u),
+        updated_at:   admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+    });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[water] POST /calibration:', e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -1916,6 +2454,325 @@ router.get('/analysis', async (req, res) => {
   }
 });
 
+// ════════════════════════════════════════════════════════════════
+// GET /analysis/v2 — V4 Insights tab payload
+// Mirrors /api/fasting/analysis/v2 + /api/nutrition/analysis/v2 contract.
+// ════════════════════════════════════════════════════════════════
+const _waterAnalytics = require('./lib/water-analytics');
+
+router.get('/analysis/v2', async (req, res) => {
+  try {
+    const { deviceId, range = '30' } = req.query;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+
+    const wSnap = await waterDoc(deviceId).get();
+    if (!wSnap.exists || !wSnap.data()?.setup_completed) {
+      return res.json({ setup_completed: false });
+    }
+    const data  = wSnap.data() || {};
+    const target_ml = data.daily_goal_ml || data.setup?.daily_goal_ml || 2500;
+
+    // Window
+    const days   = Math.max(1, Math.min(365, parseInt(range, 10) || 30));
+    const cutoff = Date.now() - days * 24 * 3600 * 1000;
+    const fetchLimit = Math.min(days * 25, 3000);
+
+    const logsSnap = await logsCol(deviceId).orderBy('logged_at', 'desc').limit(fetchLimit).get();
+    const allLogs  = logsSnap.docs.map(d => {
+      const x = d.data();
+      const ms = x.logged_at?.toMillis ? x.logged_at.toMillis() : new Date(x.logged_at || 0).getTime();
+      return {
+        id:          d.id,
+        ml:          x.ml || 0,
+        drink_type:  x.drink_type || 'water',
+        logged_at:   ms ? new Date(ms).toISOString() : null,
+        date:        x.date || (ms ? new Date(ms).toISOString().slice(0,10) : null),
+      };
+    }).filter(l => l.logged_at && new Date(l.logged_at).getTime() >= cutoff);
+
+    // Hydration score
+    const hydrationScore = _waterAnalytics.computeHydrationScore({
+      logs: allLogs, target_ml, days,
+    });
+    const score       = hydrationScore.score;
+    const grade       = _waterAnalytics.scoreGrade(score);
+    const score_gates = {
+      volume:       { label: 'Volume',       pts: hydrationScore.components.volume       * 0.35, weight: 35 },
+      timing:       { label: 'Timing',       pts: hydrationScore.components.timing       * 0.25, weight: 25 },
+      consistency:  { label: 'Consistency',  pts: hydrationScore.components.consistency  * 0.25, weight: 25 },
+      electrolytes: { label: 'Electrolytes', pts: hydrationScore.components.electrolytes * 0.15, weight: 15 },
+    };
+    Object.values(score_gates).forEach(g => { g.pts = Math.round(g.pts); });
+
+    // Signal points (one per day in range)
+    const byDate = {};
+    for (const l of allLogs) {
+      if (!l.date) continue;
+      if (!byDate[l.date]) byDate[l.date] = { ml: 0 };
+      byDate[l.date].ml += l.ml;
+    }
+    const dayKeys = [];
+    for (let i = days - 1; i >= 0; i--) {
+      const d = new Date(); d.setDate(d.getDate() - i);
+      dayKeys.push(d.toISOString().slice(0,10));
+    }
+    const signal_points = dayKeys.map(k => ({
+      value:     Math.round(byDate[k]?.ml || 0),
+      pct:       Math.min(100, Math.round((byDate[k]?.ml || 0) / target_ml * 100)),
+      completed: (byDate[k]?.ml || 0) >= target_ml,
+      date:      k,
+    }));
+
+    // Drink breakdown
+    const drink_breakdown = _waterAnalytics.computeDrinkBreakdown(allLogs);
+
+    // Daily curve (today)
+    const todayKey   = new Date().toISOString().slice(0,10);
+    const daily_curve = _waterAnalytics.computeDailyCurve({
+      logs: allLogs, target_ml, dateKey: todayKey,
+    });
+
+    // 28-day daily logs heatmap
+    const daily_logs = {};
+    for (let i = 27; i >= 0; i--) {
+      const d = new Date(); d.setDate(d.getDate() - i);
+      const k = d.toISOString().slice(0,10);
+      const v = byDate[k]?.ml || 0;
+      if (v > 0) {
+        daily_logs[k] = {
+          ml:        Math.round(v),
+          target_ml,
+          completed: v >= target_ml,
+          pct:       Math.round(v / target_ml * 100),
+        };
+      }
+    }
+
+    // Day-of-week + circadian
+    const { best_day, worst_day } = _waterAnalytics.computeDayOfWeek(allLogs, target_ml);
+    const circadian               = _waterAnalytics.computeCircadian(allLogs, target_ml);
+
+    // Streak
+    const streak = data.current_streak || 0;
+
+    // Aha + AI reads (cached)
+    const aha_moments = _waterAnalytics.computeAhaMoments(allLogs, hydrationScore, target_ml);
+
+    const totalLogs = allLogs.length;
+    const aiCacheKey = ['water_v2', range, totalLogs, score, streak, target_ml].join('|');
+    let ai_reads = { champion: null, drag: null, pattern: null };
+    const cached = data.ai_reads_cache_v2?.[aiCacheKey];
+    if (cached) {
+      ai_reads = cached;
+    } else {
+      ai_reads = await _waterAnalytics.generateAiReads(allLogs, target_ml, hydrationScore, openai);
+      if (ai_reads.champion || ai_reads.drag || ai_reads.pattern) {
+        waterDoc(deviceId).set({
+          ai_reads_cache_v2: { [aiCacheKey]: ai_reads, _generated_at: new Date().toISOString() },
+        }, { merge: true }).catch(() => {});
+      }
+    }
+
+    // Personal formula
+    const personal_formula = _waterAnalytics.computePersonalFormula({
+      logs: allLogs, target_ml, score, dayCount: Object.keys(byDate).length,
+    });
+
+    // Aggregates
+    const total_ml  = allLogs.reduce((s, l) => s + (l.ml || 0), 0);
+    const dayCount  = Object.keys(byDate).length || 1;
+    const avg_ml    = Math.round(total_ml / dayCount);
+    const best_ml   = Math.max(0, ...Object.values(byDate).map(v => v.ml || 0));
+    const completed_days = signal_points.filter(p => p.completed).length;
+    const completion = signal_points.length ? completed_days / signal_points.length : 0;
+
+    // Observations
+    const observations = [];
+    if (completion >= 0.8) {
+      observations.push({ title: `${Math.round(completion * 100)}% on-target days — elite`, body: 'Sustained 80%+ on-target hydration is the pattern in long-lived populations.' });
+    } else if (completion < 0.4 && signal_points.length >= 7) {
+      observations.push({ title: `${Math.round(completion * 100)}% on-target — room to grow`, body: 'Small wins compound. Add one anchor habit and watch this number jump in 7 days.' });
+    }
+    if (streak >= 7) {
+      observations.push({ title: `${streak}-day streak — locked in`, body: 'Streaks past 7 days mark the shift from intentional to automatic.' });
+    }
+    if (drink_breakdown.find(b => b.type === 'coffee' && b.count >= 5)) {
+      const c = drink_breakdown.find(b => b.type === 'coffee');
+      observations.push({ title: `Coffee count: ${c.count} — and it counts`, body: `Killer 2014 confirmed coffee at this level is net hydrating. Your ${c.count} cups added ~${c.effective_ml} ml of real hydration.` });
+    }
+
+    // ── Day-1 personalized insight (cold-start users with no logs yet) ──
+    // Builds an immediate, science-grounded read from setup so the Insights
+    // tab is useful from minute one — not a "come back after 3 days" wall.
+    let day_one_insight = null;
+    if (allLogs.length === 0) {
+      const setup       = data.setup || {};
+      const weightKg    = setup.weight_kg || 70;
+      const activity    = setup.activity_level || 'moderate';
+      const climate     = setup.climate || 'mild';
+      const targetL     = (target_ml / 1000).toFixed(1);
+      const morningMl   = Math.round(target_ml * 0.20);
+      const noonMl      = Math.round(target_ml * 0.50);
+      const eveningMl   = Math.round(target_ml * 0.85);
+      day_one_insight = {
+        title: `Your ${targetL}L blueprint`,
+        subtitle: `${weightKg}kg · ${activity} · ${climate} climate`,
+        formula: `Watson 1980 baseline + Sawka 2007 activity bump + ${climate}-climate adjustment = ${target_ml}ml/day`,
+        milestones: [
+          { hour: 10, ml: morningMl,  label: `${morningMl}ml by 10am`, citation: 'Forbes 2019 — front-load fights universal AM under-hydration' },
+          { hour: 14, ml: noonMl,     label: `${noonMl}ml by 2pm`,    citation: 'Cheuvront 2014 — even spacing beats peaks' },
+          { hour: 19, ml: eveningMl,  label: `${eveningMl}ml by 7pm`,  citation: 'Rosinger 2019 — finish heavy intake before sleep window' },
+        ],
+        proof_lines: [
+          'Pross 2017: 1% body-water loss measurably degrades cognition and mood.',
+          'Killer 2014: coffee ≤4 cups counts toward hydration — the multiplier is in your beverage menu.',
+          'Lally 2010: median 66 days for habit automaticity — the streak chip is built around this.',
+        ],
+        cta: 'Log your first glass to unlock personalized analysis',
+      };
+    }
+
+    return res.json({
+      setup_completed: true,
+      range,
+      score,
+      score_grade: grade,
+      score_gates,
+      hydration_score: hydrationScore,
+      signal_points,
+      daily_curve,
+      drink_breakdown,
+      daily_logs,
+      circadian,
+      best_day,
+      worst_day,
+      ai_reads,
+      aha_moments,
+      observations,
+      personal_formula,
+      day_one_insight,
+      streak,
+      longest_streak:   data.longest_streak || 0,
+      completion:       Math.round(completion * 100) / 100,
+      avg_ml,
+      best_day_ml:      Math.round(best_ml),
+      total_ml:         Math.round(total_ml),
+      target_ml,
+    });
+  } catch (e) {
+    console.error('[water] /analysis/v2:', e);
+    return res.status(500).json({ error: 'Failed' });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════
+// GET /actions/v2 — Actions tab payload
+// Mirrors /api/fasting/actions/v2 contract.
+// Cadence: "Coach reviews every 3 days" (water is daily-tempo).
+// ════════════════════════════════════════════════════════════════
+router.get('/actions/v2', async (req, res) => {
+  try {
+    const { deviceId } = req.query;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+
+    const [actSnap, wSnap, logsSnap] = await Promise.all([
+      actionsCol(deviceId).orderBy('generated_at', 'desc').limit(30).get(),
+      waterDoc(deviceId).get(),
+      logsCol(deviceId).orderBy('logged_at', 'desc').limit(60).get(),
+    ]);
+
+    const allActions = actSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+    const wData      = wSnap.exists ? wSnap.data() : {};
+    const logs       = logsSnap.docs.map(d => d.data());
+
+    // Cadence — water is daily, refresh every 3 days
+    const lastBatchAt = allActions[0]?.generated_at;
+    const lastBatchMs = lastBatchAt?._seconds
+      ? lastBatchAt._seconds * 1000
+      : (lastBatchAt ? new Date(lastBatchAt).getTime() : null);
+    const daysSinceBatch = lastBatchMs ? Math.floor((Date.now() - lastBatchMs) / (24 * 3600 * 1000)) : null;
+    const daysUntilNext  = lastBatchMs ? Math.max(0, 3 - daysSinceBatch) : null;
+    const totalLogged    = logs.length;
+
+    const cadence = lastBatchMs ? {
+      status:           'live',
+      last_review_at:   new Date(lastBatchMs).toISOString(),
+      days_until_next:  daysUntilNext,
+      next_review_label: new Date(lastBatchMs + 3 * 24 * 3600 * 1000).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }),
+      total_logs:       totalLogged,
+    } : {
+      status:     'pending',
+      total_logs: totalLogged,
+    };
+
+    // Active
+    const isCancelled = (a) => a.status === 'cancelled' || a.status === 'skipped';
+    const active = allActions.filter(a =>
+      a.kind !== 'prescription' &&
+      (!a.status || a.status === 'active' || a.status === 'pending')
+    );
+    const WHEN_LABEL = {
+      morning: 'This morning', afternoon: 'This afternoon', evening: 'This evening',
+      anytime: 'Today', now: 'Right now', today: 'Today', next: 'Today',
+    };
+    const actions = active.slice(0, 4).map(a => {
+      const rawWhen = a.when || a.cadence_text || a.when_to_do || a.priority || 'today';
+      const when    = WHEN_LABEL[String(rawWhen).toLowerCase()] || rawWhen;
+      return {
+        id:           a.id,
+        title:        a.title || a.text || 'Action',
+        why:          a.why   || a.evidence_text || a.reasoning || 'Based on your hydration data.',
+        how:          a.how   || a.micro_step    || a.action_text || a.text || '',
+        when,
+        proof:        a.proof || a.science || '',
+        status:       'active',
+        hit_rate:     a.hit_count    || a.completed_count || 0,
+        target_count: a.target_count || 1,
+        archetype:    a.archetype    || null,
+        created_at:   a.generated_at || null,
+      };
+    });
+
+    // History
+    const history = allActions
+      .filter(a => a.status === 'completed' || isCancelled(a))
+      .slice(0, 12)
+      .map(a => {
+        const tsCandidate = a.completed_at || a.cancelled_at || a.skipped_at;
+        const ms = tsCandidate?._seconds
+          ? tsCandidate._seconds * 1000
+          : (tsCandidate ? new Date(tsCandidate).getTime() : null);
+        return {
+          id:             a.id,
+          title:          a.title || a.text || 'Action',
+          date_label:     ms ? new Date(ms).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '—',
+          completed_at:   ms ? new Date(ms).toISOString() : null,
+          status:         isCancelled(a) ? 'cancelled' : 'completed',
+          outcome:        a.outcome_grade || (isCancelled(a) ? 'cancelled' : 'kept'),
+          outcome_grade:  a.outcome_grade || (isCancelled(a) ? 'abandoned' : 'kept'),
+          outcome_reason: a.outcome_reason || null,
+        };
+      });
+
+    // Stats
+    const completed_total = allActions.filter(a => a.status === 'completed').length;
+    const cancelled_total = allActions.filter(isCancelled).length;
+    const decided         = completed_total + cancelled_total;
+    const stats = {
+      active_count:       active.length,
+      completed_total,
+      cancelled_total,
+      skipped_total:      cancelled_total, // alias for forward-compat
+      follow_through_pct: decided ? Math.round((completed_total / decided) * 100) : 0,
+    };
+
+    return res.json({ cadence, prescription: null, actions, history, stats });
+  } catch (e) {
+    console.error('[water] /actions/v2:', e);
+    return res.status(500).json({ error: 'Failed' });
+  }
+});
+
 // ─── GET /actions ─────────────────────────────────────────────
 router.get('/_legacy/actions', async (req, res) => {
   try {
@@ -2083,8 +2940,7 @@ router.post('/chat', async (req, res) => {
 
     const completion = await openai.chat.completions.create({
       model: 'gpt-4.1-mini',
-      temperature: 0.3,
-      max_tokens: 175,
+      max_completion_tokens: 175,
       messages: [
         { role: 'system', content: systemPrompt },
         ...history,
@@ -2117,7 +2973,7 @@ _mountChatStreamWater(router, {
   agentName: 'water',
   openai, admin, chatsCol,
   rateLimitCheck: checkChatRate,
-  model: 'gpt-4.1-mini', maxTokens: 175, temperature: 0.3,
+  model: 'gpt-4.1-mini', maxTokens: 175,
   buildPrompt: async (deviceId /* , message */) => {
     const context = await getCachedContext(deviceId);
     const systemPrompt = `You are the Water Coach inside Pulse. Use exact numbers from context. Under 100 words. Sharp performance coach. Banned openings: praise/validation.\n\nUSER DATA:\n${context}`;

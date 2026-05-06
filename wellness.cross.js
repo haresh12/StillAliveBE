@@ -734,16 +734,16 @@ async function fireCrossAgentProactives() {
         const avgMood   = mindLogs.length   ? mindLogs.reduce((s, l) => s + (l.mood_score || 2), 0) / mindLogs.length : null;
         const todayWater = waterLogs.length  ? waterLogs[0] : null;
 
-        if (avgSleepQ !== null && avgSleepQ < 2.5 && avgMood !== null && avgMood < 2 && setupState.mind) {
+        if (avgSleepQ !== null && avgSleepQ < 2.5 && avgMood !== null && avgMood < 2 && agentSetupFlags.mind) {
           targetAgent = 'mind';
           spike = `sleep_mood_crash: sleep quality avg ${avgSleepQ.toFixed(1)}/5, mood avg ${avgMood.toFixed(1)}/4`;
-        } else if (avgSleepQ !== null && avgSleepQ < 2.5 && fitnessLogs.length > 0 && setupState.fitness) {
+        } else if (avgSleepQ !== null && avgSleepQ < 2.5 && fitnessLogs.length > 0 && agentSetupFlags.fitness) {
           targetAgent = 'fitness';
           spike = `sleep_recovery_risk: sleep quality avg ${avgSleepQ.toFixed(1)}/5`;
-        } else if (todayWater && todayWater.goal_ml && (todayWater.total_ml / todayWater.goal_ml) < 0.4 && avgMood !== null && avgMood < 2.5 && setupState.water) {
+        } else if (todayWater && todayWater.goal_ml && (todayWater.total_ml / todayWater.goal_ml) < 0.4 && avgMood !== null && avgMood < 2.5 && agentSetupFlags.water) {
           targetAgent = 'water';
           spike = `dehydration_mood: hydration at ${Math.round((todayWater.total_ml / todayWater.goal_ml) * 100)}% of goal, mood ${avgMood.toFixed(1)}/4`;
-        } else if (avgSleepQ !== null && avgSleepQ < 2.5 && setupState.sleep) {
+        } else if (avgSleepQ !== null && avgSleepQ < 2.5 && agentSetupFlags.sleep) {
           targetAgent = 'sleep';
           spike = `consecutive_poor_sleep: avg ${avgSleepQ.toFixed(1)}/5 over last ${sleepLogs.length} nights`;
         }
@@ -798,5 +798,116 @@ async function fireCrossAgentProactives() {
 
 cron.schedule('0 8,14 * * *', fireCrossAgentProactives, { timezone: 'UTC' });
 
+// ─── cross_agent/today_signals writer ──────────────────────────────
+// Single source of truth for cross-agent signals consumed by individual
+// agents (per the cross-agent law: only this engine reads across agents).
+// Writes:
+//   - water_sleep_correlation: avg water on good vs low sleep days
+//   - water_mind_correlation:  avg water on high-anxiety days
+//   - recent_sleep_summary:    last 3 nights' quality_scores
+//   - water_target_bonus_ml + reason: dynamic target bump (sleep<6h, fitness session today)
+async function recomputeTodaySignals(deviceId) {
+  if (!deviceId) return;
+  const out = {
+    updated_at: admin.firestore.FieldValue.serverTimestamp(),
+  };
+
+  // Pull last ~30d of each input agent (best-effort; never throws)
+  const [sleepSnap, mindSnap, waterSnap, fitnessSnap] = await Promise.all([
+    fetchAgentSnapshot(deviceId, 'sleep',   30).catch(() => null),
+    fetchAgentSnapshot(deviceId, 'mind',    30).catch(() => null),
+    fetchAgentSnapshot(deviceId, 'water',   30).catch(() => null),
+    fetchAgentSnapshot(deviceId, 'fitness', 7).catch(() => null),
+  ]);
+
+  const sleepLogs = sleepSnap?.logs   || [];
+  const mindLogs  = mindSnap?.logs    || [];
+  const waterLogs = waterSnap?.logs   || [];
+  const fitLogs   = fitnessSnap?.logs || [];
+
+  // Index water by date_str: { date: total_effective_ml, goal_ml }
+  const waterByDate = {};
+  for (const l of waterLogs) {
+    const d = l.date_str || (l.logged_at && new Date(l.logged_at).toISOString().slice(0, 10));
+    if (!d) continue;
+    waterByDate[d] = waterByDate[d] || { effective_ml: 0, goal_ml: l.goal_ml || 0 };
+    waterByDate[d].effective_ml += (l.effective_ml || l.ml || 0);
+    if (l.goal_ml) waterByDate[d].goal_ml = l.goal_ml;
+  }
+
+  // ─── Sleep correlation ───
+  try {
+    const pairs = sleepLogs.filter(s => s.date && waterByDate[s.date]);
+    const good  = pairs.filter(s => (s.quality_score || 0) >= 70);
+    const low   = pairs.filter(s => (s.quality_score || 0) <  70);
+    if (good.length >= 2 && low.length >= 2 && pairs.length >= 5) {
+      const avg = (xs) => Math.round(xs.reduce((s, x) => s + x, 0) / xs.length);
+      out.water_sleep_correlation = {
+        good_avg_ml:      avg(good.map(s => waterByDate[s.date].effective_ml || 0)),
+        low_avg_ml:       avg(low.map(s  => waterByDate[s.date].effective_ml || 0)),
+        good_avg_goal_ml: avg(good.map(s => waterByDate[s.date].goal_ml || 0)),
+        sample_size:      pairs.length,
+      };
+    } else {
+      out.water_sleep_correlation = null;
+    }
+  } catch { out.water_sleep_correlation = null; }
+
+  // ─── Mind correlation ───
+  try {
+    const anxious = mindLogs.filter(m => {
+      const d = m.date_str || m.date;
+      return (m.anxiety || 0) >= 4 && d && waterByDate[d];
+    });
+    if (anxious.length >= 3) {
+      const avg = (xs) => Math.round(xs.reduce((s, x) => s + x, 0) / xs.length);
+      out.water_mind_correlation = {
+        anxious_avg_ml:      avg(anxious.map(m => waterByDate[m.date_str || m.date].effective_ml || 0)),
+        anxious_avg_goal_ml: avg(anxious.map(m => waterByDate[m.date_str || m.date].goal_ml || 0)),
+        sample_size:         anxious.length,
+      };
+    } else {
+      out.water_mind_correlation = null;
+    }
+  } catch { out.water_mind_correlation = null; }
+
+  // ─── Recent sleep summary (chat context) ───
+  try {
+    const entries = sleepLogs
+      .filter(s => s.date && s.quality_score)
+      .slice(0, 3)
+      .map(s => ({ date: s.date, quality_score: s.quality_score }));
+    out.recent_sleep_summary = entries.length ? { entries } : null;
+  } catch { out.recent_sleep_summary = null; }
+
+  // ─── Water target bonus (dynamic ml bump) ───
+  try {
+    const lastNight = sleepLogs[0];
+    const lastFit   = fitLogs[0];
+    const todayStr  = new Date().toISOString().slice(0, 10);
+    let bonus_ml = 0;
+    let reasons  = [];
+
+    if (lastNight && (lastNight.duration_h || 0) > 0 && (lastNight.duration_h || 0) < 6) {
+      bonus_ml += 300;
+      reasons.push('short sleep last night');
+    }
+    if (lastFit && (lastFit.date === todayStr || lastFit.date_str === todayStr)) {
+      bonus_ml += 500;
+      reasons.push('workout logged today');
+    }
+    out.water_target_bonus_ml     = bonus_ml;
+    out.water_target_bonus_reason = reasons.length ? reasons.join(' + ') : null;
+  } catch {
+    out.water_target_bonus_ml     = 0;
+    out.water_target_bonus_reason = null;
+  }
+
+  await userDoc(deviceId).collection('cross_agent').doc('today_signals')
+    .set(out, { merge: true })
+    .catch(e => console.error('[cross] recomputeTodaySignals write:', e?.message));
+}
+
 module.exports = router;
 module.exports.invalidateWellnessCache = invalidateWellnessCache;
+module.exports.recomputeTodaySignals   = recomputeTodaySignals;
