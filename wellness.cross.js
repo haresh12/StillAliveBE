@@ -903,6 +903,67 @@ async function recomputeTodaySignals(deviceId) {
     out.water_target_bonus_reason = null;
   }
 
+  // ─── Signals consumed by Fitness agent (Phase 6 extension) ───
+  // These are scalar percentages / levels that fitness.agent.js reads to
+  // modulate today's workout recommendation. Computed from the same logs we
+  // already pulled — no extra Firestore round-trips.
+  try {
+    // Mind: mood + anxiety from latest 3 check-ins
+    const recentMood = mindLogs.slice(0, 3);
+    if (recentMood.length) {
+      const avgMood4 = recentMood.reduce((s, m) => s + (m.mood_score || 2), 0) / recentMood.length;
+      out.mind_recent_mood_pct = Math.round((avgMood4 / 4) * 100);
+      const avgAnx = recentMood.reduce((s, m) => s + (m.anxiety || 0), 0) / recentMood.length;
+      out.mind_anxiety_level   = +avgAnx.toFixed(1);
+    } else {
+      out.mind_recent_mood_pct = null;
+      out.mind_anxiety_level   = null;
+    }
+
+    // Nutrition: protein hit% + calorie balance for today
+    try {
+      const nutSnap = await fetchAgentSnapshot(deviceId, 'nutrition', 1).catch(() => null);
+      const todayLog = nutSnap?.logs?.[0];
+      if (todayLog) {
+        const protToday  = todayLog.protein_g || 0;
+        const protTarget = nutSnap.setup?.protein_target_g || 140;
+        out.nutrition_protein_target_pct = Math.round((protToday / Math.max(protTarget, 1)) * 100);
+        out.nutrition_calorie_deficit    = todayLog.calorie_deficit ?? null;
+      } else {
+        out.nutrition_protein_target_pct = null;
+        out.nutrition_calorie_deficit    = null;
+      }
+    } catch { /* non-fatal */ }
+
+    // Water: today's intake % of goal
+    try {
+      const waterSnap = await fetchAgentSnapshot(deviceId, 'water', 1).catch(() => null);
+      const todayWaterLog = waterSnap?.logs?.find(l => {
+        const d = l.date_str || l.date || '';
+        return d === new Date().toISOString().slice(0, 10);
+      });
+      const waterGoal = waterSnap?.setup?.daily_goal_ml || 2500;
+      const todayMl = waterSnap?.logs?.reduce((s, l) => {
+        const d = l.date_str || l.date || '';
+        const sameDay = d === new Date().toISOString().slice(0, 10);
+        return s + (sameDay ? (l.amount_ml || l.effective_ml || 0) : 0);
+      }, 0) || 0;
+      out.water_intake_pct = Math.round((todayMl / Math.max(waterGoal, 1)) * 100);
+    } catch { /* non-fatal */ }
+
+    // Fasting: hours into current active fast (if any)
+    try {
+      const fastSnap = await fetchAgentSnapshot(deviceId, 'fasting', 1).catch(() => null);
+      const active = fastSnap?.active_session;
+      if (active && active.started_at) {
+        const startedMs = active.started_at.toMillis ? active.started_at.toMillis() : new Date(active.started_at).getTime();
+        out.fasting_active_hours = Math.max(0, (Date.now() - startedMs) / 3600000);
+      } else {
+        out.fasting_active_hours = null;
+      }
+    } catch { /* non-fatal */ }
+  } catch { /* non-fatal — fitness will degrade gracefully */ }
+
   await userDoc(deviceId).collection('cross_agent').doc('today_signals')
     .set(out, { merge: true })
     .catch(e => console.error('[cross] recomputeTodaySignals write:', e?.message));
