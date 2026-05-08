@@ -86,6 +86,7 @@ app.use('/api/fasting',   require('./fasting.agent'));
 app.use('/api/fitness',   require('./fitness.agent'));
 app.use('/api/community', require('./community'));
 app.use('/api/wellness',  require('./wellness.cross'));
+app.use('/api/wellness/v2', require('./wellness-cross-v2'));
 
 // ============================================
 // CONSTANTS
@@ -606,6 +607,16 @@ cron.schedule('0 * * * *', () => {
   console.log('⏰ Running hourly missed check-in cron job...');
   checkMissedCheckIns();
 });
+
+// ✅ V2 CROSS-AGENT: nightly 3am UTC + 4am correlation refresh
+{
+  const v2Config = require('./wellness-cross-v2/config');
+  const { nightlyBatch } = require('./wellness-cross-v2/cron/nightly-batch');
+  cron.schedule(v2Config.CRON.NIGHTLY_BATCH, () => {
+    console.log('⏰ [v2] nightly batch starting');
+    nightlyBatch().catch((e) => console.error('[v2 cron] nightly failed:', e && e.message));
+  });
+}
 
 // ✅ INITIAL CHECK: 5 seconds after server starts
 setTimeout(() => {
