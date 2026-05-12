@@ -33,7 +33,7 @@ function buildPlannerInput({ pack, wellness, anomalies, top_correlations }) {
   });
 }
 
-async function plan({ pack, wellness, anomalies, top_correlations }) {
+async function plan({ pack, wellness, anomalies, top_correlations, language }) {
   // Skip the LLM call entirely on cold-start users — deterministic plan is better.
   if (pack.summary.tier <= 1 || wellness.is_warm_start) {
     return { slots: defaultColdStartSlots(pack), source: 'deterministic_cold_start' };
@@ -46,10 +46,11 @@ async function plan({ pack, wellness, anomalies, top_correlations }) {
       systemPrompt: PLANNER_SYSTEM,
       userPrompt,
       responseSchema: PLANNER_SCHEMA,
+      language,
     });
     return { slots: content.slots || [], source: 'llm', usage };
   } catch (err) {
-    console.error('[planner] LLM failed, falling back:', err && err.message);
+    log.error('[planner] LLM failed, falling back:', err && err.message);
     return { slots: defaultPowerSlots(pack, wellness, anomalies, top_correlations), source: 'fallback' };
   }
 }

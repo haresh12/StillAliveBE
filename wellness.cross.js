@@ -36,6 +36,9 @@ const { buildFindings, buildPendingPairs } = require('./lib/findings-engine');
 const { OpenAI } = require('openai');
 const { fetchAgentSnapshot } = require('./lib/cross-agent-context');
 const _openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const { withCron, shouldRunCron } = require('./lib/cron-helper');
+const { getUserNotifContext } = require('./lib/cron-user-context');
+const { appendLanguageInstruction, resolveUserLanguage } = require('./lib/i18n-prompt');
 const {
   getOrGenerateWeeklyReport,
   getOrGenerateMonthlyReport,
@@ -104,7 +107,7 @@ function scoreLog(agent, log) {
 const handle = (fn) => async (req, res) => {
   try { await fn(req, res); }
   catch (e) {
-    console.error('[wellness.cross]', req.path, e.message);
+    log.error('[wellness.cross]', req.path, e.message);
     res.status(500).json({ error: e.message || 'internal error' });
   }
 };
@@ -152,7 +155,7 @@ router.get('/home/:deviceId', handle(async (req, res) => {
       if (d !== 0) delta = Math.round(d);
     }
   } catch (e) {
-    console.warn('[rich_score]', e.message);
+    log.warn('[rich_score]', e.message);
   }
 
   const social_proof = buildSocialDeck(deviceId, rich_score);
@@ -188,7 +191,7 @@ router.get('/home/:deviceId', handle(async (req, res) => {
       const scoreImpact = buildScoreImpact(ctx, harvest);
       day3_letter = await getOrGenerateLetter(deviceId, ctx, harvest, scoreImpact);
     } catch (e) {
-      console.warn('[home] coach letter failed:', e.message);
+      log.warn('[home] coach letter failed:', e.message);
     }
   }
 
@@ -230,7 +233,7 @@ router.get('/home/:deviceId', handle(async (req, res) => {
     const results = await Promise.all(actionFetches);
     top_actions = results.filter(Boolean).slice(0, 4);
   } catch (e) {
-    console.warn('[home] top_actions fetch failed:', e.message);
+    log.warn('[home] top_actions fetch failed:', e.message);
   }
 
   // Fetch cached per-agent scores — the single source of truth for tile scores
@@ -307,7 +310,7 @@ router.get('/insights/:deviceId', handle(async (req, res) => {
         updated: Date.now(),
       }, { merge: true }).catch(() => {});
     }
-  } catch (e) { console.warn('[insights rich_score]', e.message); }
+  } catch (e) { log.warn('[insights rich_score]', e.message); }
 
   // Attach subscores to ctx so harvest can read per-agent scores
   ctx.subscores = rich_score?.subscores ?? null;
@@ -660,8 +663,9 @@ router.post('/cache/invalidate/:deviceId', handle(async (req, res) => {
 }));
 
 // ─── DAILY CRON 3 AM UTC ───────────────────────────────────────────
-cron.schedule('0 3 * * *', async () => {
-  try {
+// Gated by ENABLE_CRON env + Firestore distributed lock (cron-helper).
+if (shouldRunCron()) {
+  cron.schedule('0 3 * * *', withCron('cross:daily-snapshot', async () => {
     const usersSnap = await admin.firestore().collection('wellness_users').limit(2000).get();
     let ok = 0, fail = 0;
     for (const doc of usersSnap.docs) {
@@ -679,11 +683,9 @@ cron.schedule('0 3 * * *', async () => {
         ok++;
       } catch (e) { fail++; }
     }
-    console.log(`[cross-cron] ok=${ok} fail=${fail}`);
-  } catch (e) {
-    console.error('[cross-cron] fatal:', e.message);
-  }
-}, { timezone: 'UTC' });
+    log.info(`[cross:daily-snapshot] processed=${usersSnap.size} ok=${ok} fail=${fail}`);
+  }, { ttlMs: 25 * 60_000 }), { timezone: 'UTC' });
+}
 
 // ─── CROSS-AGENT PROACTIVE CRON — 8 AM + 2 PM UTC ──────────────────
 // Detects cross-agent spikes and fires a coach message to the most
@@ -701,6 +703,11 @@ async function fireCrossAgentProactives() {
         const userData = doc.data();
         // Skip if already sent a cross proactive today
         if (userData.last_cross_proactive_date === today) continue;
+
+        // Honour the user's notif + DND + timezone preferences. allowsProactive
+        // is `notif_enabled && !inDND` — covers global off-switch + quiet hours.
+        const notifCtx = await getUserNotifContext(db, deviceId);
+        if (!notifCtx.allowsProactive) continue;
 
         // Derive which agents are set up from the per-agent flags written at setup time
         const agentSetupFlags = {
@@ -762,41 +769,52 @@ async function fireCrossAgentProactives() {
         if (!agentChat[targetAgent]) continue;
 
         const userName = userData.name || '';
-        const prompt = `You are a ${targetAgent} wellness coach in an app. Send ONE short proactive message (2-3 sentences max) to ${userName || 'the user'} about this cross-agent pattern you detected: ${spike}. Be direct and specific. Mention the exact data. End with one practical action they can take right now. No fluff, no emoji, no greeting.`;
+        const basePrompt = `You are a ${targetAgent} wellness coach in an app. Send ONE short proactive message (2-3 sentences max) to ${userName || 'the user'} about this cross-agent pattern you detected: ${spike}. Be direct and specific. Mention the exact data. End with one practical action they can take right now. No fluff, no emoji, no greeting.`;
+        // Append language directive so message arrives in the user's language.
+        // Falls through to English when language='en' (no extra tokens).
+        const prompt = appendLanguageInstruction(basePrompt, notifCtx.language);
 
+        // Run chat write + user-doc update inside a transaction so we never
+        // double-charge OpenAI without persisting the dedup flag.
         const completion = await _openai.chat.completions.create({
-          model:       'gpt-4.1-mini',
-          max_tokens:  120,
-          temperature:  0.5,
-          messages:    [{ role: 'user', content: prompt }],
+          model:                 'gpt-4.1-mini',
+          max_completion_tokens: 120,
+          messages:              [{ role: 'user', content: prompt }],
         });
         const msg = completion.choices[0]?.message?.content?.trim();
         if (!msg) continue;
 
-        await agentChat[targetAgent].add({
-          role:           'assistant',
-          content:        msg,
-          is_proactive:   true,
-          proactive_type: 'cross_agent_spike',
-          spike_type:     spike,
-          is_read:        false,
-          created_at:     admin.firestore.FieldValue.serverTimestamp(),
-        });
-        await db.collection('wellness_users').doc(deviceId).update({
-          last_cross_proactive_date: today,
+        const chatRef = agentChat[targetAgent].doc();
+        const userRef = db.collection('wellness_users').doc(deviceId);
+        await db.runTransaction(async (tx) => {
+          tx.set(chatRef, {
+            role:           'assistant',
+            content:        msg,
+            is_proactive:   true,
+            proactive_type: 'cross_agent_spike',
+            spike_type:     spike,
+            language:       notifCtx.language,
+            is_read:        false,
+            created_at:     admin.firestore.FieldValue.serverTimestamp(),
+          });
+          tx.update(userRef, { last_cross_proactive_date: today });
         });
         fired++;
       } catch (e) {
-        console.error(`[cross-proactive] ${deviceId}:`, e.message);
+        log.error(`[cross-proactive] ${deviceId}:`, e.message);
       }
     }
-    console.log(`[cross-proactive] fired=${fired}`);
+    log.info(`[cross:proactives] fired=${fired} users=${usersSnap.size}`);
   } catch (e) {
-    console.error('[cross-proactive] fatal:', e.message);
+    log.error('[cross-proactive] fatal:', e.message);
   }
 }
 
-cron.schedule('0 8,14 * * *', fireCrossAgentProactives, { timezone: 'UTC' });
+if (shouldRunCron()) {
+  cron.schedule('0 8,14 * * *', withCron('cross:proactives', fireCrossAgentProactives, {
+    ttlMs: 20 * 60_000,
+  }), { timezone: 'UTC' });
+}
 
 // ─── cross_agent/today_signals writer ──────────────────────────────
 // Single source of truth for cross-agent signals consumed by individual
@@ -966,7 +984,7 @@ async function recomputeTodaySignals(deviceId) {
 
   await userDoc(deviceId).collection('cross_agent').doc('today_signals')
     .set(out, { merge: true })
-    .catch(e => console.error('[cross] recomputeTodaySignals write:', e?.message));
+    .catch(e => log.error('[cross] recomputeTodaySignals write:', e?.message));
 }
 
 module.exports = router;

@@ -20,6 +20,11 @@ const { OpenAI } = require('openai');
 const cron    = require('node-cron');
 // ABSOLUTE LAW: single agents never read sibling-agent data via fetchAgentSnapshot.
 const { computeSleepScore: _computeSleepScore } = require('./lib/agent-scores');
+const { resolveLanguage, appendLanguageInstruction } = require('./lib/i18n-prompt');
+const { withCron, shouldRunCron } = require('./lib/cron-helper');
+const { getUserNotifContext } = require('./lib/cron-user-context');
+const { resolveAnchor } = require('./lib/user-anchor');
+const { assertLoggableDate, sendLogGuardError } = require('./lib/log-guard');
 const sleepAnalytics = require('./lib/sleep-analytics');
 const sleepDescribe  = require('./lib/sleep-describe');
 
@@ -278,7 +283,7 @@ async function refreshSleepScore(deviceId) {
       score_updated_at:   admin.firestore.FieldValue.serverTimestamp(),
     });
   } catch (err) {
-    console.error('[sleep] refreshScore:', err.message);
+    log.error('[sleep] refreshScore:', err.message);
   }
 }
 
@@ -411,7 +416,7 @@ router.post('/setup', async (req, res) => {
 
     res.json({ success: true, actions: firstActions });
   } catch (err) {
-    console.error('[sleep] /setup error:', err);
+    log.error('[sleep] /setup error:', err);
     res.status(500).json({ error: 'Setup failed' });
   }
 });
@@ -430,7 +435,7 @@ router.get('/setup-status', async (req, res) => {
     const data = snap.data();
     res.json({ setup_completed: !!data.setup_completed, setup: data });
   } catch (err) {
-    console.error('[sleep] /setup-status error:', err);
+    log.error('[sleep] /setup-status error:', err);
     res.status(500).json({ error: 'Status check failed' });
   }
 });
@@ -507,7 +512,7 @@ router.get('/chat-prompts', async (req, res) => {
 
     res.json({ prompts: pool.slice(0, 6) });
   } catch (err) {
-    console.error('[sleep] /chat-prompts error:', err);
+    log.error('[sleep] /chat-prompts error:', err);
     res.status(500).json({ error: 'Failed' });
   }
 });
@@ -537,7 +542,10 @@ router.post('/log', async (req, res) => {
       return res.status(400).json({ error: 'deviceId, bedtime, wake_time required' });
     }
 
-    const today = logDate || dateStr();
+    const anchor = await resolveAnchor(deviceId);
+    let today;
+    try { today = assertLoggableDate(logDate, anchor); }
+    catch (e) { return sendLogGuardError(res, e); }
 
     // Calculate sleep metrics
     const timeInBed      = calcTimeInBed(bedtime, wake_time);
@@ -560,13 +568,17 @@ router.post('/log', async (req, res) => {
       logged_at:         admin.firestore.FieldValue.serverTimestamp(),
     };
 
-    const logRef = await logsCol(deviceId).add(logData);
+    // ── Parallelize: log write + previous-state read are independent ──
+    // Was sequential (~150ms wasted). The increment-update still depends
+    // on the read, so it stays sequential after this Promise.all.
+    const [logRef, sleepSnapBefore] = await Promise.all([
+      logsCol(deviceId).add(logData),
+      sleepDoc(deviceId).get(),
+    ]);
 
-    // v2 Actions hook
+    // v2 Actions hook (fire-and-forget, doesn't block response)
     _onSleepLog(deviceId);
 
-    // Read state BEFORE incrementing
-    const sleepSnapBefore  = await sleepDoc(deviceId).get();
     const sleepDataBefore  = sleepSnapBefore.data() || {};
     const prevCount        = sleepDataBefore.log_count || 0;
     const lastGenAt        = sleepDataBefore.last_action_gen_at_log || 0;
@@ -694,7 +706,7 @@ router.post('/log', async (req, res) => {
           await sleepDoc(deviceId).update({ last_proactive_date: today, ...extraUpdate });
         }
       } catch (err) {
-        console.error('[sleep] proactive error:', err.message);
+        log.error('[sleep] proactive error:', err.message);
       }
     }
 
@@ -716,7 +728,7 @@ router.post('/log', async (req, res) => {
       new_actions:    newActions,
     });
   } catch (err) {
-    console.error('[sleep] /log error:', err);
+    log.error('[sleep] /log error:', err);
     res.status(500).json({ error: 'Log failed' });
   }
 });
@@ -746,7 +758,7 @@ router.get('/logs/dates', async (req, res) => {
 
     res.json({ date_logs: dateLogs });
   } catch (err) {
-    console.error('[sleep] /logs/dates error:', err);
+    log.error('[sleep] /logs/dates error:', err);
     res.status(500).json({ error: 'Failed' });
   }
 });
@@ -773,7 +785,7 @@ router.get('/logs', async (req, res) => {
 
     res.json({ logs: result });
   } catch (err) {
-    console.error('[sleep] /logs error:', err);
+    log.error('[sleep] /logs error:', err);
     res.status(500).json({ error: 'Failed' });
   }
 });
@@ -816,7 +828,7 @@ router.patch('/log/:id', async (req, res) => {
     await logsCol(deviceId).doc(id).update(updates);
     res.json({ success: true });
   } catch (err) {
-    console.error('[sleep] PATCH /log error:', err);
+    log.error('[sleep] PATCH /log error:', err);
     res.status(500).json({ error: 'Update failed' });
   }
 });
@@ -838,15 +850,15 @@ router.get('/track-context', async (req, res) => {
     const payload = await sleepAnalytics.loadTrackContext(deviceId, { targetHours: target });
     res.json(payload || { last_night: null, calendar_dots: {}, streak: 0 });
   } catch (err) {
-    console.error('[sleep] /track-context error:', err);
+    log.error('[sleep] /track-context error:', err);
     res.status(500).json({ error: 'track context failed' });
   }
 });
 
 // ═══════════════════════════════════════════════════════════════
-// GET /analysis/v2 — Insights V4 payload (10/10)
+// GET /analysis — Insights V4 payload (10/10)
 // ═══════════════════════════════════════════════════════════════
-router.get('/analysis/v2', async (req, res) => {
+router.get('/analysis', async (req, res) => {
   try {
     const { deviceId, range } = req.query;
     if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
@@ -857,18 +869,77 @@ router.get('/analysis/v2', async (req, res) => {
     })();
     const sleepSnap = await sleepDoc(deviceId).get();
     const target = Number(sleepSnap.data()?.target_hours || sleepSnap.data()?.sleep_target_hours || 8);
-    const payload = await sleepAnalytics.loadAnalysisV2(deviceId, days, { openai, targetHours: target });
-    res.json(payload || { stats: null, signal_points: [], aha_moments: [] });
+
+    // Registration Anchor: clamp window to signup date in user's local TZ.
+    const nowMs = Date.now();
+    const anchor = await resolveAnchor(deviceId);
+    const { computeAnalysisWindow } = require('./lib/range-helpers');
+    const win = computeAnalysisWindow(days || 30, anchor.anchorMs, nowMs, anchor.utcOffsetMinutes);
+    const effectiveDays = days ? win.effectiveDays : null;
+
+    const payload = await sleepAnalytics.loadAnalysisV2(deviceId, effectiveDays, { openai, targetHours: target });
+    const body = payload || { stats: null, signal_points: [], aha_moments: [] };
+
+    // Lifetime fetch: pull sleep logs since anchor → quality map independent of request window.
+    const lifetimeQualityByDate = await (async () => {
+      const out = {};
+      if (!anchor.anchorMs) return out;
+      try {
+        const snap = await logsCol(deviceId)
+          .orderBy('logged_at', 'desc')
+          .limit(Math.min(win.daysSinceAnchor * 3, 1000))
+          .get();
+        const byDate = {};
+        for (const d of snap.docs) {
+          const l = d.data();
+          const ds = l.date_str;
+          if (!ds || typeof ds !== 'string') continue;
+          if (anchor.anchorDateStr && ds < anchor.anchorDateStr) continue;
+          if (!byDate[ds]) byDate[ds] = { qs: [], hs: [] };
+          byDate[ds].qs.push(Number(l.sleep_quality || 3));
+          byDate[ds].hs.push(Number(l.total_sleep_hours || 0));
+        }
+        for (const [ds, b] of Object.entries(byDate)) {
+          const q = b.qs.reduce((a, x) => a + x, 0) / b.qs.length;
+          const h = b.hs.reduce((a, x) => a + x, 0) / b.hs.length;
+          const qPart = Math.max(0, Math.min(100, (q / 5) * 100));
+          const hPart = Math.max(0, Math.min(100, (Math.min(h, target) / target) * 100));
+          out[ds] = Math.round(qPart * 0.5 + hPart * 0.5);
+        }
+      } catch { /* fall back to empty */ }
+      return out;
+    })();
+
+    const { computeStandardOutputs } = require('./lib/score-lifetime');
+    const std = computeStandardOutputs({
+      qualityByDate: lifetimeQualityByDate,
+      todayDate: win.todayDate,
+      anchorDate: anchor.anchorDateStr,
+      daysSinceAnchor: win.daysSinceAnchor,
+    });
+
+    res.json({
+      ...body,
+      effective_start_date: win.effectiveStartDate,
+      effective_days: effectiveDays,
+      days_since_anchor: win.daysSinceAnchor,
+      anchor_date: anchor.anchorDateStr,
+      is_clamped: win.isClamped,
+      score_today: std.score_today,
+      score_7d_smoothed: std.score_7d_smoothed,
+      score_lifetime: std.score_lifetime,
+      missed_days: std.missed_days,
+    });
   } catch (err) {
-    console.error('[sleep] /analysis/v2 error:', err);
+    log.error('[sleep] /analysis error:', err);
     res.status(500).json({ error: 'analysis v2 failed' });
   }
 });
 
 // ═══════════════════════════════════════════════════════════════
-// GET /actions/v2 — Actions V2 payload
+// GET /actions — Actions V2 payload
 // ═══════════════════════════════════════════════════════════════
-router.get('/actions/v2', async (req, res) => {
+router.get('/actions', async (req, res) => {
   try {
     const { deviceId } = req.query;
     if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
@@ -952,7 +1023,7 @@ router.get('/actions/v2', async (req, res) => {
       },
     });
   } catch (err) {
-    console.error('[sleep] /actions/v2 error:', err);
+    log.error('[sleep] /actions error:', err);
     res.status(500).json({ error: 'actions v2 failed' });
   }
 });
@@ -968,7 +1039,7 @@ router.get('/chat-state', async (req, res) => {
     const sleepSnap = await sleepDoc(deviceId).get();
     if (snap.empty) return res.json({ last_night: null, streak: 0 });
     const l = snap.docs[0].data();
-    const at = millis(l.logged_at);
+    const at = getTimestampMillis(l.logged_at);
     const ago = Math.max(0, Math.round((Date.now() - at) / 60000));
     res.json({
       last_night: {
@@ -983,106 +1054,11 @@ router.get('/chat-state', async (req, res) => {
       streak: sleepSnap.data()?.streak || 0,
     });
   } catch (err) {
-    console.error('[sleep] /chat-state error:', err);
+    log.error('[sleep] /chat-state error:', err);
     res.status(500).json({ error: 'state failed' });
   }
 });
 
-// ═══════════════════════════════════════════════════════════════
-// GET /analysis
-// Full sleep stats + progressive AI insight. Cached by log count.
-// ═══════════════════════════════════════════════════════════════
-router.get('/analysis', async (req, res) => {
-  try {
-    const { deviceId, range = 'all' } = req.query;
-    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
-
-    const RANGE_DAYS = { '7': 7, '30': 30, '90': 90, '365': 365 };
-    const days = RANGE_DAYS[range] || 0; // 0 = all time
-
-    const [sleepSnap, logsSnap] = await Promise.all([
-      sleepDoc(deviceId).get(),
-      logsCol(deviceId).orderBy('logged_at', 'asc').limit(500).get(),
-    ]);
-
-    if (!sleepSnap.exists) return res.json({ stage: 0, stats: null });
-
-    const sleepData = sleepSnap.data();
-    let allLogs = logsSnap.docs.map(d => ({
-      id:        d.id,
-      ...d.data(),
-      logged_at: d.data().logged_at?.toDate?.() || new Date(),
-    }));
-
-    if (days > 0) {
-      // Filter by sleep DATE (date_str), not log creation time — matches how apps count "last N days"
-      const cutoff     = new Date();
-      cutoff.setDate(cutoff.getDate() - days);
-      const cutoffStr  = dateStr(cutoff); // "YYYY-MM-DD" of the cutoff day (inclusive boundary)
-      allLogs = allLogs.filter(l => l.date_str >= cutoffStr);
-    }
-
-    if (allLogs.length === 0) {
-      return res.json({ stage: 0, stats: { total_logs: 0 }, setup: sleepData });
-    }
-
-    const stats           = computeStats(allLogs, sleepData);
-    const stage           = determineStage(stats);
-    const signal_points   = buildSignalPoints(allLogs, range);
-    const recent_timeline = buildRecentTimeline(allLogs);
-    const observations    = buildObservations(sleepData, stats, signal_points);
-    const correlations    = buildCorrelationBars(sleepData, stats, allLogs);
-    const deep_remaining  = Math.max(0, 5 - stats.days_logged);
-    // Use shared agent-scores formula (applies maturity factor) for cross-screen consistency
-    const sleep_score = _computeSleepScore({
-      avg_efficiency:    stats.avg_efficiency,
-      avg_duration:      stats.avg_duration,
-      avg_quality:       stats.avg_quality,
-      avg_energy:        stats.avg_energy,
-      avg_latency:       stats.avg_latency,
-      consistency_score: stats.consistency?.score ?? 50,
-      target_hours:      stats.target_hours,
-      sleep_debt:        stats.sleep_debt,
-      days_logged:       stats.days_logged,
-    }) || computeSleepScore(stats);
-    const tonight         = buildTonightRecommendation(sleepData, stats);
-
-    // AI insight only for all-time range — needs full history and is LLM-cached by total count
-    let ai_insight       = null;
-    let personal_formula = null;
-
-    if (range === 'all' && stats.total_logs >= 5) {
-      const cacheKey = `${stats.total_logs}_${stats.days_logged}`;
-      const cached   = sleepData.analysis_cache;
-      if (cached && cached.key === cacheKey) {
-        ai_insight       = cached.insight;
-        personal_formula = cached.formula;
-      } else {
-        const result = await generateAnalysisInsight(sleepData, stats, stage, allLogs);
-        ai_insight       = result.insight;
-        personal_formula = result.formula;
-        await sleepDoc(deviceId).update({
-          analysis_cache: {
-            key:          cacheKey,
-            insight:      ai_insight,
-            formula:      personal_formula,
-            generated_at: new Date().toISOString(),
-          },
-        });
-      }
-    }
-
-    res.json({
-      stage, stats, ai_insight, personal_formula,
-      sleep_score, tonight,
-      signal_points, recent_timeline, observations, correlations,
-      deep_remaining, setup: sleepData,
-    });
-  } catch (err) {
-    console.error('[sleep] /analysis error:', err);
-    res.status(500).json({ error: 'Analysis failed' });
-  }
-});
 
 // ═══════════════════════════════════════════════════════════════
 // POST /chat  |  GET /chat  |  GET /chat/unread  |  POST /chat/read
@@ -1109,12 +1085,14 @@ router.post('/chat', async (req, res) => {
     if (message.length > 800) return res.status(400).json({ error: 'Message too long' });
     if (!_checkChatRateLimit(deviceId)) return res.status(429).json({ error: 'Too many messages — slow down a bit' });
 
+    const language = resolveLanguage(req);
+
     await chatsCol(deviceId).add({
       role:           'user',
       content:        message,
       is_proactive:   false,
       proactive_type: null,
-      is_read:        true,
+      is_read:        true, language,
       created_at:     admin.firestore.FieldValue.serverTimestamp(),
     });
 
@@ -1130,6 +1108,7 @@ router.post('/chat', async (req, res) => {
       const note = proactiveNotes[proactive_context] || 'The user is responding to a proactive coach message.';
       systemContext += `\n\n[THREAD CONTEXT] ${note} Briefly acknowledge this context, then focus on what they actually asked.`;
     }
+    systemContext = appendLanguageInstruction(systemContext, language);
 
     const historySnap = await chatsCol(deviceId)
       .orderBy('created_at', 'desc').limit(16).get();
@@ -1155,13 +1134,13 @@ router.post('/chat', async (req, res) => {
       content:        reply,
       is_proactive:   false,
       proactive_type: null,
-      is_read:        true,
+      is_read:        true, language,
       created_at:     admin.firestore.FieldValue.serverTimestamp(),
     });
 
     res.json({ success: true, reply, message_id: msgRef.id });
   } catch (err) {
-    console.error('[sleep] /chat error:', err);
+    log.error('[sleep] /chat error:', err);
     res.status(500).json({ error: 'Chat failed' });
   }
 });
@@ -1211,7 +1190,7 @@ router.get('/chat', async (req, res) => {
 
     res.json({ messages, hasMore: snap.docs.length === limit });
   } catch (err) {
-    console.error('[sleep] GET /chat error:', err);
+    log.error('[sleep] GET /chat error:', err);
     res.status(500).json({ error: 'Failed' });
   }
 });
@@ -1229,7 +1208,7 @@ router.get('/chat/unread', async (req, res) => {
 
     res.json({ messages });
   } catch (err) {
-    console.error('[sleep] /chat/unread error:', err);
+    log.error('[sleep] /chat/unread error:', err);
     res.status(500).json({ error: 'Failed' });
   }
 });
@@ -1248,7 +1227,7 @@ router.post('/chat/read', async (req, res) => {
 
     res.json({ success: true, marked: snap.size });
   } catch (err) {
-    console.error('[sleep] /chat/read error:', err);
+    log.error('[sleep] /chat/read error:', err);
     res.status(500).json({ error: 'Failed' });
   }
 });
@@ -1485,7 +1464,7 @@ Return ONLY valid JSON array of 3 objects — no markdown, no explanation:
     if (parsed.actions && Array.isArray(parsed.actions)) return parsed.actions.slice(0, 3);
     return fallbackActions(problem);
   } catch (err) {
-    console.error('[sleep] action gen parse error:', err.message);
+    log.error('[sleep] action gen parse error:', err.message);
     return fallbackActions(problem);
   }
 }
@@ -1572,7 +1551,7 @@ Hard rules:
     sleepDoc(setupData._deviceId || '').update({ last_poor_sleep_msg_type: msgType }).catch(()=>{});
     return completion.choices[0].message.content.trim();
   } catch (err) {
-    console.error('[sleep.agent] buildPoorSleepProactive LLM:', err.message);
+    log.error('[sleep.agent] buildPoorSleepProactive LLM:', err.message);
     return `You just logged a ${quality}/5 night${disruptors?.length ? ` with ${disruptors[0]} in the mix` : ''}. That's ${poorCount} rough nights in the last 3. What do you think changed?`;
   }
 }
@@ -1607,7 +1586,7 @@ ${severity === 'urgent' ? 'Urgency: be direct — this is a real problem affecti
     });
     return completion.choices[0].message.content.trim();
   } catch (err) {
-    console.error('[sleep.agent] buildDebtProactive LLM:', err.message);
+    log.error('[sleep.agent] buildDebtProactive LLM:', err.message);
     return `Your 7-day sleep debt is at ${debtHours}h — at this level, reaction time and focus are measurably affected. Lock your wake time this weekend even if you went to bed late. What does your usual weekend sleep look like?`;
   }
 }
@@ -1628,7 +1607,7 @@ Use AFFIRMATION + CHALLENGE format:
     });
     return completion.choices[0].message.content.trim();
   } catch (err) {
-    console.error('[sleep.agent] buildStreakProactive LLM:', err.message);
+    log.error('[sleep.agent] buildStreakProactive LLM:', err.message);
     return `${streakDays} nights in — that's ${streakDays} real data points I'm building your pattern from. Next challenge: log within 30 minutes of waking for the next 3 nights.`;
   }
 }
@@ -1654,7 +1633,7 @@ Rules:
     });
     return completion.choices[0].message.content.trim();
   } catch (err) {
-    console.error('[sleep.agent] buildBedtimePrepNotification LLM:', err.message);
+    log.error('[sleep.agent] buildBedtimePrepNotification LLM:', err.message);
     return `60 minutes to lights out at ${bedtime} — phones out of the bedroom now. Blue light suppresses melatonin for up to 90 minutes.`;
   }
 }
@@ -1679,7 +1658,7 @@ Rules:
     });
     return completion.choices[0].message.content.trim();
   } catch (err) {
-    console.error('[sleep.agent] buildMorningLogPrompt LLM:', err.message);
+    log.error('[sleep.agent] buildMorningLogPrompt LLM:', err.message);
     return `How did last night go? Log takes 30 seconds →`;
   }
 }
@@ -2325,7 +2304,7 @@ Return ONLY valid JSON, no markdown:
     const cleaned = raw.replace(/^```(?:json)?\n?/i, '').replace(/\n?```$/i, '').trim();
     return JSON.parse(cleaned);
   } catch (err) {
-    console.error('[sleep] analysis insight error:', err.message);
+    log.error('[sleep] analysis insight error:', err.message);
     return {
       insight: `You've logged ${stats.total_logs} nights. Average efficiency is ${avg_efficiency}% — ${avg_efficiency >= 85 ? 'above the CBT-I target of 85%' : 'below the 85% CBT-I target, which means sleep restriction therapy could help consolidate your sleep'}. Keep logging to surface deeper patterns.`,
       formula: `${setupData.primary_problem || 'Sleep quality'} — building your pattern baseline.`,
@@ -2341,13 +2320,7 @@ Return ONLY valid JSON, no markdown:
 //   2. Bedtime prep nudge  (bedtime - 60min)   — habit anchoring
 //   3. Mid-day insight     (11:00 AM)           — debt/pattern flag
 // ═══════════════════════════════════════════════════════════════
-cron.schedule('*/10 * * * *', async () => {
-  try {
-    const now    = new Date();
-    const hour   = now.getHours();
-    const minute = now.getMinutes();
-    const today  = dateStr();
-
+const _sleepCronTick = async () => {
     const usersSnap = await db().collection('wellness_users')
       .where('sleep_setup_complete', '==', true).get();
 
@@ -2357,7 +2330,16 @@ cron.schedule('*/10 * * * *', async () => {
         const uData     = userSnap.data();
         const pName     = uData.name || '';
 
-        const [sleepSnap, profileSnap] = await Promise.all([
+        // Per-user notif context: language, utc_offset, notif_enabled, DND.
+        // Reading here means every downstream decision uses the user's LOCAL
+        // clock, not the server clock — fixes wrong-time-of-day notifs.
+        const notifCtx = await getUserNotifContext(db(), deviceId);
+        if (!notifCtx.allowsProactive) continue;
+        const hour = notifCtx.localHour;
+        const minute = notifCtx.localMinute;
+        const today = notifCtx.localDateStr;
+
+        const [sleepSnap, _profileSnap] = await Promise.all([
           sleepDoc(deviceId).get(),
           userDoc(deviceId).get(),
         ]);
@@ -2373,7 +2355,7 @@ cron.schedule('*/10 * * * *', async () => {
         const targetWake = sData.target_wake_time  || '07:00';
         const targetHrs  = sData.target_hours      || 7.5;
 
-        // Compute current-hour window in local time (server assumed same TZ as users, or use stored TZ)
+        // Compute current-hour window in user's local time
         const currentMins = hour * 60 + minute;
 
         // ── 1. MORNING LOG PROMPT: within 20-40 min after wake time ──
@@ -2459,34 +2441,37 @@ cron.schedule('*/10 * * * *', async () => {
         }
 
       } catch (err) {
-        console.error('[sleep] cron user error:', err.message);
+        log.error('[sleep] cron user error:', err.message);
       }
     }
-  } catch (err) {
-    console.error('[sleep] cron error:', err);
-  }
-});
+};
 
-// Pre-warm /analysis/v2 cache for active users every night at 02:30.
-async function preWarmSleepAnalysisV2() {
-  try {
-    const usersSnap = await db().collection('wellness_users').limit(500).get();
-    let warmed = 0;
-    for (const u of usersSnap.docs) {
-      const id = u.id;
-      try {
-        const checkSnap = await sleepDoc(id).collection('sleep_logs').limit(1).get();
-        if (checkSnap.empty) continue;
-        await sleepAnalytics.loadAnalysisV2(id, 30, { openai });
-        warmed++;
-      } catch { /* per-user non-fatal */ }
-    }
-    console.log(`[sleep] pre-warm: ${warmed}/${usersSnap.size} users analysis_v2 refreshed`);
-  } catch (err) {
-    console.error('[sleep] pre-warm error:', err.message);
-  }
+if (shouldRunCron()) {
+  cron.schedule('*/10 * * * *', withCron('sleep:notifications', _sleepCronTick, {
+    ttlMs: 9 * 60_000,                  // < cron interval — never overlaps with next tick
+  }));
 }
-cron.schedule('30 2 * * *', preWarmSleepAnalysisV2);
+
+// Pre-warm /analysis cache for active users every night at 02:30.
+async function preWarmSleepAnalysisV2() {
+  const usersSnap = await db().collection('wellness_users').limit(500).get();
+  let warmed = 0;
+  for (const u of usersSnap.docs) {
+    const id = u.id;
+    try {
+      const checkSnap = await sleepDoc(id).collection('sleep_logs').limit(1).get();
+      if (checkSnap.empty) continue;
+      await sleepAnalytics.loadAnalysisV2(id, 30, { openai });
+      warmed++;
+    } catch { /* per-user non-fatal */ }
+  }
+  log.info(`[sleep:pre-warm] warmed=${warmed}/${usersSnap.size}`);
+}
+if (shouldRunCron()) {
+  cron.schedule('30 2 * * *', withCron('sleep:pre-warm-v2', preWarmSleepAnalysisV2, {
+    ttlMs: 20 * 60_000,
+  }), { timezone: 'UTC' });
+}
 
 // ════════════════════════════════════════════════════════════════════
 // VOICE DESCRIBE — audio → transcript → parsed sleep object.
@@ -2528,7 +2513,7 @@ router.get('/describe/dg-token', async (req, res) => {
     const data = await r.json();
     res.json({ access_token: data.access_token, expires_in: data.expires_in || 60 });
   } catch (err) {
-    console.error('[sleep] /describe/dg-token error:', err?.message);
+    log.error('[sleep] /describe/dg-token error:', err?.message);
     res.status(500).json({ error: 'dg_token_failed' });
   }
 });
@@ -2553,7 +2538,7 @@ router.post('/describe/transcribe', async (req, res) => {
     if (!transcript) return res.status(400).json({ error: 'No speech detected' });
     res.json({ transcript, latency_ms: Date.now() - t0, model: 'gpt-4o-transcribe' });
   } catch (err) {
-    console.error('[sleep] /describe/transcribe error:', err?.message);
+    log.error('[sleep] /describe/transcribe error:', err?.message);
     res.status(500).json({ error: err.message || 'Transcription failed' });
   }
 });
@@ -2585,13 +2570,12 @@ router.post('/describe', async (req, res) => {
       latency_ms: Date.now() - t0,
     });
   } catch (err) {
-    console.error('[sleep] /describe error:', err?.message);
+    log.error('[sleep] /describe error:', err?.message);
     res.status(500).json({ error: err.message || 'Describe failed' });
   } finally {
     _releaseSleepDescribeLock(deviceId);
   }
 });
 
-console.log('[sleep] agent loaded ✓ — analysis-v2 pre-warm 2:30am, proactive cron */10 min, voice-describe routes mounted');
 
 module.exports = router;

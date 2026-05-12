@@ -1,4 +1,7 @@
 require('dotenv').config();
+// Centralised logger — wraps console behind LOG_LEVEL/LOG_SILENT env flags.
+// Made global so every module can reference `log.*` without an import.
+globalThis.log = require('./lib/log');
 const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
@@ -18,7 +21,7 @@ const REQUIRED_ENV = [
 ];
 const missingEnv = REQUIRED_ENV.filter(k => !process.env[k]);
 if (missingEnv.length) {
-  console.error('❌ FATAL: Missing required environment variables:', missingEnv.join(', '));
+  log.error('❌ FATAL: Missing required environment variables:', missingEnv.join(', '));
   process.exit(1);
 }
 
@@ -26,10 +29,10 @@ if (missingEnv.length) {
 // GLOBAL ERROR HANDLERS — prevent silent crashes
 // ============================================
 process.on('unhandledRejection', (reason) => {
-  console.error('⚠️  Unhandled Promise Rejection:', reason);
+  log.error('⚠️  Unhandled Promise Rejection:', reason);
 });
 process.on('uncaughtException', (err) => {
-  console.error('💥 Uncaught Exception:', err);
+  log.error('💥 Uncaught Exception:', err);
   process.exit(1);
 });
 
@@ -55,13 +58,11 @@ admin.initializeApp({
 });
 
 const db = admin.firestore();
-console.log('🔥 Firebase initialized from environment variables');
 
 // ============================================
 // RESEND INITIALIZATION
 // ============================================
 const resend = new Resend(process.env.RESEND_API_KEY);
-console.log('📧 Resend initialized');
 
 // ============================================
 // EXPRESS APP SETUP
@@ -75,6 +76,27 @@ app.use(cors());
 app.use(express.json({ limit: '30mb' }));
 app.use(express.urlencoded({ limit: '30mb', extended: true }));
 
+// ─── Latency telemetry — runs on EVERY request ────────────────────
+// Adds an `X-Response-Time: 234ms` header so curl/devtools can see latency
+// without log diving, and emits a one-line per-route log for slow requests
+// so we can build a p50/p95 dashboard later. Skips healthchecks + static.
+// Runs in O(1) — ~2 microseconds per request — never the bottleneck.
+app.use((req, res, next) => {
+  const start = process.hrtime.bigint();
+  const originalEnd = res.end;
+  res.end = function patchedEnd(...args) {
+    const ns = Number(process.hrtime.bigint() - start);
+    const ms = Math.round(ns / 1e6);
+    if (!res.headersSent) res.setHeader('X-Response-Time', `${ms}ms`);
+    // Only log slow ones to avoid log spam — anything ≥800ms is a target.
+    if (ms >= 800 && !req.path.startsWith('/api/alive-check')) {
+      log.warn(`[slow] ${ms}ms ${req.method} ${req.originalUrl} status=${res.statusCode}`);
+    }
+    return originalEnd.apply(this, args);
+  };
+  next();
+});
+
 // REMOVED: Referral routes — referral feature removed
 // app.use('/api/referrals', referralRoutes);
 app.use('/api/alive-check', aliveCheckRoutes);
@@ -84,9 +106,33 @@ app.use('/api/nutrition', require('./nutrition.agent'));
 app.use('/api/water',     require('./water.agent'));
 app.use('/api/fasting',   require('./fasting.agent'));
 app.use('/api/fitness',   require('./fitness.agent'));
+app.use('/api/personalize', require('./personalize.agent'));
 app.use('/api/community', require('./community'));
 app.use('/api/wellness',  require('./wellness.cross'));
 app.use('/api/wellness/v2', require('./wellness-cross-v2'));
+app.use('/webhooks/revenuecat', require('./lib/revenuecat-webhook'));
+app.use('/api/analytics', require('./lib/analytics-api'));
+
+// ============================================
+// V2 CROSS-AGENT NIGHTLY BATCH CRON
+// ============================================
+// Refreshes every active user's home_pack + insights_packs so the next
+// morning's open is instant. Gated by ENABLE_CRON env var + Firestore
+// distributed lock so multi-instance deploys single-fire.
+// Note: was previously dead inside a comment block — re-enabled here.
+{
+  const { withCron, shouldRunCron } = require('./lib/cron-helper');
+  const v2Config = require('./wellness-cross-v2/config');
+  const { nightlyBatch } = require('./wellness-cross-v2/cron/nightly-batch');
+  if (shouldRunCron()) {
+    cron.schedule(v2Config.CRON.NIGHTLY_BATCH, withCron('v2:nightly-batch', async () => {
+      await nightlyBatch();
+    }, { ttlMs: 25 * 60_000 }), { timezone: 'UTC' });
+    log.info('[cron] v2:nightly-batch registered:', v2Config.CRON.NIGHTLY_BATCH);
+  } else {
+    log.info('[cron] disabled via ENABLE_CRON=false — v2:nightly-batch NOT registered');
+  }
+}
 
 // ============================================
 // CONSTANTS
@@ -145,7 +191,7 @@ const ensureCodeExists = async (deviceId) => {
 
     return code;
   } catch (error) {
-    console.error('Code generation error:', error);
+    log.error('Code generation error:', error);
     return generateCode(); // Fallback
   }
 };
@@ -203,7 +249,7 @@ const getUserByDeviceId = async (deviceId) => {
       isNew: true
     };
   } catch (error) {
-    console.error('Error in getUserByDeviceId:', error);
+    log.error('Error in getUserByDeviceId:', error);
     return { success: false, error: error.message };
   }
 };;
@@ -465,14 +511,13 @@ const sendMissedCheckInEmail = async (user, squadMemberEmail, overdueTime) => {
     });
 
     if (error) {
-      console.error('Email send error:', error);
+      log.error('Email send error:', error);
       return { success: false, error };
     }
 
-    console.log(`Email sent to ${squadMemberEmail} about ${userName}`);
     return { success: true, data };
   } catch (error) {
-    console.error('Send email error:', error);
+    log.error('Send email error:', error);
     return { success: false, error };
   }
 };
@@ -486,7 +531,6 @@ END REMOVED EMAIL FUNCTIONS */
 
 const checkMissedCheckIns = async () => {
   try {
-    console.log('🔍 Checking for missed check-ins...');
     const startTime = Date.now();
 
     const now = new Date();
@@ -498,7 +542,6 @@ const checkMissedCheckIns = async () => {
       .get();
 
     if (usersSnapshot.empty) {
-      console.log('No users to check');
       return;
     }
 
@@ -550,7 +593,6 @@ const checkMissedCheckIns = async () => {
         }
 
         missedCount++;
-        console.log(`⚠️ MISSED: ${userData.displayName || 'User'} (overdue: ${formatTimeDifference(overdueTime)})`);
 
         // ✅ Send emails to all squad members
         for (const member of squadMembers) {
@@ -591,20 +633,13 @@ const checkMissedCheckIns = async () => {
     await Promise.all(emailPromises);
 
     const duration = Date.now() - startTime;
-    console.log(`\n✅ Check complete in ${duration}ms:`);
-    console.log(`   Total users: ${totalUsers}`);
-    console.log(`   With squad: ${usersWithSquad}`);
-    console.log(`   Missed: ${missedCount}`);
-    console.log(`   Emails sent: ${emailsSent}`);
-    console.log(`   Emails failed: ${emailsFailed}\n`);
   } catch (error) {
-    console.error('Check missed check-ins error:', error);
+    log.error('Check missed check-ins error:', error);
   }
 };
 
 // ✅ CRON: RUNS EVERY 1 HOUR (at :00 minutes)
 cron.schedule('0 * * * *', () => {
-  console.log('⏰ Running hourly missed check-in cron job...');
   checkMissedCheckIns();
 });
 
@@ -613,14 +648,12 @@ cron.schedule('0 * * * *', () => {
   const v2Config = require('./wellness-cross-v2/config');
   const { nightlyBatch } = require('./wellness-cross-v2/cron/nightly-batch');
   cron.schedule(v2Config.CRON.NIGHTLY_BATCH, () => {
-    console.log('⏰ [v2] nightly batch starting');
-    nightlyBatch().catch((e) => console.error('[v2 cron] nightly failed:', e && e.message));
+    nightlyBatch().catch((e) => log.error('[v2 cron] nightly failed:', e && e.message));
   });
 }
 
 // ✅ INITIAL CHECK: 5 seconds after server starts
 setTimeout(() => {
-  console.log('🚀 Running initial check...');
   checkMissedCheckIns();
 }, 5000);
 */  // END REMOVED CRON JOB
@@ -677,7 +710,7 @@ const getDeviceId = async (req, res, next) => {
     req.isNewUser = result.isNew;
     next();
   } catch (error) {
-    console.error('Device auth error:', error);
+    log.error('Device auth error:', error);
     res.status(500).json({ success: false, error: 'Device authentication failed' });
   }
 };
@@ -728,10 +761,31 @@ app.post('/api/users/me', getDeviceId, async (req, res) => {
       isNewUser: req.isNewUser || false,
     });
   } catch (error) {
-    console.error('Get user error:', error);
+    log.error('Get user error:', error);
     res.status(500).json({ success: false, error: 'Failed to get user' });
   }
 });
+
+// Coach state validation — single source of truth for the 6 agents.
+const COACH_IDS = ['sleep', 'mind', 'nutrition', 'fitness', 'water', 'fasting'];
+const COACH_STATES = ['active', 'paused', 'removed'];
+const DEFAULT_AGENT_STATES = COACH_IDS.reduce((acc, id) => {
+  acc[id] = 'active';
+  return acc;
+}, {});
+
+function sanitizeAgentStates(input) {
+  // Always returns a complete object. Unknown keys dropped, missing keys
+  // default to 'active'. Defensive against client/legacy gaps.
+  const out = { ...DEFAULT_AGENT_STATES };
+  if (input && typeof input === 'object') {
+    for (const id of COACH_IDS) {
+      const v = input[id];
+      if (typeof v === 'string' && COACH_STATES.includes(v)) out[id] = v;
+    }
+  }
+  return out;
+}
 
 app.post('/api/wellness/signup', getWellnessDeviceId, async (req, res) => {
   try {
@@ -740,6 +794,7 @@ app.post('/api/wellness/signup', getWellnessDeviceId, async (req, res) => {
       ageGroup = '',
       gender = '',
       termsAccepted = false,
+      agentStates = null,
     } = req.body || {};
 
     const trimmedName = String(name).trim();
@@ -766,6 +821,18 @@ app.post('/api/wellness/signup', getWellnessDeviceId, async (req, res) => {
     const existingDoc = await userRef.get();
     const existingData = existingDoc.exists ? existingDoc.data() : null;
 
+    // Merge logic: preserve existing states (if user re-runs signup), override
+    // with payload, fall back to default-all-active. Guarantees no user ever
+    // ends up with an empty state map.
+    const resolvedAgentStates = sanitizeAgentStates(
+      agentStates || (existingData && existingData.agentStates) || DEFAULT_AGENT_STATES,
+    );
+
+    // Registration Anchor: stamp registration_date once at signup. Never overwrite.
+    const { dateStr } = require('./lib/range-helpers');
+    const tz = Number.isFinite(req.body?.utc_offset_minutes) ? req.body.utc_offset_minutes : 0;
+    const registrationDate = existingData?.registration_date || dateStr(new Date(), tz);
+
     const payload = {
       userId: req.deviceId,
       deviceId: req.deviceId,
@@ -777,16 +844,27 @@ app.post('/api/wellness/signup', getWellnessDeviceId, async (req, res) => {
       onboardingCompleted: true,
       profileCompleted: true,
       appSection: 'wellness',
+      agentStates: resolvedAgentStates,
+      registration_date: registrationDate,
+      registration_tz_offset: Number.isFinite(existingData?.registration_tz_offset)
+        ? existingData.registration_tz_offset
+        : tz,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       ...(existingDoc.exists
         ? {}
         : {
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
             joinedAt: admin.firestore.FieldValue.serverTimestamp(),
+            created_at: admin.firestore.FieldValue.serverTimestamp(),
           }),
     };
 
     await userRef.set(payload, { merge: true });
+
+    try {
+      const { invalidateAnchor } = require('./lib/user-anchor');
+      invalidateAnchor(req.deviceId);
+    } catch { /* non-fatal */ }
 
     res.json({
       success: true,
@@ -801,10 +879,12 @@ app.post('/api/wellness/signup', getWellnessDeviceId, async (req, res) => {
         onboardingCompleted: true,
         profileCompleted: true,
         appSection: 'wellness',
+        agentStates: resolvedAgentStates,
+        registration_date: registrationDate,
       },
     });
   } catch (error) {
-    console.error('Wellness signup error:', error);
+    log.error('Wellness signup error:', error);
     res.status(500).json({ success: false, error: 'Failed to create wellness account' });
   }
 });
@@ -823,6 +903,9 @@ app.post('/api/wellness/me', async (req, res) => {
     if (!data.onboardingCompleted) {
       return res.status(404).json({ success: false, error: 'Onboarding not completed' });
     }
+    // Migration safety: any pre-feature user lacks agentStates → return
+    // default-all-active so the FE never sees null/missing.
+    const agentStates = sanitizeAgentStates(data.agentStates);
     res.json({
       success: true,
       user: {
@@ -834,23 +917,99 @@ app.post('/api/wellness/me', async (req, res) => {
         gender: data.gender || '',
         onboardingCompleted: true,
         profileCompleted: data.profileCompleted || true,
+        agentStates,
       },
     });
   } catch (error) {
-    console.error('wellness/me error:', error);
+    log.error('wellness/me error:', error);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+// ────────────────────────────────────────────────────────────────────
+// Agent state updates — pause / resume / remove a coach.
+// Soft-state only: data is never deleted. Frontend reads on mount and
+// after each state change to keep UI in sync.
+// ────────────────────────────────────────────────────────────────────
+app.post('/api/wellness/agents/state', getWellnessDeviceId, async (req, res) => {
+  try {
+    const { agent, state } = req.body || {};
+    if (!COACH_IDS.includes(agent)) {
+      return res.status(400).json({ success: false, error: `Unknown agent: ${agent}` });
+    }
+    if (!COACH_STATES.includes(state)) {
+      return res.status(400).json({ success: false, error: `Invalid state: ${state} (active|paused|removed)` });
+    }
+
+    const userRef = db.collection('wellness_users').doc(req.deviceId);
+    const doc = await userRef.get();
+    if (!doc.exists) {
+      return res.status(404).json({ success: false, error: 'No account found' });
+    }
+
+    const current = sanitizeAgentStates(doc.data().agentStates);
+    const next = { ...current, [agent]: state };
+
+    // Guardrail: never let the user end up with zero active coaches —
+    // the app loses purpose. UI should also enforce, this is defense-in-depth.
+    const activeCount = Object.values(next).filter(s => s === 'active').length;
+    if (activeCount === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'At least one coach must stay active',
+        agentStates: current,
+      });
+    }
+
+    await userRef.update({
+      agentStates: next,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    // Telemetry — track adoption, pause patterns, resume patterns.
+
+    res.json({ success: true, agentStates: next });
+  } catch (error) {
+    log.error('agents/state error:', error);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+// Bulk update — used by onboarding's "Pick your coaches" screen so we
+// commit all 6 states in a single round-trip.
+app.post('/api/wellness/agents/states', getWellnessDeviceId, async (req, res) => {
+  try {
+    const { agentStates } = req.body || {};
+    const sanitized = sanitizeAgentStates(agentStates);
+
+    const activeCount = Object.values(sanitized).filter(s => s === 'active').length;
+    if (activeCount === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'At least one coach must stay active',
+      });
+    }
+
+    const userRef = db.collection('wellness_users').doc(req.deviceId);
+    await userRef.set({
+      agentStates: sanitized,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    res.json({ success: true, agentStates: sanitized });
+  } catch (error) {
+    log.error('agents/states bulk error:', error);
     res.status(500).json({ success: false, error: 'Server error' });
   }
 });
 
 app.get('/api/version-check', async (req, res) => {
   try {
-    console.log('🔍 Version check API called');
 
     // ✅ Fetch from Firestore appConfig/versionControl
     const versionDoc = await db.collection('appConfig').doc('versionControl').get();
 
     if (!versionDoc.exists) {
-      console.log('⚠️ No version config found in Firestore');
       return res.json({
         success: true,
         versionControl: null
@@ -858,7 +1017,6 @@ app.get('/api/version-check', async (req, res) => {
     }
 
     const versionData = versionDoc.data();
-    console.log('✅ Version config found:', versionData.minimumVersion);
 
     res.json({
       success: true,
@@ -872,7 +1030,7 @@ app.get('/api/version-check', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('❌ Version check error:', error);
+    log.error('❌ Version check error:', error);
     res.json({
       success: false,
       versionControl: null,
@@ -914,7 +1072,7 @@ app.post('/api/users/update-name', getDeviceId, async (req, res) => {
       },
     });
   } catch (error) {
-    console.error('Update name error:', error);
+    log.error('Update name error:', error);
     res.status(500).json({ success: false, error: 'Failed to update name' });
   }
 });
@@ -951,7 +1109,7 @@ app.post('/api/users/checkin-frequency', getDeviceId, async (req, res) => {
       message: `Check-in frequency set to ${days} day${days > 1 ? 's' : ''}`,
     });
   } catch (error) {
-    console.error('Update frequency error:', error);
+    log.error('Update frequency error:', error);
     res.status(500).json({ success: false, error: 'Failed to update frequency' });
   }
 });
@@ -1001,7 +1159,7 @@ app.post('/api/users/generate-code', getDeviceId, async (req, res) => {
       code,
     });
   } catch (error) {
-    console.error('Generate code error:', error);
+    log.error('Generate code error:', error);
     res.status(500).json({ success: false, error: 'Failed to generate code' });
   }
 });
@@ -1077,7 +1235,7 @@ app.post('/api/users/checkin', getDeviceId, async (req, res) => {
       },
     });
   } catch (error) {
-    console.error('Check-in error:', error);
+    log.error('Check-in error:', error);
     res.status(500).json({ success: false, error: 'Failed to check in' });
   }
 });
@@ -1119,7 +1277,7 @@ app.post('/api/users/checkin/status', getDeviceId, async (req, res) => {
       totalCheckIns: userData.totalCheckIns || 0,
     });
   } catch (error) {
-    console.error('Get check-in status error:', error);
+    log.error('Get check-in status error:', error);
     res.status(500).json({ success: false, error: 'Failed to get status' });
   }
 });
@@ -1191,7 +1349,7 @@ app.post('/api/squad/add-member', getDeviceId, async (req, res) => {
       squadMembers,
     });
   } catch (error) {
-    console.error('Add squad member error:', error);
+    log.error('Add squad member error:', error);
     res.status(500).json({ success: false, error: 'Failed to add squad member' });
   }
 });
@@ -1211,7 +1369,7 @@ app.post('/api/squad/members', getDeviceId, async (req, res) => {
       members: squadMembers,
     });
   } catch (error) {
-    console.error('Get squad members error:', error);
+    log.error('Get squad members error:', error);
     res.status(500).json({ success: false, error: 'Failed to get squad members' });
   }
 });
@@ -1247,7 +1405,7 @@ app.post('/api/squad/members/:id/remove', getDeviceId, async (req, res) => {
       squadMembers,
     });
   } catch (error) {
-    console.error('Remove squad member error:', error);
+    log.error('Remove squad member error:', error);
     res.status(500).json({ success: false, error: 'Failed to remove squad member' });
   }
 });
@@ -1345,7 +1503,7 @@ app.post('/api/watching/add', async (req, res) => {
       },
     });
   } catch (error) {
-    console.error('Add watching error:', error);
+    log.error('Add watching error:', error);
     res.status(500).json({ success: false, error: 'Failed to add watching' });
   }
 });
@@ -1421,7 +1579,7 @@ app.get('/api/watching/list', async (req, res) => {
       watching,
     });
   } catch (error) {
-    console.error('Get watching list error:', error);
+    log.error('Get watching list error:', error);
     res.status(500).json({ success: false, error: 'Failed to get watching list' });
   }
 });
@@ -1480,7 +1638,7 @@ app.delete('/api/watching/:id', async (req, res) => {
       return res.status(code).json({ success: false, error: error.message });
     }
 
-    console.error('Delete watching error:', error);
+    log.error('Delete watching error:', error);
     res.status(500).json({ success: false, error: 'Failed to stop watching' });
   }
 });
@@ -1493,6 +1651,13 @@ app.delete('/api/watching/:id', async (req, res) => {
 app.post('/api/account/delete', getDeviceId, async (req, res) => {
   try {
     const deviceId = req.deviceId;
+
+    // GDPR — best-effort issue Mixpanel delete in background. Don't block
+    // user response on it; we have 30 days to complete per Mixpanel SLA.
+    try {
+      const _mp = require('./lib/mixpanel');
+      _mp.gdprDelete(deviceId).catch(() => {});
+    } catch {}
 
     const watchingAsWatcherSnap = await db
       .collection('watching')
@@ -1558,7 +1723,7 @@ app.post('/api/account/delete', getDeviceId, async (req, res) => {
       },
     });
   } catch (error) {
-    console.error('Delete account error:', error);
+    log.error('Delete account error:', error);
     res.status(500).json({ success: false, error: 'Failed to delete account' });
   }
 });
@@ -1627,7 +1792,7 @@ app.get('/api/pulse/challenges', async (req, res) => {
 
     res.json({ success: true, challenges });
   } catch (error) {
-    console.error('Get challenges error:', error);
+    log.error('Get challenges error:', error);
     res.status(500).json({ success: false, error: 'Failed to load challenges' });
   }
 });
@@ -1663,7 +1828,7 @@ app.post('/api/pulse/challenges/enroll', getDeviceId, async (req, res) => {
 
     res.json({ success: true, challengeId, enrollCount: liveCount });
   } catch (error) {
-    console.error('Enroll challenge error:', error);
+    log.error('Enroll challenge error:', error);
     res.status(500).json({ success: false, error: 'Failed to enroll' });
   }
 });
@@ -1723,7 +1888,7 @@ app.post('/api/pulse/challenges/log-activity', getDeviceId, async (req, res) => 
 
     res.json({ success: true, date: today, pillarCount });
   } catch (error) {
-    console.error('Log activity error:', error);
+    log.error('Log activity error:', error);
     res.status(500).json({ success: false, error: 'Failed to log activity' });
   }
 });
@@ -1779,7 +1944,7 @@ app.get('/api/pulse/challenges/progress', async (req, res) => {
       days,
     });
   } catch (error) {
-    console.error('Get progress error:', error);
+    log.error('Get progress error:', error);
     res.status(500).json({ success: false, error: 'Failed to get progress' });
   }
 });
@@ -1906,7 +2071,7 @@ app.get('/api/mirror/today', async (req, res) => {
       followUp,
     });
   } catch (err) {
-    console.error('Mirror today error:', err);
+    log.error('Mirror today error:', err);
     res.status(500).json({ success: false, error: 'Failed to fetch today' });
   }
 });
@@ -1980,7 +2145,7 @@ app.post('/api/mirror/checkin', async (req, res) => {
     try {
       const ctx = buildMirrorContext({ moodLevel }, aliveData || {}, note);
       const completion = await mirrorOpenAI.chat.completions.create({
-        model: 'gpt-4o-mini', max_tokens: 120,
+        model: 'gpt-4o-mini', max_completion_tokens: 120,
         messages: [
           { role: 'system', content: MIRROR_SYSTEM_PROMPT },
           { role: 'user', content: ctx },
@@ -1989,11 +2154,11 @@ app.post('/api/mirror/checkin', async (req, res) => {
       const observation = completion.choices[0]?.message?.content?.trim() || '';
       if (observation) await docRef.update({ observation });
     } catch (aiErr) {
-      console.error('Mirror AI error:', aiErr.message);
+      log.error('Mirror AI error:', aiErr.message);
       await docRef.update({ observation: 'Something real is happening. Keep showing up.' });
     }
   } catch (err) {
-    console.error('Mirror checkin error:', err);
+    log.error('Mirror checkin error:', err);
     res.status(500).json({ success: false, error: 'Failed to save check-in' });
   }
 });
@@ -2010,7 +2175,7 @@ app.post('/api/mirror/followup', async (req, res) => {
     await db.collection('mirrorCheckins').doc(docId).update({ followUpA: answer });
     res.json({ success: true });
   } catch (err) {
-    console.error('Mirror followup error:', err);
+    log.error('Mirror followup error:', err);
     res.status(500).json({ success: false, error: 'Failed to save follow-up' });
   }
 });
@@ -2122,7 +2287,7 @@ ${history}`;
 
     const completion = await mirrorOpenAI.chat.completions.create({
       model: 'gpt-4o-mini',
-      max_tokens: 480,
+      max_completion_tokens: 480,
       messages: [
         { role: 'system', content: 'You are Mirror — the one friend who has read every single check-in and tells the truth. Return exactly 6 labeled lines: PATTERN:, QUOTE:, HIDDEN:, TRUTH:, CONCLUSION:, GOALS:. No bullets. No intro. No extra text. Each line starts with its label. GOALS: is always the last line — write 3-5 short goals separated by " | ", specific to their data. Be specific throughout — reference actual counts, days, words they wrote. The goal: make them say "how did it know that?" Sound like a person paying close attention, not an AI.' },
         { role: 'user', content: userPrompt },
@@ -2140,7 +2305,7 @@ ${history}`;
 
     res.json({ success: true, analysis, checkinCount: totalUniqueDays });
   } catch (err) {
-    console.error('Mirror analysis error:', err);
+    log.error('Mirror analysis error:', err);
     res.status(500).json({ success: false, error: 'Failed to generate analysis' });
   }
 });
@@ -2182,7 +2347,7 @@ app.get('/api/mirror/analysis/status', async (req, res) => {
       canGenerate,
     });
   } catch (e) {
-    console.error('[Mirror] analysis status error:', e);
+    log.error('[Mirror] analysis status error:', e);
     res.status(500).json({ success: false });
   }
 });
@@ -2206,7 +2371,7 @@ app.get('/api/mirror/goals', async (req, res) => {
       .sort((a, b) => b.createdAt - a.createdAt);
     res.json({ success: true, goals });
   } catch (e) {
-    console.error('[Goals] fetchGoals error:', e);
+    log.error('[Goals] fetchGoals error:', e);
     res.status(500).json({ success: false });
   }
 });
@@ -2272,7 +2437,7 @@ app.get('/api/mirror/history', async (req, res) => {
 
     res.json({ success: true, checkins });
   } catch (err) {
-    console.error('Mirror history error:', err);
+    log.error('Mirror history error:', err);
     res.status(500).json({ success: false, error: 'Failed to fetch history' });
   }
 });
@@ -2326,16 +2491,37 @@ app.post('/api/subscription/sync', async (req, res) => {
       lastSyncedAt: now,
     };
 
-    // Use set+merge so this works even if the user doc doesn't exist yet
-    // (e.g. RC initialises faster than the first alive-check API call on a fresh install)
-    await userRef.set({
+    // ── Trial-once enforcement ─────────────────────────────────────────────
+    // Mark trialUsedAt the first time we see a trial period OR any subscription
+    // history (originalPurchaseDate). Once set, NEVER unset — a user only gets
+    // one free trial, ever. This is enforced by Apple at the App Store level
+    // for the Apple ID (via productIdentifier eligibility), and we double-track
+    // here to defend against device/account swaps.
+    const updatePayload = {
       subscription: subscriptionData,
       updatedAt: now,
-    }, { merge: true });
+    };
 
-    res.json({ success: true, subscription: { ...subscriptionData, lastSyncedAt: new Date().toISOString() } });
+    const existing = await userRef.get();
+    const existingTrialUsedAt = existing.exists ? existing.data()?.trialUsedAt : null;
+    const shouldMarkTrialUsed = !existingTrialUsedAt && (
+      Boolean(isTrial) || Boolean(originalPurchaseDate) || Boolean(isPremium)
+    );
+    if (shouldMarkTrialUsed) {
+      updatePayload.trialUsedAt = now;
+    }
+
+    // Use set+merge so this works even if the user doc doesn't exist yet
+    // (e.g. RC initialises faster than the first alive-check API call on a fresh install)
+    await userRef.set(updatePayload, { merge: true });
+
+    res.json({
+      success: true,
+      subscription: { ...subscriptionData, lastSyncedAt: new Date().toISOString() },
+      trialUsedAt: existingTrialUsedAt || (shouldMarkTrialUsed ? new Date().toISOString() : null),
+    });
   } catch (err) {
-    console.error('❌ Subscription sync error:', err);
+    log.error('❌ Subscription sync error:', err);
     res.status(500).json({ success: false, error: 'Failed to sync subscription' });
   }
 });
@@ -2357,8 +2543,51 @@ app.get('/api/subscription/status', async (req, res) => {
     const subscription = userDoc.data().subscription || null;
     res.json({ success: true, subscription });
   } catch (err) {
-    console.error('❌ Subscription status error:', err);
+    log.error('❌ Subscription status error:', err);
     res.status(500).json({ success: false, error: 'Failed to get subscription status' });
+  }
+});
+
+// GET /api/subscription/trial-eligibility
+// Returns whether this device's user is eligible for a free trial.
+// Frontend uses this AS A SECONDARY CHECK on top of Apple's RC SDK check.
+// A user is eligible only if BOTH say eligible.
+//
+// Eligible = trialUsedAt is null AND user has never had a premium subscription.
+// Once trialUsedAt is set, it NEVER unsets — one trial per user, forever.
+app.get('/api/subscription/trial-eligibility', async (req, res) => {
+  try {
+    const deviceId = req.headers['x-device-id'] || req.query.deviceId;
+    if (!deviceId) {
+      // No deviceId yet — assume eligible (fresh install).
+      return res.json({ success: true, eligible: true, reason: 'no_device_id' });
+    }
+
+    const userDoc = await db.collection('users').doc(deviceId).get();
+    if (!userDoc.exists) {
+      // No user record yet — fresh install, eligible.
+      return res.json({ success: true, eligible: true, reason: 'no_user_record' });
+    }
+
+    const data = userDoc.data();
+    const trialUsedAt = data?.trialUsedAt || null;
+    const sub = data?.subscription || null;
+
+    // Hard block: ever used trial → not eligible
+    if (trialUsedAt) {
+      return res.json({ success: true, eligible: false, reason: 'trial_already_used', trialUsedAt });
+    }
+
+    // Soft block: currently/previously had premium → not eligible
+    if (sub?.isPremium || sub?.originalPurchaseDate) {
+      return res.json({ success: true, eligible: false, reason: 'has_subscription_history' });
+    }
+
+    res.json({ success: true, eligible: true });
+  } catch (err) {
+    log.error('❌ Trial eligibility error:', err);
+    // Fail-open: if backend errors, let Apple's check decide.
+    res.json({ success: true, eligible: true, reason: 'backend_error' });
   }
 });
 
@@ -2372,7 +2601,7 @@ app.post('/api/webhooks/revenuecat', express.json({ type: '*/*' }), async (req, 
     const secret = process.env.RC_WEBHOOK_SECRET;
     const auth = req.headers['authorization'];
     if (auth !== secret) {
-      console.warn('⚠️ RevenueCat webhook: invalid or missing secret');
+      log.warn('⚠️ RevenueCat webhook: invalid or missing secret');
       return res.status(401).json({ success: false, error: 'Unauthorized' });
     }
 
@@ -2416,23 +2645,42 @@ app.post('/api/webhooks/revenuecat', express.json({ type: '*/*' }), async (req, 
 
     if (!userRef) {
       // User not found — still return 200 so RC doesn't retry forever
-      console.warn(`⚠️ RC Webhook: no user found for app_user_id=${app_user_id}`);
+      log.warn(`⚠️ RC Webhook: no user found for app_user_id=${app_user_id}`);
       return res.json({ success: true, warning: 'user_not_found' });
     }
 
     const isTrial = period_type === 'TRIAL' || period_type === 'INTRO';
-    const planType = product_id?.includes('annual') ? 'annual' : product_id?.includes('monthly') ? 'monthly' : null;
+    const planType = product_id?.includes('annual') || product_id?.includes('yearly') ? 'yearly'
+                   : product_id?.includes('weekly') ? 'weekly'
+                   : product_id?.includes('monthly') ? 'monthly'
+                   : null;
     const trialEndsAt = isTrial && expiration_at_ms ? new Date(expiration_at_ms).toISOString() : null;
     const expiresAt = expiration_at_ms ? new Date(expiration_at_ms).toISOString() : null;
     const now = admin.firestore.FieldValue.serverTimestamp();
 
-    let subscriptionUpdate = {};
+    // Build a nested subscription object — set+merge does a deep merge for objects,
+    // so concurrent webhooks updating different fields won't clobber each other.
+    const subUpdate = {};
+    const setSub = (obj) => Object.assign(subUpdate, obj);
+
+    // Always-stamp metadata
+    setSub({ lastSyncedAt: now, webhookType: type, webhookReceivedAt: now, rcAppUserId: app_user_id });
+
+    // Trial-once defense: any event proving a paid/trial relationship locks trialUsedAt
+    // forever. /sync also marks it; this layer protects against the case where the
+    // webhook arrives before the app comes back to foreground.
+    const existingDoc = await userRef.get();
+    const existingTrialUsedAt = existingDoc.exists ? existingDoc.data()?.trialUsedAt : null;
+    const lockTrial = !existingTrialUsedAt && (
+      type === 'TRIAL_STARTED' || type === 'INITIAL_PURCHASE' ||
+      type === 'TRIAL_CONVERTED' || type === 'RENEWAL' || type === 'UNCANCELLATION'
+    );
 
     switch (type) {
       case 'INITIAL_PURCHASE':
       case 'RENEWAL':
       case 'UNCANCELLATION':
-        subscriptionUpdate = {
+        setSub({
           isPremium: true,
           isTrial,
           planType,
@@ -2444,14 +2692,11 @@ app.post('/api/webhooks/revenuecat', express.json({ type: '*/*' }), async (req, 
           originalPurchaseDate: purchased_at_ms ? new Date(purchased_at_ms).toISOString() : null,
           isSandbox: Boolean(is_sandbox),
           billingIssue: null,
-          lastSyncedAt: now,
-          webhookType: type,
-          webhookReceivedAt: now,
-        };
+        });
         break;
 
       case 'TRIAL_STARTED':
-        subscriptionUpdate = {
+        setSub({
           isPremium: true,
           isTrial: true,
           planType,
@@ -2463,14 +2708,11 @@ app.post('/api/webhooks/revenuecat', express.json({ type: '*/*' }), async (req, 
           originalPurchaseDate: purchased_at_ms ? new Date(purchased_at_ms).toISOString() : null,
           isSandbox: Boolean(is_sandbox),
           billingIssue: null,
-          lastSyncedAt: now,
-          webhookType: type,
-          webhookReceivedAt: now,
-        };
+        });
         break;
 
       case 'TRIAL_CONVERTED':
-        subscriptionUpdate = {
+        setSub({
           isPremium: true,
           isTrial: false,
           planType,
@@ -2481,62 +2723,87 @@ app.post('/api/webhooks/revenuecat', express.json({ type: '*/*' }), async (req, 
           periodType: 'normal',
           isSandbox: Boolean(is_sandbox),
           billingIssue: null,
-          lastSyncedAt: now,
-          webhookType: type,
-          webhookReceivedAt: now,
-        };
+        });
         break;
 
       case 'TRIAL_CANCELLED':
       case 'CANCELLATION':
         // Keep access until expiration — don't flip isPremium yet; expiry handles it
-        subscriptionUpdate = {
+        setSub({
           willRenew: false,
           cancelReason: cancel_reason || null,
-          lastSyncedAt: now,
-          webhookType: type,
-          webhookReceivedAt: now,
-        };
+        });
         break;
 
       case 'EXPIRATION':
-        subscriptionUpdate = {
+        setSub({
           isPremium: false,
           isTrial: false,
           willRenew: false,
           expiresAt,
           trialEndsAt: null,
-          lastSyncedAt: now,
-          webhookType: type,
-          webhookReceivedAt: now,
-        };
+        });
         break;
 
       case 'BILLING_ISSUE':
-        subscriptionUpdate = {
+        setSub({
           billingIssue: new Date().toISOString(),
-          lastSyncedAt: now,
-          webhookType: type,
-          webhookReceivedAt: now,
-        };
+        });
         break;
 
       default:
         return res.json({ success: true, note: 'unhandled_event_type' });
     }
 
-    await userRef.update({
-      'subscription': {
-        ...(await userRef.get()).data()?.subscription,
-        ...subscriptionUpdate,
-      },
-      updatedAt: now,
-    });
+    // set+merge so a doc-less reinstall (deviceId never seen) is created cleanly.
+    // Deep-merge ensures concurrent webhooks (e.g. RENEWAL + BILLING_ISSUE) don't
+    // clobber each other's fields.
+    const finalUpdate = { subscription: subUpdate, updatedAt: now };
+    if (lockTrial) finalUpdate.trialUsedAt = now;
+    await userRef.set(finalUpdate, { merge: true });
+
+    // ── Mirror to Mixpanel ────────────────────────────────────────────────
+    // Single endpoint handles BOTH Firestore + analytics so dashboards stay in
+    // sync without configuring two webhook URLs in the RC dashboard.
+    try {
+      const mp = require('./lib/mixpanel');
+      const distinctId = userRef.id;
+      switch (type) {
+        case 'RENEWAL':
+        case 'PRODUCT_CHANGE':
+          await mp.track(mp.EVENTS.SUBSCRIPTION_RENEWED, distinctId, { plan: planType, product_id });
+          break;
+        case 'CANCELLATION':
+          await mp.track(mp.EVENTS.SUBSCRIPTION_CANCELLED, distinctId, { plan: planType, reason: cancel_reason || 'user_cancelled' });
+          break;
+        case 'EXPIRATION':
+          await mp.track(mp.EVENTS.SUBSCRIPTION_CANCELLED, distinctId, { plan: planType, reason: 'expired' });
+          await mp.peopleSet(distinctId, { [mp.PEOPLE.IS_PREMIUM]: false, [mp.PEOPLE.IS_TRIAL]: false });
+          break;
+        case 'BILLING_ISSUE':
+          await mp.track(mp.EVENTS.SUBSCRIPTION_CANCELLED, distinctId, { plan: planType, reason: 'billing_issue' });
+          break;
+        case 'TRIAL_STARTED':
+          await mp.track(mp.EVENTS.TRIAL_STARTED, distinctId, { plan: planType, product_id });
+          await mp.peopleSet(distinctId, { [mp.PEOPLE.IS_TRIAL]: true, [mp.PEOPLE.PLAN_TYPE]: planType });
+          break;
+        case 'TRIAL_CONVERTED':
+          await mp.track(mp.EVENTS.TRIAL_CONVERTED, distinctId, { plan: planType });
+          await mp.peopleSet(distinctId, { [mp.PEOPLE.IS_TRIAL]: false, [mp.PEOPLE.IS_PREMIUM]: true });
+          break;
+        case 'TRIAL_CANCELLED':
+          await mp.track(mp.EVENTS.TRIAL_EXPIRED, distinctId, { plan: planType });
+          await mp.peopleSet(distinctId, { [mp.PEOPLE.IS_TRIAL]: false });
+          break;
+      }
+    } catch (mpErr) {
+      log.warn('⚠️ RC webhook → Mixpanel mirror failed:', mpErr?.message);
+    }
 
     res.json({ success: true });
 
   } catch (err) {
-    console.error('❌ RevenueCat webhook error:', err);
+    log.error('❌ RevenueCat webhook error:', err);
     // Return 200 to prevent RC from retrying on our server errors
     res.json({ success: false, error: err.message });
   }
@@ -2615,7 +2882,7 @@ app.get('/api/admin/users', async (req, res) => {
 
     res.json({ success: true, total: filtered.length, users: filtered });
   } catch (err) {
-    console.error('❌ Admin users list error:', err);
+    log.error('❌ Admin users list error:', err);
     res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -2672,7 +2939,7 @@ app.get('/api/admin/users/:deviceId', async (req, res) => {
       },
     });
   } catch (err) {
-    console.error('❌ Admin user detail error:', err);
+    log.error('❌ Admin user detail error:', err);
     res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -2690,7 +2957,7 @@ app.use((req, res) => {
 });
 
 app.use((err, req, res, next) => {
-  console.error('Unhandled error:', err);
+  log.error('Unhandled error:', err);
   res.status(500).json({
     success: false,
     error: 'Internal server error',
@@ -2703,26 +2970,55 @@ app.use((err, req, res, next) => {
 // ============================================
 
 // POST /api/wellness/register — called on onboarding completion
-// Creates or updates a wellness_users document with deviceId as document ID
+// Creates or updates a wellness_users document with deviceId as document ID.
+//
+// Registration Anchor: stamps `registration_date` (local-TZ YYYY-MM-DD) once,
+// at signup. Never recomputed. Every BE route and the FE read THIS field —
+// no more deriving from created_at on the fly.
 app.post('/api/wellness/register', async (req, res) => {
   try {
-    const { deviceId, name, age, gender, selectedCoaches } = req.body;
+    const { deviceId, name, age, gender, selectedCoaches, utc_offset_minutes } = req.body;
     if (!deviceId) return res.status(400).json({ success: false, error: 'deviceId required' });
 
-    await db.collection('wellness_users').doc(deviceId).set({
+    // Compute registration_date in the user's local TZ (defaults to UTC).
+    const { dateStr } = require('./lib/range-helpers');
+    const tz = Number.isFinite(utc_offset_minutes) ? utc_offset_minutes : 0;
+    const registrationDate = dateStr(new Date(), tz);
+
+    // Only stamp registration_date if the doc doesn't already have one —
+    // protects against re-runs of onboarding overwriting the original anchor.
+    const ref = db.collection('wellness_users').doc(deviceId);
+    const existing = await ref.get();
+    const existingRegDate = existing.exists ? existing.data()?.registration_date : null;
+
+    await ref.set({
       device_id: deviceId,
       name: (name || '').trim(),
       age: age ? Number(age) : null,
       gender: gender || '',
       selected_coaches: Array.isArray(selectedCoaches) ? selectedCoaches : [],
-      created_at: admin.firestore.FieldValue.serverTimestamp(),
+      created_at: existing.exists && existing.data()?.created_at
+        ? existing.data().created_at
+        : admin.firestore.FieldValue.serverTimestamp(),
+      registration_date: existingRegDate || registrationDate,
+      registration_tz_offset: Number.isFinite(existing.data()?.registration_tz_offset)
+        ? existing.data().registration_tz_offset
+        : tz,
       onboarding_completed: true,
     }, { merge: true });
 
-    console.log(`✅ wellness_users registered: ${deviceId}`);
-    res.json({ success: true });
+    // Bust the anchor cache so the next read picks up the new field.
+    try {
+      const { invalidateAnchor } = require('./lib/user-anchor');
+      invalidateAnchor(deviceId);
+    } catch { /* non-fatal */ }
+
+    res.json({
+      success: true,
+      registration_date: existingRegDate || registrationDate,
+    });
   } catch (error) {
-    console.error('wellness/register error:', error);
+    log.error('wellness/register error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -2731,18 +3027,6 @@ app.post('/api/wellness/register', async (req, res) => {
 // START SERVER
 // ============================================
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`\n${'='.repeat(60)}`);
-  console.log(`🚀 ALIVE SCORE SERVER - PRODUCTION MODE`);
-  console.log(`${'='.repeat(60)}\n`);
-  console.log(`📡 Server:          http://localhost:${PORT}`);
-  console.log(`📝 Environment:     ${process.env.NODE_ENV || 'production'}`);
-  console.log(`🔐 Auth:            ✅ Device ID only`);
-  console.log(`🏆 Alive Score:     ✅ Managed in /api/alive-check`);
-  console.log(`🔑 Unified Code:    ✅ Auto-generated on first use`);
-  console.log(`🤖 AI Scoring:      ✅ GPT-4o-mini per pillar`);
-  console.log(`📊 Analytics:       ✅ Pillar trends & history`);
-  console.log(`⚡ Performance:     ✅ OPTIMIZED`);
-  console.log(`\n${'='.repeat(60)}`);
 });
 
 module.exports = app;

@@ -28,7 +28,6 @@ const loadContestConfig = () => {
   if (!CONTEST_CONFIG) {
     const configPath = path.join(__dirname, 'referral-contest.json');
     CONTEST_CONFIG = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-    console.log('✅ Contest config loaded:', configPath);
   }
   return CONTEST_CONFIG;
 };
@@ -146,7 +145,7 @@ router.get('/contest-config', async (req, res) => {
       },
     });
   } catch (error) {
-    console.error('Contest config error:', error);
+    log.error('Contest config error:', error);
     res.status(500).json({ success: false, error: 'Failed to load contest config' });
   }
 });
@@ -166,7 +165,7 @@ router.get('/profile-status', requireDeviceId, async (req, res) => {
       profile: profile ? { name: profile.name, code } : null,
     });
   } catch (error) {
-    console.error('Profile status error:', error);
+    log.error('Profile status error:', error);
     res.status(500).json({ success: false, error: 'Failed to check profile status' });
   }
 });
@@ -203,7 +202,7 @@ router.post('/validate-code', async (req, res) => {
 
     return res.json({ success: true, valid: true, referrerName });
   } catch (error) {
-    console.error('Validate code error:', error);
+    log.error('Validate code error:', error);
     res.status(500).json({ success: false, error: 'Failed to validate code' });
   }
 });
@@ -247,10 +246,9 @@ router.post('/track', requireDeviceId, async (req, res) => {
       createdAtISO:    new Date().toISOString(),
     });
 
-    console.log(`✅ Referral: ${referrerDeviceId} → ${deviceId} [${currentMonth}]`);
     res.json({ success: true, message: 'Referral recorded!' });
   } catch (error) {
-    console.error('Track referral error:', error);
+    log.error('Track referral error:', error);
     res.status(500).json({ success: false, error: 'Failed to track referral' });
   }
 });
@@ -302,7 +300,7 @@ router.get('/my-stats', requireDeviceId, async (req, res) => {
       },
     });
   } catch (error) {
-    console.error('My stats error:', error);
+    log.error('My stats error:', error);
     res.status(500).json({ success: false, error: 'Failed to get stats' });
   }
 });
@@ -357,7 +355,7 @@ router.get('/leaderboard', async (req, res) => {
       monthLabel:  getMonthLabel(targetMonth, language),
     });
   } catch (error) {
-    console.error('Leaderboard error:', error);
+    log.error('Leaderboard error:', error);
     res.status(500).json({ success: false, error: 'Failed to get leaderboard' });
   }
 });
@@ -376,7 +374,7 @@ router.get('/my-code', requireDeviceId, async (req, res) => {
 
     res.json({ success: true, code, name: profile.name });
   } catch (error) {
-    console.error('My code error:', error);
+    log.error('My code error:', error);
     res.status(500).json({ success: false, error: 'Failed to get code' });
   }
 });
@@ -407,11 +405,10 @@ router.patch('/claim-email', requireDeviceId, async (req, res) => {
     if (!profile.claimEmail) updateData['profile.claimEmailAddedAt'] = now;
 
     await db.collection('aliveChecks').doc(deviceId).update(updateData);
-    console.log(`✅ Claim email: ${deviceId} → ${trimmedEmail}`);
 
     res.json({ success: true, alreadySaved: false, email: trimmedEmail });
   } catch (error) {
-    console.error('Claim email error:', error);
+    log.error('Claim email error:', error);
     res.status(500).json({ success: false, error: 'Failed to save email' });
   }
 });

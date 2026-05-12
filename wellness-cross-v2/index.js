@@ -35,5 +35,7 @@ router.get('/health', (req, res) => {
 router.use(require('./api/home.routes'));
 router.use(require('./api/insights.routes'));
 router.use(require('./api/recompute.routes'));
+router.use(require('./api/agent-scores.routes'));
+router.use(require('./api/anchor.routes'));
 
 module.exports = router;

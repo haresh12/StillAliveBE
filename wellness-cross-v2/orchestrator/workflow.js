@@ -72,6 +72,64 @@ async function loadPrevStreaks(deviceId) {
 }
 
 /**
+ * runForUserFastDay0 — instant Day-0 path. Skips all cross-agent compute
+ * (correlations, anomalies, chronotype, AHA, streaks, score history) since
+ * none of those produce content with zero logs. Persists the empty pack in
+ * the background so the next read hits cache. Sub-100ms typical.
+ */
+async function runForUserFastDay0(deviceId, { pack, snapshots, today, startedAt }) {
+  const wellness = computeWellness({
+    snapshots,
+    baselines: pack.baselines,
+    profile: {
+      anchor: pack.profile.cold_start_anchor || 'none',
+      onboarding_answers: {},
+      setup_state: pack.profile.setup_state,
+      total_days_logged: 0,
+    },
+    recentDailyHistory: [],
+  });
+  wellness.why_line = fallbackWhyLine(wellness);
+
+  const emptyStreaks = {
+    per_agent: ['sleep', 'mind', 'nutrition', 'fitness', 'water', 'fasting'].map((agent) => ({
+      agent, current: 0, longest: 0, status: 'lapsed',
+    })),
+    cross_agent_grace_active: false,
+    grace_reason: null,
+    streak_freeze_available: true,
+    streak_freeze_count: 1,
+    next_freeze_grant_at: today,
+  };
+
+  const home_pack = buildHomeResponse({
+    pack, snapshots, wellness, anomalies: [], exec: null, streaks: emptyStreaks,
+    top_correlations: [],
+  });
+
+  // Persist in background so subsequent reads hit cache instantly. Don't block
+  // the response — the user's first paint is what matters.
+  setImmediate(() => {
+    Promise.allSettled([
+      v2ContextPack(deviceId).set({ ...pack, _server_at: Timestamp.now() }, { merge: true }),
+      v2HomePack(deviceId).set({ ...home_pack, _server_at: Timestamp.now(), _enrichment_pending: false, _day0: true, _lang: 'en' }, { merge: true }),
+    ]).catch(() => {});
+  });
+
+  return {
+    home_pack,
+    insights_packs: [7, 30, 90, 365].map((range) => ({ range, pack: null })),
+    streaks: emptyStreaks,
+    enrichment_context: null, // skip enrich on Day-0 — nothing to enrich
+    telemetry: {
+      total_latency_ms: Date.now() - startedAt,
+      path: 'fast_day0',
+      llm_calls: {},
+    },
+  };
+}
+
+/**
  * runForUserFast — DETERMINISTIC ONLY (no LLM). Sub-1s typical.
  * Returns a complete home_pack with deterministic why_line, deterministic actions,
  * deterministic Did You Know. The caller can fire-and-forget runForUserEnrich()
@@ -83,16 +141,34 @@ async function runForUserFast(deviceId, opts = {}) {
   const today = opts.todayDate || todayDate();
   const startedAt = Date.now();
 
-  // 1. Snapshots (parallel Firestore reads)
-  const snapshots = await getAllSnapshots(deviceId, { todayDate: today });
+  // 1. Snapshots + user doc IN PARALLEL.
+  // Previously: snapshots THEN userDoc.get() — wasted ~50-100ms of round-trip.
+  const [snapshots, userSnap] = await Promise.all([
+    getAllSnapshots(deviceId, { todayDate: today }),
+    userDoc(deviceId).get(),
+  ]);
 
   // 2. Pack
-  const userSnap = await userDoc(deviceId).get();
   const userData = userSnap.exists
     ? userSnap.data()
     : { deviceId, name: 'there', cold_start_anchor: 'none', onboarding_answers: {} };
   const pack = buildContextPack({ snapshots, userData, todayDate: today });
   assertContextPack(pack);
+
+  // ── Day-0 SHORT CIRCUIT ────────────────────────────────────────────
+  // If the user has zero setups AND zero logs across all 6 agents, skip
+  // correlations / anomalies / chronotype / AHA / week-pattern entirely —
+  // they would all return empty anyway. This is the dominant cold-start
+  // case (a fresh signup hitting Home for the first time) and saves
+  // 200-500ms of compute + 3-4 wasted Firestore round trips for AHA/streaks.
+  const totalLogs90d = Object.values(snapshots).reduce((s, sn) => {
+    if (!sn || !Array.isArray(sn.last_90d)) return s;
+    return s + sn.last_90d.filter((p) => p && p.has_log).length;
+  }, 0);
+  const setupCount = pack.profile.setup_count || 0;
+  if (totalLogs90d === 0 && setupCount === 0) {
+    return runForUserFastDay0(deviceId, { pack, snapshots, today, startedAt });
+  }
 
   // 3. Score (deterministic)
   const recentDailyHistory = await loadRecentDailyHistory(deviceId, 14);
@@ -106,6 +182,33 @@ async function runForUserFast(deviceId, opts = {}) {
 
   // 4. Correlations (deterministic)
   const { matrix } = buildDailyMatrix(snapshots);
+
+  // Lifetime composite — mean of per-agent lifetime means, weighted by the
+  // same component weights as today's wellness score. Fed to Home so the
+  // headline matches per-agent Analysis lifetime cards.
+  wellness.score_lifetime = (() => {
+    try {
+      const perAgentLifetime = {};
+      const agents = Object.keys(snapshots);
+      for (const agent of agents) {
+        const arr = matrix
+          .map((r) => (r.scores && Number.isFinite(r.scores[agent]) ? r.scores[agent] : null))
+          .filter((s) => Number.isFinite(s));
+        perAgentLifetime[agent] = arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null;
+      }
+      const components = wellness.components || {};
+      let weightedSum = 0, weightTotal = 0;
+      for (const [agent, val] of Object.entries(perAgentLifetime)) {
+        if (val == null) continue;
+        const w = (components[agent] && Number.isFinite(components[agent].weight)) ? components[agent].weight : 1;
+        weightedSum += val * w;
+        weightTotal += w;
+      }
+      return weightTotal > 0 ? Math.round(weightedSum / weightTotal) : null;
+    } catch { return null; }
+  })();
+
+
   const allCorrelations = computeCorrelations(matrix);
   for (const c of allCorrelations) c.plain_english = translate(c);
   const top_correlations = selectTop(allCorrelations);
@@ -161,32 +264,42 @@ async function runForUserFast(deviceId, opts = {}) {
     }),
   }));
 
-  // Persist fast pack so subsequent reads hit cache instantly
-  const fastPersists = [
-    v2ContextPack(deviceId).set({ ...pack, _server_at: Timestamp.now() }, { merge: true }),
-    v2HomePack(deviceId).set({ ...home_pack, _server_at: Timestamp.now(), _enrichment_pending: true }, { merge: true }),
-    ...insights_packs.map((ip) =>
-      v2InsightsPack(deviceId, ip.range).set({ ...ip.pack, _server_at: Timestamp.now() }, { merge: true }),
-    ),
-    v2Correlations(deviceId).set({ computed_at: Timestamp.now(), results: allCorrelations }, { merge: true }),
-    v2Streaks(deviceId).set({ ...streaks, _server_at: Timestamp.now() }, { merge: true }),
-    v2ScoreHistoryCol(deviceId).doc(today).set({
-      date: today,
-      wellness_score: wellness.score,
-      components: wellness.components,
-      confidence: wellness.confidence,
-      is_warm_start: wellness.is_warm_start,
-      warm_start_blend: wellness.warm_start_blend,
-      computed_at: Timestamp.now(),
-    }, { merge: true }),
-  ];
-  await Promise.allSettled(fastPersists);
+  // Persist fast pack so subsequent reads hit cache instantly.
+  // CRITICAL: do NOT await these. The user is waiting on the response;
+  // Firestore writes can add hundreds of ms (sometimes seconds on cold instance)
+  // and the data is already correct in the response we're about to send.
+  // setImmediate ensures the writes start after the response is flushed.
+  setImmediate(() => {
+    const _lang = opts.language || 'en';
+    const fastPersists = [
+      v2ContextPack(deviceId).set({ ...pack, _server_at: Timestamp.now() }, { merge: true }),
+      v2HomePack(deviceId).set({ ...home_pack, _server_at: Timestamp.now(), _enrichment_pending: true, _lang }, { merge: true }),
+      ...insights_packs.map((ip) =>
+        v2InsightsPack(deviceId, ip.range).set({ ...ip.pack, _server_at: Timestamp.now(), _lang }, { merge: true }),
+      ),
+      v2Correlations(deviceId).set({ computed_at: Timestamp.now(), results: allCorrelations }, { merge: true }),
+      v2Streaks(deviceId).set({ ...streaks, _server_at: Timestamp.now() }, { merge: true }),
+      v2ScoreHistoryCol(deviceId).doc(today).set({
+        date: today,
+        wellness_score: wellness.score,
+        components: wellness.components,
+        confidence: wellness.confidence,
+        is_warm_start: wellness.is_warm_start,
+        warm_start_blend: wellness.warm_start_blend,
+        computed_at: Timestamp.now(),
+      }, { merge: true }),
+    ];
+    Promise.allSettled(fastPersists).catch(() => {});
+  });
 
   return {
     home_pack,
     insights_packs,
     streaks,
-    enrichment_context: { pack, snapshots, wellness, enrichedAnomalies, top_correlations, allCorrelations, today },
+    enrichment_context: {
+      pack, snapshots, wellness, enrichedAnomalies, top_correlations, allCorrelations, today,
+      language: opts.language || 'en',
+    },
     telemetry: {
       total_latency_ms: Date.now() - startedAt,
       path: 'fast',
@@ -202,16 +315,17 @@ async function runForUserFast(deviceId, opts = {}) {
  *
  * Safe to fire-and-forget. Never throws. Telemetry only.
  */
-async function runForUserEnrich(deviceId, ctx) {
+async function runForUserEnrich(deviceId, ctx, opts = {}) {
   const startedAt = Date.now();
   try {
     const { pack, wellness, enrichedAnomalies, top_correlations } = ctx;
+    const language = opts.language || ctx.language || 'en';
 
     const { slots: plan_slots, usage: plan_usage } = await plan({
-      pack, wellness, anomalies: enrichedAnomalies, top_correlations,
+      pack, wellness, anomalies: enrichedAnomalies, top_correlations, language,
     });
     const { content: execContent, usage: exec_usage } = await execute({
-      pack, wellness, anomalies: enrichedAnomalies, top_correlations, plan_slots,
+      pack, wellness, anomalies: enrichedAnomalies, top_correlations, plan_slots, language,
     });
 
     const claims = collectClaims(execContent, top_correlations);
@@ -240,6 +354,7 @@ async function runForUserEnrich(deviceId, ctx) {
         anomaly: patch.anomaly || data.anomaly,
         _enrichment_pending: false,
         _enriched_at: Timestamp.now(),
+        _lang: language,
       };
       await v2HomePack(deviceId).set(next, { merge: true });
     }
@@ -250,7 +365,7 @@ async function runForUserEnrich(deviceId, ctx) {
       llm_calls: { planner: plan_usage || null, executor: exec_usage || null },
     };
   } catch (err) {
-    console.warn(`[v2 enrich] ${deviceId} failed:`, err && err.message);
+    log.warn(`[v2 enrich] ${deviceId} failed:`, err && err.message);
     return { latency_ms: Date.now() - startedAt, error: err && err.message };
   }
 }
@@ -291,6 +406,30 @@ async function runForUser(deviceId, opts = {}) {
 
   // 4. Correlations
   const { matrix } = buildDailyMatrix(snapshots);
+
+  // Lifetime composite — same blend the Home headline reads.
+  wellness.score_lifetime = (() => {
+    try {
+      const perAgentLifetime = {};
+      const agents = Object.keys(snapshots);
+      for (const agent of agents) {
+        const arr = matrix
+          .map((r) => (r.scores && Number.isFinite(r.scores[agent]) ? r.scores[agent] : null))
+          .filter((s) => Number.isFinite(s));
+        perAgentLifetime[agent] = arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null;
+      }
+      const components = wellness.components || {};
+      let weightedSum = 0, weightTotal = 0;
+      for (const [agent, val] of Object.entries(perAgentLifetime)) {
+        if (val == null) continue;
+        const w = (components[agent] && Number.isFinite(components[agent].weight)) ? components[agent].weight : 1;
+        weightedSum += val * w;
+        weightTotal += w;
+      }
+      return weightTotal > 0 ? Math.round(weightedSum / weightTotal) : null;
+    } catch { return null; }
+  })();
+
   const allCorrelations = computeCorrelations(matrix);
   for (const c of allCorrelations) c.plain_english = translate(c);
   const top_correlations = selectTop(allCorrelations);
@@ -308,6 +447,7 @@ async function runForUser(deviceId, opts = {}) {
     wellness,
     anomalies: enrichedAnomalies,
     top_correlations,
+    language: opts.language,
   });
   const { content: execContent, source: exec_source, usage: exec_usage } = await execute({
     pack,
@@ -315,6 +455,7 @@ async function runForUser(deviceId, opts = {}) {
     anomalies: enrichedAnomalies,
     top_correlations,
     plan_slots,
+    language: opts.language,
   });
 
   // 8. Validate numeric claims
@@ -376,11 +517,12 @@ async function runForUser(deviceId, opts = {}) {
   }));
 
   // 11. Persist (each write is non-fatal — read path can survive partial writes)
+  const _lang = opts.language || 'en';
   const persists = [
     v2ContextPack(deviceId).set({ ...pack, _server_at: Timestamp.now() }, { merge: true }),
-    v2HomePack(deviceId).set({ ...home_pack, _server_at: Timestamp.now() }, { merge: true }),
+    v2HomePack(deviceId).set({ ...home_pack, _server_at: Timestamp.now(), _lang }, { merge: true }),
     ...insights_packs.map((ip) =>
-      v2InsightsPack(deviceId, ip.range).set({ ...ip.pack, _server_at: Timestamp.now() }, { merge: true }),
+      v2InsightsPack(deviceId, ip.range).set({ ...ip.pack, _server_at: Timestamp.now(), _lang }, { merge: true }),
     ),
     v2Correlations(deviceId).set({
       computed_at: Timestamp.now(),
@@ -407,7 +549,7 @@ async function runForUser(deviceId, opts = {}) {
   await Promise.allSettled(persists).then((results) => {
     const failed = results.filter((r) => r.status === 'rejected');
     if (failed.length) {
-      console.warn(`[v2 workflow] ${failed.length}/${persists.length} writes failed for ${deviceId}:`,
+      log.warn(`[v2 workflow] ${failed.length}/${persists.length} writes failed for ${deviceId}:`,
         failed.slice(0, 2).map((r) => r.reason && r.reason.message).join(' | '));
     }
   });
@@ -538,6 +680,11 @@ function buildHomeResponse({ pack, snapshots, wellness, anomalies, exec, streaks
       setup_count: pack.profile.setup_count,
       setup_state: pack.profile.setup_state,
       tier: pack.summary.tier,
+      // Registration Anchor (2026-05-13): exposed for Home headline copy
+      // and depth-ribbon gating. Sourced from pack.profile if the adapter
+      // stamped it; otherwise null and FE falls back to /anchor route.
+      anchor_date: pack.profile.anchor_date || null,
+      days_since_anchor: pack.profile.days_since_anchor || null,
     },
     wellness: { ...wellness, why_line: (exec && exec.why_line) || wellness.why_line || null },
     sparklines,
@@ -697,7 +844,11 @@ function buildInsightsResponse({
     meta: {
       device_id: pack.profile.device_id,
       calibration_days_done: Math.min(14, pack.summary.total_days_logged || 0),
-      days_since_signup: pack.profile.days_active || 0,
+      // Prefer the anchor-derived count when available; falls back to
+      // days_active for legacy/no-anchor users. Both are derived from
+      // wellness_users.created_at so they agree at runtime.
+      days_since_signup: pack.profile.days_since_anchor || pack.profile.days_active || 0,
+      anchor_date: pack.profile.anchor_date || null,
       setup_count: pack.profile.setup_count || 0,
       setup_state: pack.profile.setup_state || {},
       cohort_age_band: pack.profile.cohort_age_band || '25-34',
@@ -999,7 +1150,7 @@ async function runForUserSafe(deviceId, opts = {}) {
   } catch (err) {
     const msg = (err && err.message) || String(err);
     const stack = (err && err.stack) || '';
-    console.error(`[v2 workflow] FATAL for ${deviceId}: ${msg}\n${stack.split('\n').slice(0, 4).join('\n')}`);
+    log.error(`[v2 workflow] FATAL for ${deviceId}: ${msg}\n${stack.split('\n').slice(0, 4).join('\n')}`);
     return {
       home_pack: buildDay0FallbackPack(deviceId, msg),
       insights_packs: [
@@ -1020,7 +1171,7 @@ async function runForUserFastSafe(deviceId, opts = {}) {
     return await runForUserFast(deviceId, opts);
   } catch (err) {
     const msg = (err && err.message) || String(err);
-    console.error(`[v2 fast] FATAL for ${deviceId}: ${msg}`);
+    log.error(`[v2 fast] FATAL for ${deviceId}: ${msg}`);
     return {
       home_pack: buildDay0FallbackPack(deviceId, msg),
       insights_packs: [{ range: 7, pack: null }, { range: 30, pack: null }, { range: 90, pack: null }, { range: 365, pack: null }],

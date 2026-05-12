@@ -56,11 +56,17 @@ function buildCoachStates(snapshots) {
     if (isSetup && Number.isFinite(todayScore)) state = 'logged_today';
     else if (isSetup) state = 'no_log_today';
 
+    // Status band — same mapping the main Wellness Score uses, so coach cards
+    // and the central dial share visual language. Critical for "every score
+    // means the same thing across surfaces".
+    const status_band = statusBandForScore(smoothed7d);
+
     return {
       agent,
       state,
       score_today: Number.isFinite(todayScore) ? Math.round(todayScore) : null,
       score_smoothed_7d: smoothed7d,
+      status_band,
       delta_vs_7d_prior: deltaVs7d,
       trend_slope_per_day: slope,
       primary_metric: primary,
@@ -68,6 +74,18 @@ function buildCoachStates(snapshots) {
       last_log_date: lastLogDate(points),
     };
   }).filter(Boolean);
+}
+
+// Canonical mapping. ALSO used by Home Wellness Score Gauge (FE mirrors this).
+// Keep in lockstep with statusFor() in WellnessScoreGauge.js.
+function statusBandForScore(score) {
+  if (!Number.isFinite(score)) return 'idle';
+  if (score >= 80) return 'thriving';
+  if (score >= 65) return 'strong';
+  if (score >= 50) return 'steady';
+  if (score >= 30) return 'building';
+  if (score >= 1)  return 'starting';
+  return 'idle';
 }
 
 function primaryMetric(agent, snap) {

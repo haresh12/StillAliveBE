@@ -93,7 +93,7 @@ async function validateClaims({ claims, source, useLLMFallback = true }) {
         }
       }
     } catch (err) {
-      console.error('[validator] LLM second-look failed:', err && err.message);
+      log.error('[validator] LLM second-look failed:', err && err.message);
       for (const r of results) delete r._pending_llm;
     }
   }

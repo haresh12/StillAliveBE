@@ -73,7 +73,12 @@ const { mountActionRoutes, gradeActions: _gradeActionsShared } = require('./lib/
 const { computeFastingCandidates, fastingGraders } = require('./lib/candidates/fasting');
 const { assertNoCrossAgent } = require('./lib/sandbox');
 const { computeFastingScore: _computeFastingScore } = require('./lib/agent-scores');
+const { resolveLanguage, appendLanguageInstruction } = require('./lib/i18n-prompt');
 const { fetchAgentSnapshot } = require('./lib/cross-agent-context');
+const { withCron, shouldRunCron } = require('./lib/cron-helper');
+const { getUserNotifContext } = require('./lib/cron-user-context');
+const { resolveAnchor } = require('./lib/user-anchor');
+const { assertLoggableDate, sendLogGuardError } = require('./lib/log-guard');
 assertNoCrossAgent('fasting', computeFastingCandidates);
 const _v2Hooks = mountActionRoutes(router, {
   agentName: 'fasting',
@@ -517,7 +522,7 @@ async function buildFastingContext(deviceId) {
       recentProactives ? `Recent coach messages:\n${recentProactives}` : '',
     ].filter(Boolean).join('\n');
   } catch (e) {
-    console.error('[fasting] buildFastingContext:', e);
+    log.error('[fasting] buildFastingContext:', e);
     return 'Context unavailable.';
   }
 }
@@ -669,7 +674,7 @@ router.post('/setup', async (req, res) => {
       await batch.commit();
       invalidateCtx(deviceId);
     } catch (e) {
-      console.error('[fasting] setup actions gen:', e);
+      log.error('[fasting] setup actions gen:', e);
     }
 
     // Queue v2 welcome action batch (shared engine — runs in addition to legacy)
@@ -677,7 +682,7 @@ router.post('/setup', async (req, res) => {
 
     return res.json({ success: true, setup, windowStart, windowEnd });
   } catch (e) {
-    console.error('[fasting] setup:', e);
+    log.error('[fasting] setup:', e);
     return res.status(500).json({ error: 'Setup failed' });
   }
 });
@@ -712,7 +717,7 @@ router.get('/setup-status', async (req, res) => {
       ready_for_upgrade:  data.ready_for_upgrade  || false,
     });
   } catch (e) {
-    console.error('[fasting] setup-status:', e);
+    log.error('[fasting] setup-status:', e);
     return res.status(500).json({ error: 'Failed' });
   }
 });
@@ -783,7 +788,7 @@ router.get('/chat-prompts', async (req, res) => {
 
     res.json({ prompts: pool.slice(0, 6) });
   } catch (err) {
-    console.error('[fasting] /chat-prompts error:', err);
+    log.error('[fasting] /chat-prompts error:', err);
     res.status(500).json({ error: 'Failed' });
   }
 });
@@ -847,7 +852,7 @@ router.patch('/setup', async (req, res) => {
       active_session_preserved: !!activeSessionId,
     });
   } catch (e) {
-    console.error('[fasting] patch/setup:', e);
+    log.error('[fasting] patch/setup:', e);
     return res.status(500).json({ error: 'Failed' });
   }
 });
@@ -860,7 +865,15 @@ router.post('/session/start', async (req, res) => {
     const { deviceId, notes, started_at: customStartedAt } = req.body;
     if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
 
-    const fSnap = await fastingDoc(deviceId).get();
+    // ── Parallelize: setup doc + today's sessions are independent reads ──
+    // Was sequential (~120ms wasted on every session start). The "no setup"
+    // guard runs after both come back; in the rare no-setup case we waste
+    // one cheap query, but the common case is instantly faster.
+    const todayKey  = dateStr();
+    const [fSnap, todaySnap] = await Promise.all([
+      fastingDoc(deviceId).get(),
+      sessionsCol(deviceId).where('date', '==', todayKey).limit(5).get(),
+    ]);
     if (!fSnap.exists) return res.status(400).json({ error: 'Setup not completed' });
 
     const data   = fSnap.data() || {};
@@ -868,8 +881,6 @@ router.post('/session/start', async (req, res) => {
 
     // ── ONE FAST PER DAY RULE — guard against duplicate sessions ─────
     // Allow only if there are NO sessions yet today AND no active session.
-    const todayKey  = dateStr();
-    const todaySnap = await sessionsCol(deviceId).where('date', '==', todayKey).limit(5).get();
     const todayDocs = todaySnap.docs.map(d => d.data());
     const alreadyBrokenToday    = todayDocs.some(d => d.broken_early === true);
     const alreadyCompletedToday = todayDocs.some(d => d.completed === true);
@@ -972,7 +983,7 @@ router.post('/session/start', async (req, res) => {
         });
       });
     } catch (txErr) {
-      console.error('[fasting] session/start transaction:', txErr);
+      log.error('[fasting] session/start transaction:', txErr);
       return res.status(500).json({ error: 'Failed to start session' });
     }
     if (raceError === 'session_in_progress') {
@@ -986,7 +997,7 @@ router.post('/session/start', async (req, res) => {
 
     return res.json({ success: true, session_id: sessionRef.id, started_at: customStartedAt || new Date().toISOString() });
   } catch (e) {
-    console.error('[fasting] session/start:', e);
+    log.error('[fasting] session/start:', e);
     return res.status(500).json({ error: 'Failed to start session' });
   }
 });
@@ -1051,7 +1062,7 @@ async function refreshFastingScore(deviceId) {
       score_updated_at:   admin.firestore.FieldValue.serverTimestamp(),
     });
   } catch (err) {
-    console.error('[fasting] refreshScore:', err.message);
+    log.error('[fasting] refreshScore:', err.message);
   }
 }
 
@@ -1181,7 +1192,7 @@ router.post('/session/end', async (req, res) => {
         generationKind: 'pattern',
         completedTotalAtGeneration: totalDone,
       }).catch(err => {
-        console.error('[fasting] session/end action queue:', err);
+        log.error('[fasting] session/end action queue:', err);
       });
     }
 
@@ -1197,7 +1208,7 @@ router.post('/session/end', async (req, res) => {
       ready_for_upgrade: newlyReadyForUpgrade,
     });
   } catch (e) {
-    console.error('[fasting] session/end:', e);
+    log.error('[fasting] session/end:', e);
     return res.status(500).json({ error: 'Failed to end session' });
   }
 });
@@ -1219,19 +1230,23 @@ router.post('/session/backfill', async (req, res) => {
       return res.status(400).json({ error: 'Setup not completed' });
     }
 
+    const anchor = await resolveAnchor(deviceId);
+    let validatedDate;
+    try { validatedDate = assertLoggableDate(date, anchor); }
+    catch (e) { return sendLogGuardError(res, e); }
+
     const today = dateStr();
-    if (date >= today) {
+    if (validatedDate >= today) {
       return res.status(400).json({ error: 'Backfill is only for past days' });
     }
 
-    const dateMs = new Date(`${date}T12:00:00`).getTime();
+    const dateMs = new Date(`${validatedDate}T12:00:00`).getTime();
     if (Number.isNaN(dateMs)) return res.status(400).json({ error: 'invalid date' });
-    if (dateMs < Date.now() - 120 * 24 * 3600 * 1000) {
-      return res.status(400).json({ error: 'date too far in the past' });
-    }
 
     const startMs = new Date(started_at).getTime();
     const endMs = new Date(ended_at).getTime();
+    // The 120-day cap is replaced by anchor clamp above — no fast can be
+    // backfilled before registration.
     if (Number.isNaN(startMs) || Number.isNaN(endMs)) {
       return res.status(400).json({ error: 'invalid timestamps' });
     }
@@ -1248,7 +1263,7 @@ router.post('/session/backfill', async (req, res) => {
     }
 
     const duplicateSnap = await sessionsCol(deviceId)
-      .where('date', '==', date)
+      .where('date', '==', validatedDate)
       .limit(1)
       .get();
     if (!duplicateSnap.empty) {
@@ -1329,7 +1344,7 @@ router.post('/session/backfill', async (req, res) => {
         generationKind: 'pattern',
         completedTotalAtGeneration: totalDone,
       }).catch(err => {
-        console.error('[fasting] session/backfill action queue:', err);
+        log.error('[fasting] session/backfill action queue:', err);
       });
     }
 
@@ -1344,7 +1359,7 @@ router.post('/session/backfill', async (req, res) => {
       current_streak: currentStreak,
     });
   } catch (e) {
-    console.error('[fasting] session/backfill:', e);
+    log.error('[fasting] session/backfill:', e);
     return res.status(500).json({ error: 'Failed to save past fast' });
   }
 });
@@ -1446,7 +1461,7 @@ router.get('/today', async (req, res) => {
       total_completed:    data.total_sessions_completed || 0,
     });
   } catch (e) {
-    console.error('[fasting] today:', e);
+    log.error('[fasting] today:', e);
     return res.status(500).json({ error: 'Failed' });
   }
 });
@@ -1482,7 +1497,7 @@ router.get('/history', async (req, res) => {
 
     return res.json({ sessions });
   } catch (e) {
-    console.error('[fasting] history:', e);
+    log.error('[fasting] history:', e);
     return res.status(500).json({ error: 'Failed' });
   }
 });
@@ -1527,7 +1542,7 @@ router.get('/calendar', async (req, res) => {
 
     return res.json({ date_logs });
   } catch (e) {
-    console.error('[fasting] calendar:', e);
+    log.error('[fasting] calendar:', e);
     return res.status(500).json({ error: 'Failed' });
   }
 });
@@ -1595,14 +1610,18 @@ function computeAvgHoursFromSessions(sessions = []) {
   return round(avg(done.map(s => s.actual_hours || 0)), 1);
 }
 
-function buildRangeMeta(range, allSessions = []) {
+function buildRangeMeta(range, allSessions = [], clampStartKey = null) {
   const todayKey = dateStr();
+  // Clamp window start to the agent's setup date so pre-registration days
+  // never appear on charts.
+  const clamp = (key) => (clampStartKey && key < clampStartKey ? clampStartKey : key);
   if (range === 'all') {
     const allKeys = allSessions
       .map(getSessionDateKey)
       .filter(Boolean)
       .sort();
-    const startKey = allKeys[0] || todayKey;
+    const rawStartKey = allKeys[0] || todayKey;
+    const startKey = clamp(rawStartKey);
     const endKey = todayKey;
     const spanDays = Math.max(
       1,
@@ -1620,15 +1639,20 @@ function buildRangeMeta(range, allSessions = []) {
     };
   }
 
-  const days = Math.max(1, parseInt(range, 10) || 30);
+  const requestedDays = Math.max(1, parseInt(range, 10) || 30);
   const end = new Date();
   end.setHours(0, 0, 0, 0);
   const start = new Date(end);
-  start.setDate(start.getDate() - (days - 1));
-  const startKey = dateStr(start);
+  start.setDate(start.getDate() - (requestedDays - 1));
+  const rawStartKey = dateStr(start);
+  const startKey = clamp(rawStartKey);
   const endKey = dateStr(end);
+  const days = Math.max(
+    1,
+    Math.round((parseDayKey(endKey) - parseDayKey(startKey)) / 86400000) + 1,
+  );
   return {
-    key: String(days),
+    key: String(requestedDays),
     isAllTime: false,
     days,
     startKey,
@@ -1718,337 +1742,15 @@ function buildAnalysisContext({
     .join('\n');
 }
 
-router.get('/analysis', async (req, res) => {
-  try {
-    const { deviceId, range = '30' } = req.query;
-    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
-
-    const fSnap = await fastingDoc(deviceId).get();
-    if (!fSnap.exists) return res.json({ setup_completed: false });
-
-    const data  = fSnap.data() || {};
-    const setup = data.setup  || {};
-    const sessSnap = await sessionsCol(deviceId).orderBy('started_at', 'desc').limit(400).get();
-    const allSessions = sessSnap.docs.map(mapDoc);
-    const rangeMeta = buildRangeMeta(range, allSessions);
-    const sessions = filterSessionsToRange(allSessions, rangeMeta);
-    const previousRangeMeta = rangeMeta.isAllTime
-      ? null
-      : {
-          ...rangeMeta,
-          startKey: shiftDayKey(rangeMeta.startKey, -rangeMeta.days),
-          endKey: shiftDayKey(rangeMeta.startKey, -1),
-        };
-    const previousSessions = previousRangeMeta
-      ? filterSessionsToRange(allSessions, previousRangeMeta)
-      : [];
-
-    const streak        = computeStreak(allSessions);
-    const longestStreak = computeLongestStreak(allSessions);
-    const completion    = computeCompletionFromSessions(sessions);
-    const avgH          = computeAvgHoursFromSessions(sessions);
-    const targetHours   = setup.target_fast_hours || 16;
-
-    const completedSessions = sessions.filter(s => s.completed && s.actual_hours);
-    const totalFastH    = completedSessions.reduce((sum, s) => sum + (s.actual_hours || 0), 0);
-    const bestFastH     = completedSessions.reduce((max, s) => Math.max(max, s.actual_hours || 0), 0);
-
-    // Daily map
-    const byDate = {};
-    for (const s of sessions) {
-      const key = s.date || dateStr(new Date(getMillis(s.started_at)));
-      if (!byDate[key]) byDate[key] = { hours: 0, completed: false, stage: null, broken_early: false };
-      if ((s.actual_hours || 0) >= (byDate[key].hours || 0)) {
-        byDate[key].hours       = s.actual_hours || 0;
-        byDate[key].completed   = s.completed || false;
-        byDate[key].stage       = s.metabolic_stage_reached || getStage(s.actual_hours || 0).id;
-        byDate[key].broken_early = !s.completed;
-      }
-    }
-
-    // Signal points: full selected calendar range, not just logged days.
-    const rangeKeys = buildDayKeysInRange(rangeMeta.startKey, rangeMeta.endKey);
-    const hasAnyLogsInRange = rangeKeys.some(key => byDate[key]?.hours > 0);
-    const signal_points = hasAnyLogsInRange
-      ? rangeKeys.map(key => {
-          const [y, m, d] = key.split('-').map(Number);
-          const dayLog = byDate[key] || null;
-          const label = new Date(y, m - 1, d).toLocaleDateString('en-US', {
-            month: 'short',
-            day: 'numeric',
-          });
-          return {
-            value: round(dayLog?.hours || 0, 1),
-            completed: !!dayLog?.completed,
-            skipped: !dayLog,
-            date: key,
-            label,
-          };
-        })
-      : [];
-
-    // 28-day heatmap
-    const daily_logs = {};
-    for (let i = 27; i >= 0; i--) {
-      const d = new Date(); d.setDate(d.getDate() - i);
-      const key = dateStr(d);
-      if (byDate[key]) daily_logs[key] = byDate[key];
-    }
-
-    // Stage breakdown (all-time, for pattern analysis)
-    const stageCounts = {};
-    for (const s of allSessions.filter(s => s.completed && s.actual_hours)) {
-      const id = s.metabolic_stage_reached || getStage(s.actual_hours).id;
-      stageCounts[id] = (stageCounts[id] || 0) + 1;
-    }
-    const totalComp = allSessions.filter(s => s.completed).length;
-    const STAGE_META = {
-      fed:            { label: 'Fed State',        emoji: '🍽️', color: '#6B7280' },
-      post_absorptive:{ label: 'Post-Absorptive',  emoji: '⚡', color: '#FBBF24' },
-      glycogen:       { label: 'Glycogen Burning', emoji: '🔥', color: '#F97316' },
-      fat_burning:    { label: 'Fat Burning',      emoji: '💪', color: '#EA580C' },
-      ketosis_entry:  { label: 'Ketosis Entry',    emoji: '🧬', color: '#DC2626' },
-      autophagy:      { label: 'Autophagy Active', emoji: '🔬', color: '#B91C1C' },
-      deep_fast:      { label: 'Deep Fast',        emoji: '🌙', color: '#7F1D1D' },
-    };
-    const stage_breakdown = Object.entries(stageCounts)
-      .map(([id, count]) => ({
-        id, count,
-        label: STAGE_META[id]?.label || id,
-        emoji: STAGE_META[id]?.emoji || '⚡',
-        color: STAGE_META[id]?.color || '#F97316',
-        pct: totalComp > 0 ? Math.round(count / totalComp * 100) : 0,
-      }))
-      .sort((a, b) => b.count - a.count);
-
-    // Recent timeline — order by when the user added/logged the entry, not by fast date.
-    const recent_timeline = sessions
-      .filter(s => s.ended_at)
-      .sort((a, b) => getSessionRecentOrderMillis(b) - getSessionRecentOrderMillis(a))
-      .slice(0, 10)
-      .map(s => ({
-        date_str:      s.date || dateStr(new Date(getMillis(s.started_at))),
-        actual_hours:  round(s.actual_hours || 0, 1),
-        target_hours:  s.target_hours || targetHours,
-        completed:     s.completed || false,
-        broken_early:  !s.completed,
-        broken_reason: s.broken_reason || null,
-        stage_reached: s.metabolic_stage_reached || getStage(s.actual_hours || 0).id,
-      }));
-
-    // Programmatic observations
-    const observations = [];
-    if (completion >= 0.8) {
-      observations.push({ title: `${Math.round(completion * 100)}% completion — elite consistency`, body: 'At 80%+ consistency, metabolic flexibility is actively building. Fat oxidation is becoming your default fuel system.', accent: 'green' });
-    } else if (completion < 0.5 && sessions.length >= 3) {
-      observations.push({ title: `${Math.round(completion * 100)}% completion — room to build`, body: 'Most early breaks happen in the 8–12h glycogen window. Push through that window once and the next fast gets measurably easier.', accent: 'red' });
-    }
-    if (streak >= 7) {
-      observations.push({ title: `${streak}-day streak — ghrelin is adapting`, body: 'After 7 consecutive fasts, ghrelin pulse timing shifts. You will notice hunger cues becoming predictable and weaker at fast times.', accent: 'purple' });
-    }
-    if (avgH > 0 && avgH < targetHours * 0.85) {
-      observations.push({ title: `Avg ${avgH}h vs ${targetHours}h target — closing the gap`, body: `You're ${round(targetHours - avgH, 1)}h short of your protocol target on average. The fat-burning switch flips at 12h — push 2 more hours beyond your usual stopping point.`, accent: 'yellow' });
-    }
-    if (bestFastH >= 20) {
-      observations.push({ title: `Personal best: ${round(bestFastH, 1)}h fast recorded`, body: 'A 20h+ fast reaches deep autophagy territory. That cellular repair event is now in your biological history.', accent: 'purple' });
-    }
-
-    // Fasting score — 5-gate algorithm for cross-screen consistency
-    const _fastingDaysLogged = Object.keys(byDate).length;
-    const _cutoff7d = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
-    const _sessions7d   = allSessions.filter(s => (s.date || '') >= _cutoff7d);
-    const _completed7d  = _sessions7d.filter(s => s.completed);
-    const _cr7d  = _sessions7d.length > 0 ? _completed7d.length / _sessions7d.length : completion;
-    const _avgH7 = _completed7d.length
-      ? _completed7d.reduce((s, x) => s + (x.actual_hours || 0), 0) / _completed7d.length : avgH;
-    const _withH = completedSessions.filter(s => s.actual_hours > 0);
-    const _pctFB = _withH.length ? _withH.filter(s => s.actual_hours >= 12).length / _withH.length : 0;
-    const _pctKT = _withH.length ? _withH.filter(s => s.actual_hours >= 16).length / _withH.length : 0;
-    const fasting_score = _computeFastingScore({
-      completion_rate:       completion,
-      completion_rate_7d:    _cr7d,
-      streak,
-      avg_hours:             avgH,
-      avg_hours_7d:          _avgH7,
-      target_hours:          targetHours,
-      pct_reaching_fat_burn: _pctFB,
-      pct_reaching_ketosis:  _pctKT,
-      days_logged:           _fastingDaysLogged,
-    });
-
-    // AI insight
-    let ai_insight = null, personal_formula = null;
-    try {
-      const latestMarker = allSessions[0]
-        ? (allSessions[0].date || toIso(allSessions[0].started_at) || 'latest')
-        : 'none';
-      const cacheKey = [
-        rangeMeta.key,
-        rangeMeta.startKey,
-        rangeMeta.endKey,
-        targetHours,
-        streak,
-        longestStreak,
-        Math.round(completion * 100),
-        avgH,
-        round(bestFastH, 1),
-        round(totalFastH, 1),
-        sessions.length,
-        latestMarker,
-      ].join('|');
-      const cacheId = crypto.createHash('sha1').update(cacheKey).digest('hex');
-      const cached = data.analysis_cache;
-      const cachedEntry = cached?.entries?.[cacheId];
-
-      if (cachedEntry?.key === cacheKey) {
-        ai_insight = cachedEntry.insight || null;
-        personal_formula = cachedEntry.formula || null;
-      } else {
-        const context = buildAnalysisContext({
-          setup,
-          targetHours,
-          rangeMeta,
-          selectedSessions: sessions,
-          previousSessions,
-          allSessions,
-          selectedCompletion: completion,
-          selectedAvgHours: avgH,
-          selectedBestFast: bestFastH,
-        });
-        const insightPrompt = [
-          'You are the fasting intelligence analyst inside a premium fasting app.',
-          'Return ONLY valid JSON. No markdown. No code fences.',
-          'JSON schema: { "insight": string, "formula": string }',
-          `Analyze ONLY the selected window: ${rangeMeta.summary}.`,
-          'You may reference all-time context only when explicitly labeled as all-time.',
-          'The insight must be exactly 2 short sentences, sharp and data-driven, using exact numbers from the selected window.',
-          'The formula must be 1 short action line for the next cycle, concrete and immediately usable.',
-          'If there is a meaningful change vs the previous matching window, name it directly.',
-          'Do not mention data outside the selected window as if it happened inside the window.',
-          'No filler, no hype, no generic fasting advice.',
-        ].join(' ');
-        const aiRes = await openai.chat.completions.create({
-          model: 'gpt-4.1-mini', max_completion_tokens: 180,
-          messages: [
-            { role: 'system', content: insightPrompt },
-            { role: 'user',   content: context },
-          ],
-        });
-        const parsed = JSON.parse(aiRes.choices[0].message.content.trim().replace(/```json|```/g, ''));
-        ai_insight       = parsed.insight      || null;
-        personal_formula = parsed.formula      || null;
-
-        if (ai_insight || personal_formula) {
-          const existingEntries = data.analysis_cache?.entries || {};
-          const generatedAt = new Date().toISOString();
-          fastingDoc(deviceId).update({
-            analysis_cache: {
-              key: cacheKey,
-              cache_id: cacheId,
-              insight: ai_insight,
-              formula: personal_formula,
-              generated_at: generatedAt,
-              entries: {
-                ...existingEntries,
-                [cacheId]: {
-                  key: cacheKey,
-                  range: rangeMeta.key,
-                  start_key: rangeMeta.startKey,
-                  end_key: rangeMeta.endKey,
-                  insight: ai_insight,
-                  formula: personal_formula,
-                  generated_at: generatedAt,
-                },
-              },
-            },
-          }).catch(() => {});
-        }
-      }
-    } catch (e) {
-      console.error('[fasting] analysis insight:', e);
-    }
-
-    return res.json({
-      setup_completed: true,
-      range,
-      range_meta: {
-        key: rangeMeta.key,
-        is_all_time: rangeMeta.isAllTime,
-        days: rangeMeta.days,
-        start_date: rangeMeta.startKey,
-        end_date: rangeMeta.endKey,
-        summary: rangeMeta.summary,
-        short_summary: rangeMeta.shortSummary,
-      },
-      fasting_score,
-      stats: {
-        current_streak:   streak,
-        longest_streak:   longestStreak,
-        completion_rate:  completion,
-        avg_fast_hours:   avgH,
-        total_fasts:      sessions.length,
-        completed_fasts:  completedSessions.length,
-        best_fast_hours:  round(bestFastH, 1),
-        total_fast_hours: round(totalFastH, 1),
-        days_logged:      Object.keys(byDate).length,
-        target_hours:     targetHours,
-      },
-      signal_points,
-      daily_logs,
-      stage_breakdown,
-      recent_timeline,
-      observations,
-      ai_insight,
-      personal_formula,
-      ready_for_upgrade: _cr7d >= 0.85 && _avgH7 >= (targetHours - 0.5),
-      avg_hours_7d:      round(_avgH7, 1),
-      completion_rate_7d: Math.round(_cr7d * 100),
-      cross_agent_snapshot: await (async () => {
-        try {
-          const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
-          const [sleepRes, waterRes, mindRes] = await Promise.allSettled([
-            userDoc(deviceId).collection('agents').doc('sleep')
-              .collection('sleep_logs').orderBy('date', 'desc').limit(1).get(),
-            (async () => {
-              const wRef = await userDoc(deviceId).collection('agents').doc('water').get();
-              const goalMl = wRef.exists ? (wRef.data()?.setup?.daily_goal_ml || wRef.data()?.setup?.recommended_goal_ml || 2500) : 2500;
-              const wSnap = await userDoc(deviceId).collection('agents').doc('water')
-                .collection('water_logs').where('logged_at', '>=', todayStart).get();
-              const todayMl = wSnap.docs.reduce((s, d) => s + (d.data().effective_ml || 0), 0);
-              return { todayMl, goalMl, pct: Math.min(1, todayMl / Math.max(goalMl, 1)) };
-            })(),
-            userDoc(deviceId).collection('agents').doc('mind')
-              .collection('mind_checkins').orderBy('created_at', 'desc').limit(1).get(),
-          ]);
-          const sleepDoc   = sleepRes.status === 'fulfilled' && !sleepRes.value?.empty ? sleepRes.value.docs[0].data() : null;
-          const waterData  = waterRes.status === 'fulfilled' ? waterRes.value : null;
-          const mindDoc    = mindRes.status === 'fulfilled'  && !mindRes.value?.empty  ? mindRes.value.docs[0].data()  : null;
-          const rawMind    = mindDoc ? (mindDoc.mood_score || mindDoc.current_rating || null) : null;
-          return {
-            sleep_quality:    sleepDoc?.quality_score ?? null,
-            sleep_hrs:        sleepDoc?.total_hours_in_bed ?? sleepDoc?.duration_hours ?? null,
-            water_today_pct:  waterData ? Math.round(waterData.pct * 100) : null,
-            water_today_ml:   waterData?.todayMl ?? null,
-            water_goal_ml:    waterData?.goalMl ?? null,
-            mind_score:       rawMind != null ? Math.min(100, Math.round((rawMind / 4) * 100)) : null,
-          };
-        } catch { return null; }
-      })(),
-    });
-  } catch (e) {
-    console.error('[fasting] analysis:', e);
-    return res.status(500).json({ error: 'Failed' });
-  }
-});
 
 // ════════════════════════════════════════════════════════════════
-// GET /analysis/v2 — V4-compatible payload for FastingAnalysisTabV4
+// GET /analysis — V4-compatible payload for FastingAnalysisTabV4
 // Shape: score / score_grade / score_gates / efh_per_day / signal_points /
 //        daily_logs / stage_breakdown / ai_reads / aha_moments / circadian /
 //        best_day / worst_day / streak / completion / avg_hours / best_fast /
 //        total_fast_hours / personal_formula / observations / ready_for_upgrade
 // ════════════════════════════════════════════════════════════════
-router.get('/analysis/v2', async (req, res) => {
+router.get('/analysis', async (req, res) => {
   try {
     const { deviceId, range = '30' } = req.query;
     if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
@@ -2059,9 +1761,15 @@ router.get('/analysis/v2', async (req, res) => {
     const data  = fSnap.data() || {};
     const setup = data.setup   || {};
 
+    // Registration Anchor: clamp start to user signup date (local-TZ).
+    const anchor = await resolveAnchor(deviceId);
+    const clampStartKey = anchor.anchorDateStr;
+    const { computeAnalysisWindow } = require('./lib/range-helpers');
+    const win = computeAnalysisWindow(range, anchor.anchorMs, Date.now(), anchor.utcOffsetMinutes);
+
     const sessSnap = await sessionsCol(deviceId).orderBy('started_at', 'desc').limit(400).get();
     const allSessions = sessSnap.docs.map(mapDoc);
-    const rangeMeta   = buildRangeMeta(range, allSessions);
+    const rangeMeta   = buildRangeMeta(range, allSessions, clampStartKey);
     const sessions    = filterSessionsToRange(allSessions, rangeMeta);
 
     const previousRangeMeta = rangeMeta.isAllTime ? null : {
@@ -2110,12 +1818,17 @@ router.get('/analysis/v2', async (req, res) => {
       };
     }) : [];
 
-    // 28-day heatmap
+    // 28-day heatmap — Registration Anchor Law: never iterate past anchor.
     const daily_logs = {};
-    for (let i = 27; i >= 0; i--) {
-      const d = new Date(); d.setDate(d.getDate() - i);
-      const key = dateStr(d);
-      if (byDate[key]) daily_logs[key] = byDate[key];
+    {
+      const { enumerateDaysFrom: _enum } = require('./lib/range-helpers');
+      const todayKey = dateStr();
+      const dt = new Date(); dt.setDate(dt.getDate() - 27);
+      const candidateStart = dateStr(dt);
+      const heatStart = anchor.anchorDateStr && candidateStart < anchor.anchorDateStr ? anchor.anchorDateStr : candidateStart;
+      for (const key of _enum(heatStart, todayKey)) {
+        if (byDate[key]) daily_logs[key] = byDate[key];
+      }
     }
 
     // Stage breakdown
@@ -2223,9 +1936,50 @@ router.get('/analysis/v2', async (req, res) => {
           new Date(b.generated_at) - new Date(a.generated_at))[0]?.formula || null)
       : null;
 
+    // Lifetime fetch: per-day quality = clamped(actual_hours / target × 100) since anchor.
+    const lifetimeQualityByDateFast = await (async () => {
+      const out = {};
+      if (!anchor.anchorMs) return out;
+      try {
+        const snap = await sessionsCol(deviceId)
+          .orderBy('started_at', 'desc')
+          .limit(Math.min(win.daysSinceAnchor * 2, 1000))
+          .get();
+        for (const d of snap.docs) {
+          const s = d.data();
+          const ds = s.date || (s.started_at ? dateStr(new Date(getMillis(s.started_at))) : null);
+          if (!ds || typeof ds !== 'string') continue;
+          if (anchor.anchorDateStr && ds < anchor.anchorDateStr) continue;
+          const h = Number(s.actual_hours || 0);
+          if (h > 0) {
+            const v = Math.max(0, Math.min(100, Math.round((h / targetHours) * 100)));
+            // Keep the longest fast for that day.
+            out[ds] = Math.max(out[ds] || 0, v);
+          }
+        }
+      } catch { /* fall back to empty */ }
+      return out;
+    })();
+    const { computeStandardOutputs: _csoFast } = require('./lib/score-lifetime');
+    const stdFast = _csoFast({
+      qualityByDate: lifetimeQualityByDateFast,
+      todayDate: win.todayDate,
+      anchorDate: anchor.anchorDateStr,
+      daysSinceAnchor: win.daysSinceAnchor,
+    });
+
     return res.json({
       setup_completed: true,
       range,
+      effective_start_date: rangeMeta.startKey,
+      effective_days: rangeMeta.days,
+      days_since_anchor: win.daysSinceAnchor,
+      anchor_date: anchor.anchorDateStr,
+      is_clamped: win.isClamped,
+      score_today: stdFast.score_today,
+      score_7d_smoothed: stdFast.score_7d_smoothed,
+      score_lifetime: stdFast.score_lifetime,
+      missed_days: stdFast.missed_days,
       score,
       score_grade:  grade,
       score_gates,
@@ -2254,17 +2008,17 @@ router.get('/analysis/v2', async (req, res) => {
         : null,
     });
   } catch (e) {
-    console.error('[fasting] /analysis/v2:', e);
+    log.error('[fasting] /analysis:', e);
     return res.status(500).json({ error: 'Failed' });
   }
 });
 
 // ════════════════════════════════════════════════════════════════
-// GET /actions/v2 — V2-compatible payload for FastingActionsTabV2
+// GET /actions — V2-compatible payload for FastingActionsTabV2
 // Shape: cadence / prescription / actions[] / history[] / stats
 // Cadence is fasting-specific: "Coach reviews every 3 fasts"
 // ════════════════════════════════════════════════════════════════
-router.get('/actions/v2', async (req, res) => {
+router.get('/actions', async (req, res) => {
   try {
     const { deviceId } = req.query;
     if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
@@ -2380,7 +2134,7 @@ router.get('/actions/v2', async (req, res) => {
 
     return res.json({ cadence, prescription, actions, history, stats });
   } catch (e) {
-    console.error('[fasting] /actions/v2:', e);
+    log.error('[fasting] /actions:', e);
     return res.status(500).json({ error: 'Failed' });
   }
 });
@@ -2521,7 +2275,7 @@ async function buildActionContext(deviceId) {
       .filter(Boolean)
       .join('\n');
   } catch (e) {
-    console.error('[fasting] buildActionContext:', e);
+    log.error('[fasting] buildActionContext:', e);
     return 'Context unavailable.';
   }
 }
@@ -2574,8 +2328,7 @@ async function generateActionBatch(
 
   const actRes = await openai.chat.completions.create({
     model: 'gpt-4.1-mini',
-    max_tokens: 650,
-    temperature: 0.28,
+    max_completion_tokens: 650,
     messages: [
       { role: 'system', content: systemPrompt },
       { role: 'user', content: context },
@@ -2733,7 +2486,7 @@ async function buildActionsPayload(deviceId, { allowGeneration = true } = {}) {
       generationKind: 'pattern',
       completedTotalAtGeneration: totalCompleted,
     }).catch(e => {
-      console.error('[fasting] actions cycle queue:', e);
+      log.error('[fasting] actions cycle queue:', e);
     });
   }
 
@@ -2820,45 +2573,10 @@ async function buildActionsPayload(deviceId, { allowGeneration = true } = {}) {
   };
 }
 
-// ================================================================
-// GET /actions -- setup batch, then only every 3 completed fasts
-// ================================================================
-router.get('/_legacy/actions', async (req, res) => {
-  try {
-    const { deviceId } = req.query;
-    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
-
-    const payload = await buildActionsPayload(deviceId, {
-      allowGeneration: true,
-    });
-    return res.json(payload);
-  } catch (e) {
-    console.error('[fasting] actions:', e);
-    return res.status(500).json({ error: 'Failed' });
-  }
-});
-
-// ================================================================
-// POST /actions/refresh -- reload only, no forced generation
-// ================================================================
-router.post('/_legacy/actions/refresh', async (req, res) => {
-  try {
-    const { deviceId } = req.body;
-    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
-
-    const payload = await buildActionsPayload(deviceId, {
-      allowGeneration: true,
-    });
-    return res.json({ success: true, ...payload });
-  } catch (e) {
-    console.error('[fasting] actions/refresh:', e);
-    return res.status(500).json({ error: 'Failed' });
-  }
-});
 
 // ================================================================
 // POST /action/:id/complete  (canonical — frontend uses this path)
-// Also reachable via /_legacy/action/:id/complete for forward compat.
+
 // ================================================================
 async function _completeAction(req, res) {
   try {
@@ -2875,12 +2593,11 @@ async function _completeAction(req, res) {
     });
     return res.json({ success: true });
   } catch (e) {
-    console.error('[fasting] action/complete:', e);
+    log.error('[fasting] action/complete:', e);
     return res.status(500).json({ error: 'Failed' });
   }
 }
 router.post('/action/:id/complete',         _completeAction);
-router.post('/_legacy/action/:id/complete', _completeAction);
 
 // ================================================================
 // POST /action/:id/skip  (canonical)
@@ -2901,12 +2618,11 @@ async function _skipAction(req, res) {
     });
     return res.json({ success: true });
   } catch (e) {
-    console.error('[fasting] action/skip:', e);
+    log.error('[fasting] action/skip:', e);
     return res.status(500).json({ error: 'Failed' });
   }
 }
 router.post('/action/:id/skip',         _skipAction);
-router.post('/_legacy/action/:id/skip', _skipAction);
 
 // ================================================================
 // POST /chat
@@ -2918,6 +2634,7 @@ router.post('/chat', async (req, res) => {
     if (!message?.trim()) return res.status(400).json({ error: 'message required' });
     if (!checkChatRate(deviceId)) return res.status(429).json({ error: 'Rate limit' });
 
+    const language = resolveLanguage(req);
     const context = await getCachedContext(deviceId);
 
     const threadNotes = {
@@ -3003,15 +2720,14 @@ router.post('/chat', async (req, res) => {
       .map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content }));
 
     const messages = [
-      { role: 'system', content: `CONTEXT:\n${context}\n\n${systemPrompt}` },
+      { role: 'system', content: appendLanguageInstruction(`CONTEXT:\n${context}\n\n${systemPrompt}`, language) },
       ...history.slice(-10),
       { role: 'user', content: message },
     ];
 
     const completion = await openai.chat.completions.create({
       model: 'gpt-4.1',
-      max_tokens: 220,
-      temperature: 0.35,
+      max_completion_tokens: 220,
       messages,
     });
 
@@ -3021,14 +2737,14 @@ router.post('/chat', async (req, res) => {
     const userMsgRef = chatsCol(deviceId).doc();
     batch.set(userMsgRef, {
       role: 'user', content: message,
-      is_proactive: false,
+      is_proactive: false, language,
       proactive_context: proactive_context || null,
       created_at: admin.firestore.FieldValue.serverTimestamp(),
     });
     const aiMsgRef = chatsCol(deviceId).doc();
     batch.set(aiMsgRef, {
       role: 'assistant', content: reply,
-      is_proactive: false,
+      is_proactive: false, language,
       created_at: admin.firestore.FieldValue.serverTimestamp(),
     });
     await batch.commit();
@@ -3036,7 +2752,7 @@ router.post('/chat', async (req, res) => {
 
     return res.json({ reply, message_id: aiMsgRef.id });
   } catch (e) {
-    console.error('[fasting] chat:', e);
+    log.error('[fasting] chat:', e);
     return res.status(500).json({ error: 'Chat failed' });
   }
 });
@@ -3049,7 +2765,7 @@ _mountChatStreamFasting(router, {
   agentName: 'fasting',
   openai, admin, chatsCol,
   rateLimitCheck: checkChatRate,
-  model: 'gpt-4.1', maxTokens: 220, temperature: 0.35,
+  model: 'gpt-4.1', maxTokens: 220,
   buildPrompt: async (deviceId, message, { proactive_context } = {}) => {
     const context = await getCachedContext(deviceId);
     let systemPrompt = `CONTEXT:\n${context}\n\nYou are the Pulse Fasting Coach. Tight, precise, max 140 words. Reference exact hours/streak/water/sleep numbers. Sound human, never robotic.`;
@@ -3099,7 +2815,7 @@ router.get('/chat/messages', async (req, res) => {
 
     return res.json({ messages, has_more: hasMore, oldest_id: oldest?.id || null });
   } catch (e) {
-    console.error('[fasting] chat/messages:', e);
+    log.error('[fasting] chat/messages:', e);
     return res.status(500).json({ error: 'Failed' });
   }
 });
@@ -3116,7 +2832,7 @@ router.get('/chat/unread', async (req, res) => {
     const unread = fSnap.exists ? (fSnap.data()?.unread_proactive_count || 0) : 0;
     return res.json({ unread });
   } catch (e) {
-    console.error('[fasting] chat/unread:', e);
+    log.error('[fasting] chat/unread:', e);
     return res.json({ unread: 0 });
   }
 });
@@ -3134,7 +2850,7 @@ router.post('/chat/read', async (req, res) => {
     });
     return res.json({ success: true });
   } catch (e) {
-    console.error('[fasting] chat/read:', e);
+    log.error('[fasting] chat/read:', e);
     return res.status(500).json({ error: 'Failed' });
   }
 });
@@ -3143,8 +2859,7 @@ router.post('/chat/read', async (req, res) => {
 // PROACTIVE CRON -- every hour
 // Fires personalized messages based on fast state + thresholds
 // ================================================================
-cron.schedule('0 * * * *', async () => {
-  try {
+const _fastingCronTick = async () => {
     const usersSnap = await db().collection('wellness_users').limit(300).get();
 
     for (const userSnap of usersSnap.docs) {
@@ -3153,12 +2868,16 @@ cron.schedule('0 * * * *', async () => {
         const fSnap = await fastingDoc(deviceId).get();
         if (!fSnap.exists || !fSnap.data()?.setup_completed) continue;
 
+        // notif_enabled + DND + user-local time — gate before doing work.
+        const notifCtx = await getUserNotifContext(db(), deviceId);
+        if (!notifCtx.allowsProactive) continue;
+
         const data  = fSnap.data() || {};
         const setup = data.setup || {};
 
-        const today     = dateStr();
-        const hour      = new Date().getHours();
-        const minute    = new Date().getMinutes();
+        const today     = notifCtx.localDateStr;
+        const hour      = notifCtx.localHour;
+        const minute    = notifCtx.localMinute;
         const nowMin    = hour * 60 + minute;
         const storedDate = data.last_proactive_date || '';
         const storedCount= storedDate === today ? (data.proactive_count_today || 0) : 0;
@@ -3338,14 +3057,16 @@ cron.schedule('0 * * * *', async () => {
 
         invalidateCtx(deviceId);
       } catch (e) {
-        console.error(`[fasting] cron error for ${deviceId}:`, e);
+        log.error(`[fasting] cron error for ${deviceId}:`, e);
       }
     }
-  } catch (e) {
-    console.error('[fasting] cron fatal:', e);
-  }
-});
+};
 
-console.log('[fasting] agent loaded -- metabolic stages, cross-agent synergy, proactive cron active');
+if (shouldRunCron()) {
+  cron.schedule('0 * * * *', withCron('fasting:hourly-proactives', _fastingCronTick, {
+    ttlMs: 25 * 60_000,
+  }), { timezone: 'UTC' });
+}
+
 
 module.exports = router;

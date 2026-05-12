@@ -32,7 +32,7 @@ async function getAllSnapshots(deviceId, opts = {}) {
         const snap = await getAgentSnapshot(agent, deviceId, opts);
         return [agent, snap];
       } catch (err) {
-        console.error(`[adapters] ${agent} failed:`, err && err.message);
+        log.error(`[adapters] ${agent} failed:`, err && err.message);
         const { emptyAgentSnapshot } = require('./_shape');
         const today = opts.todayDate || new Date().toISOString().slice(0, 10);
         return [agent, emptyAgentSnapshot(agent, today)];

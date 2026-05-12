@@ -22,6 +22,7 @@ const router = express.Router();
 const { requireDeviceId, rateLimit, RATE } = require('./_middleware');
 const { readInsightsPack, readCorrelations } = require('../persistence/insights-pack.repo');
 const { runForUserSafe, runForUserFastSafe, runForUserEnrich } = require('../orchestrator/workflow');
+const { resolveLanguage } = require('../../lib/i18n-prompt');
 const config = require('../config');
 
 const STALE_HOURS = config.CACHE.INSIGHTS_PACK_STALE_THRESHOLD_HOURS;
@@ -40,13 +41,16 @@ router.get('/insights/:deviceId', requireDeviceId, rateLimit(RATE.INSIGHTS_GET_P
         });
       }
     }
+    const language = resolveLanguage(req);
     const range = parseRange(req.query.range);
     let cached = await readInsightsPack(req.deviceId, range);
+    const cachedLang = (cached && cached._lang) || (cached && cached.meta && cached.meta._lang) || 'en';
+    const langChanged = cached && cachedLang !== language;
     const stale = cached
-      ? cached.meta.stale_for_seconds > STALE_HOURS * 3600
+      ? (cached.meta.stale_for_seconds > STALE_HOURS * 3600) || langChanged
       : true;
 
-    // Path 1: fresh cache hit
+    // Path 1: fresh cache hit (and same language)
     if (cached && !stale) {
       return res.json(cached);
     }
@@ -54,25 +58,25 @@ router.get('/insights/:deviceId', requireDeviceId, rateLimit(RATE.INSIGHTS_GET_P
     // Path 2: stale — return immediately, refresh async with LLM polish
     if (cached && stale) {
       res.json(cached);
-      runForUserSafe(req.deviceId).catch((err) =>
-        console.error('[insights] async refresh failed:', err && err.message));
+      runForUserSafe(req.deviceId, { language }).catch((err) =>
+        log.error('[insights] async refresh failed:', err && err.message));
       return;
     }
 
     // Path 3: COLD — deterministic fast path keeps the user under 1s,
     // then fire LLM enrich in the background so prose lands by next open.
-    const result = await runForUserFastSafe(req.deviceId);
+    const result = await runForUserFastSafe(req.deviceId, { language });
     const fresh = result.insights_packs.find((ip) => ip.range === range);
     res.json(fresh && fresh.pack ? fresh.pack : (result.insights_packs[0] && result.insights_packs[0].pack) || {});
 
     // Async LLM upgrade — never blocks the response. enrichment_context is
     // populated by runForUserFast; runForUserEnrich is null-safe.
     if (result.enrichment_context) {
-      runForUserEnrich(req.deviceId, result.enrichment_context).catch((err) =>
-        console.error('[insights] async enrich failed:', err && err.message));
+      runForUserEnrich(req.deviceId, result.enrichment_context, { language }).catch((err) =>
+        log.error('[insights] async enrich failed:', err && err.message));
     }
   } catch (err) {
-    console.error('[insights] error:', err);
+    log.error('[insights] error:', err);
     res.status(500).json({ error: 'insights_failed', message: err && err.message });
   }
 });
@@ -103,7 +107,7 @@ router.get('/correlations/:deviceId/:correlationId', requireDeviceId, async (req
       evidence: found.evidence,
     });
   } catch (err) {
-    console.error('[correlations] error:', err);
+    log.error('[correlations] error:', err);
     res.status(500).json({ error: 'correlation_failed' });
   }
 });

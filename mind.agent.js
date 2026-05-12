@@ -12,6 +12,10 @@ const admin   = require('firebase-admin');
 const { OpenAI } = require('openai');
 const cron    = require('node-cron');
 const { fetchAgentSnapshot } = require('./lib/cross-agent-context');
+const { resolveLanguage, appendLanguageInstruction } = require('./lib/i18n-prompt');
+const { withCron, shouldRunCron } = require('./lib/cron-helper');
+const { resolveAnchor } = require('./lib/user-anchor');
+const { assertLoggableDate, sendLogGuardError } = require('./lib/log-guard');
 const { computeMindScore: _computeMindScore } = require('./lib/agent-scores');
 const mindAnalytics = require('./lib/mind-analytics');
 const { detectCrisis, crisisEnvelope } = require('./lib/safety');
@@ -201,7 +205,7 @@ router.post('/setup', async (req, res) => {
 
     res.json({ success: true, actions: firstActions });
   } catch (err) {
-    console.error('[mind] /setup error:', err);
+    log.error('[mind] /setup error:', err);
     res.status(500).json({ error: 'Setup failed' });
   }
 });
@@ -222,7 +226,7 @@ router.get('/setup-status', async (req, res) => {
     const data = snap.data();
     res.json({ setup_completed: !!data.setup_completed, setup: data });
   } catch (err) {
-    console.error('[mind] /setup-status error:', err);
+    log.error('[mind] /setup-status error:', err);
     res.status(500).json({ error: 'Status check failed' });
   }
 });
@@ -301,7 +305,7 @@ router.get('/chat-prompts', async (req, res) => {
 
     res.json({ prompts: pool.slice(0, 6) });
   } catch (err) {
-    console.error('[mind] /chat-prompts error:', err);
+    log.error('[mind] /chat-prompts error:', err);
     res.status(500).json({ error: 'Failed' });
   }
 });
@@ -347,7 +351,7 @@ async function refreshMindScore(deviceId) {
       score_updated_at: admin.firestore.FieldValue.serverTimestamp(),
     });
   } catch (err) {
-    console.error('[mind] refreshScore:', err.message);
+    log.error('[mind] refreshScore:', err.message);
   }
 }
 
@@ -361,16 +365,21 @@ router.post('/checkin', async (req, res) => {
     const { deviceId, mood, emotions, triggers, anxiety, note, override_date } = req.body;
     if (!deviceId || !mood) return res.status(400).json({ error: 'deviceId and mood required' });
 
-    // Support past-date logging (override_date = 'YYYY-MM-DD')
+    // Support past-date logging (override_date = 'YYYY-MM-DD'), clamped to anchor.
+    const anchor = await resolveAnchor(deviceId);
+    let candidateDate;
+    try { candidateDate = assertLoggableDate(override_date, anchor); }
+    catch (e) { return sendLogGuardError(res, e); }
+
     let now, hour, today;
     if (override_date && /^\d{4}-\d{2}-\d{2}$/.test(override_date)) {
-      now   = new Date(override_date + 'T12:00:00');
+      now   = new Date(candidateDate + 'T12:00:00');
       hour  = 12;
-      today = override_date;
+      today = candidateDate;
     } else {
       now   = new Date();
       hour  = now.getHours();
-      today = dateStr(now);
+      today = candidateDate;
     }
 
     // actionDate is ALWAYS the real current date — actions must be for today
@@ -390,11 +399,13 @@ router.post('/checkin', async (req, res) => {
       logged_at:   admin.firestore.Timestamp.fromDate(now),
     };
 
-    // Save checkin
-    const checkinRef = await checkinsCol(deviceId).add(checkinData);
+    // ── Parallelize: checkin write + previous-state read are independent ──
+    // ~120ms saved on the median checkin.
+    const [checkinRef, mindSnapBefore] = await Promise.all([
+      checkinsCol(deviceId).add(checkinData),
+      mindDoc(deviceId).get(),
+    ]);
 
-    // Read state BEFORE incrementing so we can check last_checkin_date
-    const mindSnapBefore  = await mindDoc(deviceId).get();
     const mindDataBefore  = mindSnapBefore.data() || {};
     const prevCount       = mindDataBefore.checkin_count || 0;
     const lastGenAt       = mindDataBefore.last_action_gen_at_checkin || 0;
@@ -492,7 +503,7 @@ router.post('/checkin', async (req, res) => {
           );
           proactiveType = 'anxiety_spike';
         } catch (err) {
-          console.error('[mind] anxiety proactive gen error:', err.message);
+          log.error('[mind] anxiety proactive gen error:', err.message);
         }
       }
 
@@ -540,7 +551,7 @@ router.post('/checkin', async (req, res) => {
       new_actions:    newActions,
     });
   } catch (err) {
-    console.error('[mind] /checkin error:', err);
+    log.error('[mind] /checkin error:', err);
     res.status(500).json({ error: 'Checkin failed' });
   }
 });
@@ -571,7 +582,7 @@ router.get('/checkins/dates', async (req, res) => {
 
     res.json({ date_counts: dateCounts });
   } catch (err) {
-    console.error('[mind] /checkins/dates error:', err);
+    log.error('[mind] /checkins/dates error:', err);
     res.status(500).json({ error: 'Failed' });
   }
 });
@@ -597,7 +608,7 @@ router.get('/checkins', async (req, res) => {
 
     res.json({ checkins: result });
   } catch (err) {
-    console.error('[mind] /checkins error:', err);
+    log.error('[mind] /checkins error:', err);
     res.status(500).json({ error: 'Failed to get checkins' });
   }
 });
@@ -623,7 +634,7 @@ router.patch('/checkin/:id', async (req, res) => {
     await checkinsCol(deviceId).doc(id).update(updates);
     res.json({ success: true });
   } catch (err) {
-    console.error('[mind] PATCH /checkin error:', err);
+    log.error('[mind] PATCH /checkin error:', err);
     res.status(500).json({ error: 'Update failed' });
   }
 });
@@ -655,159 +666,17 @@ router.post('/intention', async (req, res) => {
 
     res.json({ success: true, id: ref.id });
   } catch (err) {
-    console.error('[mind] /intention error:', err);
+    log.error('[mind] /intention error:', err);
     res.status(500).json({ error: 'Failed' });
   }
 });
 
-// ═══════════════════════════════════════════════════════════════
-// GET /analysis
-// Full stats + progressive AI insight. Cached by checkin count
-// so pull-to-refresh only calls OpenAI when data has changed.
-// ═══════════════════════════════════════════════════════════════
-router.get('/analysis', async (req, res) => {
-  try {
-    const { deviceId, days } = req.query;
-    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
-
-    const [mindSnap, allCheckinsSnap] = await Promise.all([
-      mindDoc(deviceId).get(),
-      checkinsCol(deviceId).orderBy('logged_at', 'asc').get(),
-    ]);
-
-    if (!mindSnap.exists) return res.json({ stage: 0, stats: null });
-
-    const mindData    = mindSnap.data();
-    const allCheckins = allCheckinsSnap.docs.map(d => ({
-      id:        d.id,
-      ...d.data(),
-      logged_at: d.data().logged_at?.toDate?.() || new Date(),
-    }));
-
-    if (allCheckins.length === 0) {
-      return res.json({ stage: 0, stats: { total_checkins: 0 }, setup: mindData });
-    }
-
-    // ── Period filter — Today/7d/30d/90d or all-time ─────────────
-    const daysNum = days ? parseInt(days, 10) : null;
-    const periodCheckins = daysNum
-      ? (() => {
-          const cutoff = new Date();
-          cutoff.setDate(cutoff.getDate() - (daysNum - 1));
-          cutoff.setHours(0, 0, 0, 0);
-          const cutoffStr = dateStr(cutoff);
-          return allCheckins.filter(c => {
-            const ds = c.date_str || dateStr(c.logged_at instanceof Date ? c.logged_at : new Date(c.logged_at));
-            return ds >= cutoffStr;
-          });
-        })()
-      : allCheckins;
-
-    // Stage + streak always from ALL-TIME data (progression/habit metrics)
-    const allTimeStats = computeStats(allCheckins);
-    const stage        = determineStage(allTimeStats);
-
-    // Period-specific analytics
-    const stats = periodCheckins.length > 0
-      ? { ...computeStats(periodCheckins), streak: allTimeStats.streak }
-      : { total_checkins: 0, days_with_logs: 0, streak: allTimeStats.streak };
-    const recent_signal_points = buildRecentSignalPoints(periodCheckins);
-    const recent_timeline      = buildRecentTimeline(periodCheckins);
-    const observations         = buildAnalysisObservations(mindData, stats, recent_signal_points);
-    const correlations         = buildCorrelationBars(mindData, stats);
-
-    // AI insight — keyed to all-time data (expensive, don't regenerate per period)
-    const cacheKey  = `${allTimeStats.total_checkins}_${allTimeStats.days_with_logs}`;
-    const cached    = mindData.analysis_cache;
-    let ai_insight       = null;
-    let personal_formula = null;
-
-    if (cached && cached.key === cacheKey) {
-      ai_insight       = cached.insight;
-      personal_formula = cached.formula;
-    } else if (allTimeStats.total_checkins >= 1) {
-      const result = await generateAnalysisInsight(mindData, allTimeStats);
-      ai_insight       = result.insight;
-      personal_formula = result.formula;
-      await mindDoc(deviceId).update({
-        analysis_cache: {
-          key:          cacheKey,
-          insight:      ai_insight,
-          formula:      personal_formula,
-          generated_at: new Date().toISOString(),
-        },
-      });
-    }
-
-    // Today's logs (always all-time scoped)
-    const today     = dateStr();
-    const todayLogs = allCheckins
-      .filter(c => c.date_str === today)
-      .map(c => ({
-        ...c,
-        logged_at: c.logged_at instanceof Date ? c.logged_at.toISOString() : c.logged_at,
-      }));
-
-    // Mind Score — always all-time (rolling health score, not period-scoped)
-    // Fetch sleep cross-agent signal in parallel with existing queries above
-    const sleepLogsRef = userDoc(deviceId).collection('agents').doc('sleep').collection('sleep_logs');
-    let recentSleepHoursForScore = null;
-    try {
-      const recentSleepSnap = await sleepLogsRef.orderBy('logged_at', 'desc').limit(3).get();
-      const recentSleepLogs = recentSleepSnap.docs.map(d => d.data());
-      if (recentSleepLogs.length) {
-        recentSleepHoursForScore = recentSleepLogs.reduce((s, l) => s + (l.total_sleep_hours || 0), 0) / recentSleepLogs.length;
-      }
-    } catch { /* non-fatal: scoring gracefully degrades without sleep data */ }
-
-    const moodScores    = [...allCheckins].reverse().map(c => c.mood_score || c.mood || 3); // oldest-first → reverse for most-recent-first
-    const anxietyScores = [...allCheckins].reverse().map(c => c.anxiety_level || c.anxiety || 2);
-    const checkinDates  = [...new Set(allCheckins.map(c => c.date_str).filter(Boolean))];
-    const mindScore = _computeMindScore({
-      mood_scores:         moodScores,
-      anxiety_scores:      anxietyScores,
-      checkin_dates:       checkinDates,
-      days_logged:         checkinDates.length,
-      streak:              allTimeStats.streak || 0,
-      recent_sleep_hours:  recentSleepHoursForScore,
-    });
-
-    if (mindScore) {
-      mindDoc(deviceId).update({
-        current_score:    mindScore.score,
-        score_label:      mindScore.label,
-        score_components: mindScore.components,
-        score_updated_at: admin.firestore.FieldValue.serverTimestamp(),
-      }).catch(() => {});
-    }
-
-    res.json({
-      stage,
-      stats,
-      ai_insight,
-      personal_formula,
-      recent_signal_points,
-      recent_timeline,
-      observations,
-      correlations,
-      deep_analysis_remaining: Math.max(0, 5 - allTimeStats.days_with_logs),
-      today_checkins:          todayLogs,
-      setup:                   mindData,
-      mind_score:              mindScore,
-      period_days:             daysNum,
-      all_time_total:          allTimeStats.total_checkins,
-    });
-  } catch (err) {
-    console.error('[mind] /analysis error:', err);
-    res.status(500).json({ error: 'Analysis failed' });
-  }
-});
 
 // ═══════════════════════════════════════════════════════════════
-// GET /analysis/v2 — full Insights tab payload (10/10 reference)
+// GET /analysis — full Insights tab payload (10/10 reference)
 // Range: 7|30|90|365 days. Returns 7 aha cards + AI reads + score.
 // ═══════════════════════════════════════════════════════════════
-router.get('/analysis/v2', async (req, res) => {
+router.get('/analysis', async (req, res) => {
   try {
     const { deviceId, range } = req.query;
     if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
@@ -818,11 +687,68 @@ router.get('/analysis/v2', async (req, res) => {
       return null; // all-time
     })();
 
-    const payload = await mindAnalytics.loadAnalysisV2(deviceId, daysNum, { openai });
-    if (!payload) return res.json({ stats: null, signal_points: [], aha_moments: [] });
-    res.json(payload);
+    // Registration Anchor: clamp window to signup date in user's local TZ.
+    const nowMs = Date.now();
+    const anchor = await resolveAnchor(deviceId);
+    const { computeAnalysisWindow } = require('./lib/range-helpers');
+    const win = computeAnalysisWindow(daysNum || 30, anchor.anchorMs, nowMs, anchor.utcOffsetMinutes);
+    const effectiveDays = daysNum ? win.effectiveDays : null;
+
+    const payload = await mindAnalytics.loadAnalysisV2(deviceId, effectiveDays, { openai });
+    const body = payload || { stats: null, signal_points: [], aha_moments: [] };
+
+    // Lifetime fetch: pull checkins since anchor → quality map independent of request window.
+    const lifetimeQualityByDate = await (async () => {
+      const out = {};
+      if (!anchor.anchorMs) return out;
+      try {
+        const snap = await checkinsCol(deviceId)
+          .orderBy('logged_at', 'desc')
+          .limit(Math.min(win.daysSinceAnchor * 5, 3000))
+          .get();
+        const byDate = {};
+        for (const d of snap.docs) {
+          const c = d.data();
+          const ds = c.date_str;
+          if (!ds || typeof ds !== 'string') continue;
+          if (anchor.anchorDateStr && ds < anchor.anchorDateStr) continue;
+          if (!byDate[ds]) byDate[ds] = { moods: [], anxs: [] };
+          byDate[ds].moods.push(Number(c.mood_score || c.mood || 2));
+          byDate[ds].anxs.push(Number(c.anxiety_level || c.anxiety || 3));
+        }
+        for (const [ds, b] of Object.entries(byDate)) {
+          const mood = b.moods.reduce((a, x) => a + x, 0) / b.moods.length;
+          const anx  = b.anxs.reduce((a, x) => a + x, 0) / b.anxs.length;
+          const moodPart = Math.max(0, Math.min(100, ((mood - 1) / 2) * 100));
+          const anxPart  = Math.max(0, Math.min(100, ((5 - anx) / 4) * 100));
+          out[ds] = Math.round(moodPart * 0.6 + anxPart * 0.4);
+        }
+      } catch { /* fall back to empty */ }
+      return out;
+    })();
+
+    const { computeStandardOutputs } = require('./lib/score-lifetime');
+    const std = computeStandardOutputs({
+      qualityByDate: lifetimeQualityByDate,
+      todayDate: win.todayDate,
+      anchorDate: anchor.anchorDateStr,
+      daysSinceAnchor: win.daysSinceAnchor,
+    });
+
+    res.json({
+      ...body,
+      effective_start_date: win.effectiveStartDate,
+      effective_days: effectiveDays,
+      days_since_anchor: win.daysSinceAnchor,
+      anchor_date: anchor.anchorDateStr,
+      is_clamped: win.isClamped,
+      score_today: std.score_today,
+      score_7d_smoothed: std.score_7d_smoothed,
+      score_lifetime: std.score_lifetime,
+      missed_days: std.missed_days,
+    });
   } catch (err) {
-    console.error('[mind] /analysis/v2 error:', err);
+    log.error('[mind] /analysis error:', err);
     res.status(500).json({ error: 'Analysis V2 failed' });
   }
 });
@@ -851,7 +777,7 @@ router.post('/reframe', async (req, res) => {
     const parsed = JSON.parse(completion.choices?.[0]?.message?.content || '{}');
     res.json({ is_crisis: false, reframe: parsed?.reframe || null });
   } catch (err) {
-    console.error('[mind] /reframe error:', err);
+    log.error('[mind] /reframe error:', err);
     res.status(500).json({ error: 'Reframe failed' });
   }
 });
@@ -868,16 +794,16 @@ router.get('/track-context', async (req, res) => {
     const payload = await mindAnalytics.loadTrackContext(deviceId);
     res.json(payload || { today_logs: [], smart_defaults: null, streak: 0 });
   } catch (err) {
-    console.error('[mind] /track-context error:', err);
+    log.error('[mind] /track-context error:', err);
     res.status(500).json({ error: 'track context failed' });
   }
 });
 
 // ═══════════════════════════════════════════════════════════════
-// GET /actions/v2 — 10/10 Actions tab payload (mind-native)
+// GET /actions — 10/10 Actions tab payload (mind-native)
 // Wraps the actions-engine collection + adds cadence + history shape.
 // ═══════════════════════════════════════════════════════════════
-router.get('/actions/v2', async (req, res) => {
+router.get('/actions', async (req, res) => {
   try {
     const { deviceId } = req.query;
     if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
@@ -969,7 +895,7 @@ router.get('/actions/v2', async (req, res) => {
       },
     });
   } catch (err) {
-    console.error('[mind] /actions/v2 error:', err);
+    log.error('[mind] /actions error:', err);
     return res.status(500).json({ error: 'server error' });
   }
 });
@@ -1004,7 +930,7 @@ router.get('/chat-state', async (req, res) => {
       })(),
     });
   } catch (err) {
-    console.error('[mind] /chat-state error:', err);
+    log.error('[mind] /chat-state error:', err);
     res.status(500).json({ error: 'state failed' });
   }
 });
@@ -1019,18 +945,22 @@ router.post('/chat', async (req, res) => {
     const { deviceId, message, region } = req.body;
     if (!deviceId || !message) return res.status(400).json({ error: 'deviceId and message required' });
 
+    const language = resolveLanguage(req);
+
     // Save user message first so it appears immediately client-side
     await chatsCol(deviceId).add({
       role:           'user',
       content:        message,
       is_proactive:   false,
       proactive_type: null,
-      is_read:        true,
+      is_read:        true, language,
       created_at:     admin.firestore.FieldValue.serverTimestamp(),
     });
 
     // ── CRISIS ROUTING ──────────────────────────────────────────
     // Never call OpenAI for crisis content — return the warm template.
+    // Crisis envelope is already localized via the crisisEnvelope(region)
+    // path; language directive is intentionally NOT applied here.
     const crisis = detectCrisis(message);
     if (crisis) {
       const env = crisisEnvelope(region);
@@ -1040,14 +970,14 @@ router.post('/chat', async (req, res) => {
         is_proactive:   false,
         proactive_type: 'crisis_safe',
         is_crisis:      true,
-        is_read:        true,
+        is_read:        true, language,
         created_at:     admin.firestore.FieldValue.serverTimestamp(),
       });
       return res.json({ success: true, reply: env.reply, message_id: msgRef.id, ...env });
     }
 
-    // Build personalised system context
-    const systemContext = await buildContext(deviceId);
+    // Build personalised system context, then append language directive
+    const systemContext = appendLanguageInstruction(await buildContext(deviceId), language);
 
     // Fetch chat history for conversation continuity (last 14 messages)
     const historySnap = await chatsCol(deviceId)
@@ -1075,13 +1005,13 @@ router.post('/chat', async (req, res) => {
       content:        reply,
       is_proactive:   false,
       proactive_type: null,
-      is_read:        true,
+      is_read:        true, language,
       created_at:     admin.firestore.FieldValue.serverTimestamp(),
     });
 
     res.json({ success: true, reply, message_id: msgRef.id });
   } catch (err) {
-    console.error('[mind] /chat error:', err);
+    log.error('[mind] /chat error:', err);
     res.status(500).json({ error: 'Chat failed' });
   }
 });
@@ -1127,7 +1057,7 @@ router.get('/chat', async (req, res) => {
 
     res.json({ messages });
   } catch (err) {
-    console.error('[mind] GET /chat error:', err);
+    log.error('[mind] GET /chat error:', err);
     res.status(500).json({ error: 'Failed' });
   }
 });
@@ -1162,7 +1092,7 @@ router.get('/chat/unread', async (req, res) => {
 
     res.json({ messages });
   } catch (err) {
-    console.error('[mind] /chat/unread error:', err);
+    log.error('[mind] /chat/unread error:', err);
     res.status(500).json({ error: 'Failed' });
   }
 });
@@ -1184,7 +1114,7 @@ router.post('/chat/read', async (req, res) => {
 
     res.json({ success: true, marked: snap.size });
   } catch (err) {
-    console.error('[mind] /chat/read error:', err);
+    log.error('[mind] /chat/read error:', err);
     res.status(500).json({ error: 'Failed' });
   }
 });
@@ -1305,7 +1235,7 @@ Return ONLY valid JSON — an array of ${count} objects. No markdown, no explana
 
     return fallbackActions(challenge, worstTime);
   } catch (err) {
-    console.error('[mind] action gen parse error:', err.message);
+    log.error('[mind] action gen parse error:', err.message);
     return fallbackActions(challenge, worstTime);
   }
 }
@@ -2039,7 +1969,7 @@ RULES:
     const parsed  = JSON.parse(cleaned);
     return { insight: parsed.insight || null, formula: parsed.formula || null };
   } catch (err) {
-    console.error('[mind] insight gen error:', err.message);
+    log.error('[mind] insight gen error:', err.message);
     return { insight: buildEarlyMindInsight(stats), formula: null };
   }
 }
@@ -2066,7 +1996,6 @@ function buildOpeningMessage(name, primary_challenge, triggers) {
 // ═══════════════════════════════════════════════════════════════
 
 async function runProactiveChecks() {
-  console.log('[mind] running proactive checks');
   try {
     const usersSnap = await db()
       .collection('wellness_users')
@@ -2186,11 +2115,11 @@ async function runProactiveChecks() {
           });
         }
       } catch (uErr) {
-        console.error(`[mind] proactive failed for ${deviceId}:`, uErr.message);
+        log.error(`[mind] proactive failed for ${deviceId}:`, uErr.message);
       }
     }
   } catch (err) {
-    console.error('[mind] proactive checks error:', err);
+    log.error('[mind] proactive checks error:', err);
   }
 }
 
@@ -2356,7 +2285,6 @@ function getWeekKey(d = new Date()) {
 // block the more valuable behaviour-triggered streak reminder.
 // ═══════════════════════════════════════════════════════════════
 async function runStreakReminders() {
-  console.log('[mind] running evening streak reminders');
   try {
     const usersSnap = await db()
       .collection('wellness_users')
@@ -2407,11 +2335,11 @@ async function runStreakReminders() {
           });
         }
       } catch (uErr) {
-        console.error(`[mind] streak reminder failed for ${deviceId}:`, uErr.message);
+        log.error(`[mind] streak reminder failed for ${deviceId}:`, uErr.message);
       }
     }
   } catch (err) {
-    console.error('[mind] streak reminders error:', err);
+    log.error('[mind] streak reminders error:', err);
   }
 }
 
@@ -2420,31 +2348,36 @@ async function runStreakReminders() {
 // Morning: full proactive suite (mood drop, progress, topic)
 // Evening: streak-at-risk only (behaviour-triggered, highest value)
 // ═══════════════════════════════════════════════════════════════
-cron.schedule('0 10 * * *', () => { runProactiveChecks(); });
-cron.schedule('0 20 * * *', () => { runStreakReminders(); });
+if (shouldRunCron()) {
+  cron.schedule('0 10 * * *', withCron('mind:morning-proactive', async () => {
+    await runProactiveChecks();
+  }, { ttlMs: 20 * 60_000 }), { timezone: 'UTC' });
+  cron.schedule('0 20 * * *', withCron('mind:evening-streak', async () => {
+    await runStreakReminders();
+  }, { ttlMs: 20 * 60_000 }), { timezone: 'UTC' });
+}
 
-// Pre-warm /analysis/v2 cache for active users every night at 02:30.
+// Pre-warm /analysis cache for active users every night at 02:30.
 // Skips users with 0 check-ins. Best-effort, never blocks startup.
 async function preWarmAnalysisV2() {
-  try {
-    const usersSnap = await db().collection('wellness_users').limit(500).get();
-    let warmed = 0;
-    for (const u of usersSnap.docs) {
-      const id = u.id;
-      try {
-        const checkSnap = await mindDoc(id).collection('mind_checkins').limit(1).get();
-        if (checkSnap.empty) continue;
-        await mindAnalytics.loadAnalysisV2(id, 30, { openai });
-        warmed++;
-      } catch { /* per-user non-fatal */ }
-    }
-    console.log(`[mind] pre-warm: ${warmed}/${usersSnap.size} users analysis_v2 refreshed`);
-  } catch (err) {
-    console.error('[mind] pre-warm error:', err.message);
+  const usersSnap = await db().collection('wellness_users').limit(500).get();
+  let warmed = 0;
+  for (const u of usersSnap.docs) {
+    const id = u.id;
+    try {
+      const checkSnap = await mindDoc(id).collection('mind_checkins').limit(1).get();
+      if (checkSnap.empty) continue;
+      await mindAnalytics.loadAnalysisV2(id, 30, { openai });
+      warmed++;
+    } catch { /* per-user non-fatal */ }
   }
+  log.info(`[mind:pre-warm] warmed=${warmed}/${usersSnap.size}`);
 }
-cron.schedule('30 2 * * *', preWarmAnalysisV2);
+if (shouldRunCron()) {
+  cron.schedule('30 2 * * *', withCron('mind:pre-warm-v2', preWarmAnalysisV2, {
+    ttlMs: 20 * 60_000,
+  }), { timezone: 'UTC' });
+}
 
-console.log('[mind] agent loaded ✓ — proactive 10am · streak 8pm · analysis pre-warm 2:30am');
 
 module.exports = router;

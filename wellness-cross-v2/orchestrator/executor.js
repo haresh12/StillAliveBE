@@ -48,7 +48,7 @@ function buildExecutorInput({ pack, wellness, anomalies, top_correlations, plan_
   });
 }
 
-async function execute({ pack, wellness, anomalies, top_correlations, plan_slots }) {
+async function execute({ pack, wellness, anomalies, top_correlations, plan_slots, language }) {
   // Cold-start path — deterministic content (no LLM, faster, free).
   if (pack.summary.tier <= 1 || wellness.is_warm_start) {
     return {
@@ -64,10 +64,11 @@ async function execute({ pack, wellness, anomalies, top_correlations, plan_slots
       systemPrompt: EXECUTOR_SYSTEM,
       userPrompt,
       responseSchema: EXECUTOR_SCHEMA,
+      language,
     });
     return { content, source: 'llm', usage };
   } catch (err) {
-    console.error('[executor] LLM failed, deterministic fallback:', err && err.message);
+    log.error('[executor] LLM failed, deterministic fallback:', err && err.message);
     return { content: deterministicFallback(pack, wellness, anomalies, top_correlations), source: 'fallback' };
   }
 }

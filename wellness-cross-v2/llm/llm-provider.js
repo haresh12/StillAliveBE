@@ -9,6 +9,7 @@ const openai = require('./openai');
 const { withRetry } = require('./retry');
 const telemetry = require('./telemetry');
 const config = require('../config');
+const { appendLanguageInstruction, normalizeLanguage } = require('../../lib/i18n-prompt');
 
 const PROVIDERS = { gemini, openai };
 
@@ -20,6 +21,9 @@ const PROVIDERS = { gemini, openai };
  * @param {Object} [args.responseSchema] - JSON schema for structured output
  * @param {string} [args.cacheKey] - opaque cache key for the stable prefix
  * @param {string} [args.cachedContent] - the stable prefix to cache (Gemini only for now)
+ * @param {string} [args.language] - 'en'|'de'|'es'|'fr'|'pt'|'ru' (default 'en').
+ *                                   Directive APPENDED to systemPrompt so cached
+ *                                   English prefix stays bytewise identical.
  * @param {Function} [args.providerOverride] - test injection
  * @returns {Promise<{ content: any, usage: { input_tokens, output_tokens, cached_tokens, cost_usd, latency_ms } }>}
  */
@@ -29,11 +33,16 @@ async function callLLM(args) {
   const provider = args.providerOverride || PROVIDERS[cfg.provider];
   if (!provider) throw new Error(`Unknown provider: ${cfg.provider}`);
 
+  // Append language directive AFTER cachedContent (the stable prefix) so
+  // Gemini implicit/explicit caching still hits. For 'en' this is a no-op.
+  const language = normalizeLanguage(args.language);
+  const systemPrompt = appendLanguageInstruction(args.systemPrompt, language);
+
   const start = Date.now();
   const result = await withRetry(() =>
     provider.complete({
       model: cfg.model,
-      systemPrompt: args.systemPrompt,
+      systemPrompt,
       userPrompt: args.userPrompt,
       maxCompletionTokens: cfg.max_completion_tokens,
       timeoutMs: cfg.timeout_ms,
@@ -53,6 +62,7 @@ async function callLLM(args) {
     role: args.role,
     provider: cfg.provider,
     model: cfg.model,
+    language,
     ...usage,
   });
 

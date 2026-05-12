@@ -21,9 +21,19 @@ const crypto  = require('crypto');
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const db     = () => admin.firestore();
 
+// Gemini 2.5 Pro is the canonical vision model across the app (nutrition +
+// water + future flows). Same model + same decoding lock everywhere → re-shot
+// scenes return byte-identical JSON. The router exports VISION_MODEL_PRIMARY
+// so we never hard-code a model string at a call site.
 // Gemini 2.5 Pro is preferred for water-photo vision (deterministic, cheaper,
 // stays consistent across re-shoots of the same glass). OpenAI is the fallback.
-const { callGeminiVision, hashImages } = require('./lib/vision-router');
+const { callGeminiVision, hashImages, VISION_MODEL_PRIMARY } = require('./lib/vision-router');
+const { MODELS, openaiStrict } = require('./lib/model-router');
+const { resolveLanguage, appendLanguageInstruction } = require('./lib/i18n-prompt');
+const { withCron, shouldRunCron } = require('./lib/cron-helper');
+const { getUserNotifContext } = require('./lib/cron-user-context');
+const { resolveAnchor } = require('./lib/user-anchor');
+const { assertLoggableDate, sendLogGuardError } = require('./lib/log-guard');
 
 // Image-hash cache — same photo bytes ⇒ same response. Kills the "10 different
 // answers for the same glass" bug at the root. 30-min TTL, capped 200 entries.
@@ -45,6 +55,25 @@ function _photoCacheSet(key, data) {
 // ─── Context cache (5-min TTL, invalidated on write) ─────────
 const _ctxCache = new Map();
 const CTX_TTL   = 5 * 60 * 1000;
+
+// ─── Calibration cache (5-min TTL, invalidated on POST /calibration) ──
+// Personal calibration is read on EVERY photo log; the underlying Firestore
+// query (orderBy + limit) costs ~150ms each time. Calibration only changes
+// when the user explicitly corrects a log, so we can safely memoize for 5
+// minutes. Wired into _calCacheBust() which runs on calibration writes.
+const _calCache = new Map();
+const CAL_TTL   = 5 * 60 * 1000;
+function _calCacheGet(deviceId) {
+  const v = _calCache.get(deviceId);
+  if (!v) return null;
+  if (Date.now() - v.t > CAL_TTL) { _calCache.delete(deviceId); return null; }
+  return v.data;
+}
+function _calCacheSet(deviceId, data) {
+  _calCache.set(deviceId, { t: Date.now(), data });
+  if (_calCache.size > 500) _calCache.delete(_calCache.keys().next().value);
+}
+function _calCacheBust(deviceId) { _calCache.delete(deviceId); }
 
 // ─── Chat rate limiter (20 req / 60s per device) ─────────────
 const _rateMap = new Map();
@@ -929,7 +958,7 @@ async function generateAnalysisInsight(setup, stats, hydrationScore, crossAgentI
       formula: typeof json.formula === 'string' && json.formula.trim() ? json.formula.trim() : fallback.formula,
     };
   } catch (err) {
-    console.error('[water] generateAnalysisInsight:', err.message);
+    log.error('[water] generateAnalysisInsight:', err.message);
     return fallback;
   }
 }
@@ -1319,7 +1348,7 @@ async function buildWaterContext(deviceId) {
       activeActions,
     ].filter(Boolean).join('\n');
   } catch (e) {
-    console.error('[water] buildWaterContext:', e);
+    log.error('[water] buildWaterContext:', e);
     return 'Context unavailable.';
   }
 }
@@ -1367,7 +1396,7 @@ router.post('/setup', async (req, res) => {
 
     res.json({ ok: true, daily_goal_ml: goal, recommended_goal_ml: goal, manual_goal_ml: null, goal_source: 'recommended', setup });
   } catch (e) {
-    console.error('[water] POST /setup:', e);
+    log.error('[water] POST /setup:', e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -1396,7 +1425,7 @@ router.get('/setup-status', async (req, res) => {
       },
     });
   } catch (e) {
-    console.error('[water] GET /setup-status:', e);
+    log.error('[water] GET /setup-status:', e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -1454,7 +1483,7 @@ router.get('/chat-prompts', async (req, res) => {
 
     res.json({ prompts: pool.slice(0, 6) });
   } catch (err) {
-    console.error('[water] /chat-prompts error:', err);
+    log.error('[water] /chat-prompts error:', err);
     res.status(500).json({ error: 'Failed' });
   }
 });
@@ -1515,7 +1544,7 @@ router.post('/goal', async (req, res) => {
       setup: nextSetup,
     });
   } catch (e) {
-    console.error('[water] POST /goal:', e);
+    log.error('[water] POST /goal:', e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -1573,7 +1602,7 @@ async function refreshWaterScore(deviceId) {
       score_updated_at: admin.firestore.FieldValue.serverTimestamp(),
     });
   } catch (err) {
-    console.error('[water] refreshScore:', err.message);
+    log.error('[water] refreshScore:', err.message);
   }
 }
 
@@ -1590,7 +1619,10 @@ router.post('/log', async (req, res) => {
     const safeBev     = Object.prototype.hasOwnProperty.call(BEV_MULT, beverage_type) ? beverage_type : 'water';
     const multiplier  = BEV_MULT[safeBev];
     const effectiveMl = Math.round(parsedMl * multiplier);
-    const logDate     = (typeof date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(date)) ? date : dateStr();
+    const anchor = await resolveAnchor(deviceId);
+    let logDate;
+    try { logDate = assertLoggableDate(date, anchor); }
+    catch (e) { return sendLogGuardError(res, e); }
 
     const ref = await logsCol(deviceId).add({
       ml: parsedMl,
@@ -1605,7 +1637,7 @@ router.post('/log', async (req, res) => {
     refreshWaterScore(deviceId).catch(() => {});
     res.json({ ok: true, id: ref.id, effective_ml: effectiveMl });
   } catch (e) {
-    console.error('[water] POST /log:', e);
+    log.error('[water] POST /log:', e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -1794,54 +1826,60 @@ router.post('/log/from-photo', async (req, res) => {
     // Each {drink_type, container_type} pair has a learned ratio (user_ml /
     // ai_ml) from past corrections. Shrinks the range over time and applies
     // a multiplier so the AI's estimate auto-corrects in this user's direction.
-    let personalCalibration = null;
-    try {
-      const calSnap = await waterDoc(deviceId).collection('calibration')
-        .orderBy('updated_at', 'desc').limit(20).get();
-      if (!calSnap.empty) {
-        const map = {};
-        calSnap.docs.forEach(d => {
-          const x = d.data();
-          if (x.drink_type && x.container_type && Number.isFinite(x.ratio) && Number.isFinite(x.sample_count)) {
-            map[`${x.drink_type}|${x.container_type}`] = {
-              ratio: x.ratio,
-              n:     x.sample_count,
-            };
-          }
-        });
-        personalCalibration = map;
-      }
-    } catch { /* non-fatal */ }
+    // Cached in-memory for 5 minutes (busted on calibration writes) — the
+    // raw Firestore query costs ~150ms which is wasted on every photo log.
+    let personalCalibration = _calCacheGet(deviceId);
+    if (!personalCalibration) {
+      try {
+        const calSnap = await waterDoc(deviceId).collection('calibration')
+          .orderBy('updated_at', 'desc').limit(20).get();
+        if (!calSnap.empty) {
+          const map = {};
+          calSnap.docs.forEach(d => {
+            const x = d.data();
+            if (x.drink_type && x.container_type && Number.isFinite(x.ratio) && Number.isFinite(x.sample_count)) {
+              map[`${x.drink_type}|${x.container_type}`] = {
+                ratio: x.ratio,
+                n:     x.sample_count,
+              };
+            }
+          });
+          personalCalibration = map;
+        } else {
+          personalCalibration = {}; // empty map still cached → avoid re-querying
+        }
+        _calCacheSet(deviceId, personalCalibration);
+      } catch { /* non-fatal */ }
+    }
 
     const t0 = Date.now();
     let parsed = null;
-    // usedModel is set by exactly one of the paths below (Gemini success OR
-    // OpenAI fallback success). If both fail we return 502 before reading it.
+    // usedModel is set by whichever of the two paths below produced a
+    // parseable response. If both fail we return 502 before reading it.
     let usedModel = 'unknown';
 
-    // ── Path A: Gemini 2.5 Flash (preferred — 3-5× faster than Pro, plenty
-    // accurate for the simple "what drink, how full" task. Pro is overkill
-    // for water and was the main reason logs were taking 6-10s on slow
-    // networks). Deterministic config (temp 0) is preserved by the router.
-    parsed = await callGeminiVision({
-      systemPrompt,
-      userText: 'Analyze this drink photo. Work through the 7-step reasoning chain internally, then emit the JSON.',
-      images: [shot_b64],
-      responseSchema,
-      // 1200 tokens lets the model reason through scale anchor → geometry →
-      // capacity → fill → self-check before emitting JSON. 400 was forcing
-      // it to skip steps, which is why the same glass gave 200 vs 560.
-      maxOutputTokens: 1200,
-      model: 'gemini-2.5-flash',
-      label: 'water-log',
-    });
-    if (parsed) usedModel = 'gemini-2.5-flash';
-
-    // ── Path B: OpenAI fallback ──
-    if (!parsed) {
+    // ── Path A: GPT-4o (PRIMARY — accuracy winner per benchmarks) ──
+    // Same model + canonical pipeline as nutrition `_multiShotVision`. The
+    // 7-step reasoning chain in `systemPrompt` is preserved verbatim; what
+    // changes is which model executes it. GPT-4o's spatial reasoning +
+    // OCR fidelity edges Gemini 2.5 Pro on photo tasks per the food
+    // benchmarks (the volume task is structurally similar — scale anchor +
+    // geometry estimation).
+    //
+    // We use OpenAI's `json_schema` strict mode (shipped late 2024) which
+    // guarantees the response matches `responseSchema` at the API level —
+    // same shape-lock guarantee as Gemini's `responseSchema`. Together with
+    // the Gemini fallback, both paths are now schema-enforced.
+    try {
       const completion = await openai.chat.completions.create({
-        model: 'gpt-4.1-mini',
-        max_completion_tokens: 1200,
+        model: MODELS.cameraPrimary,
+        // OpenAI strict json_schema mode emits ONLY the JSON (no inline
+        // reasoning). Schema is ~10 fields including a `reasoning` string
+        // capped to 24 words by the prompt → worst case ~250 tokens. 600
+        // gives 2.4× headroom; 1200 was overweight and added ~400ms.
+        // Gemini fallback below stays at 1200 because Gemini DOES inline
+        // reasoning before the JSON (different decoding behavior).
+        max_completion_tokens: 600,
         messages: [
           { role: 'system', content: systemPrompt },
           {
@@ -1852,15 +1890,44 @@ router.post('/log/from-photo', async (req, res) => {
             ],
           },
         ],
-        response_format: { type: 'json_object' },
+        response_format: {
+          type: 'json_schema',
+          json_schema: { name: 'water_drink_log', strict: true, schema: openaiStrict(responseSchema) },
+        },
       });
-      const raw = completion.choices?.[0]?.message?.content?.trim() || '{}';
-      try { parsed = JSON.parse(raw); }
-      catch {
-        console.error('[water] /log/from-photo parse fail:', raw.slice(0, 200));
-        return res.status(502).json({ error: 'AI response unparseable, try again' });
+      const raw = completion.choices?.[0]?.message?.content?.trim() || '';
+      try {
+        parsed = JSON.parse(raw);
+        usedModel = MODELS.cameraPrimary;
+      } catch {
+        log.warn('[water] /log/from-photo OpenAI parse fail (will try Gemini):', raw.slice(0, 200));
       }
-      usedModel = 'gpt-4.1-mini';
+    } catch (err) {
+      log.warn('[water] /log/from-photo OpenAI primary failed (will try Gemini):', err?.message);
+    }
+
+    // ── Path B: Gemini 2.5 Pro fallback (schema-enforced, deterministic) ──
+    // Same systemPrompt + responseSchema. The SDK enforces the shape so
+    // even if the model is uncertain, we get a valid JSON object back.
+    // This is the safety net when OpenAI either threw or returned non-JSON.
+    if (!parsed) {
+      parsed = await callGeminiVision({
+        systemPrompt,
+        userText: 'Analyze this drink photo. Work through the 7-step reasoning chain internally, then emit the JSON.',
+        images: [shot_b64],
+        responseSchema,
+        // 1200 tokens lets the model reason through scale anchor → geometry →
+        // capacity → fill → self-check before emitting JSON.
+        maxOutputTokens: 1200,
+        model: VISION_MODEL_PRIMARY,
+        label: 'water-log-fallback',
+      });
+      if (parsed) usedModel = VISION_MODEL_PRIMARY;
+    }
+
+    if (!parsed) {
+      log.error('[water] /log/from-photo: both OpenAI primary and Gemini fallback failed');
+      return res.status(502).json({ error: 'AI response unparseable, try again' });
     }
     const latency_ms = Date.now() - t0;
 
@@ -2004,7 +2071,7 @@ router.post('/log/from-photo', async (req, res) => {
 
     return res.json({ ...result, cached: false });
   } catch (e) {
-    console.error('[water] POST /log/from-photo:', e);
+    log.error('[water] POST /log/from-photo:', e);
     res.status(500).json({ error: e.message || 'vision call failed' });
   }
 });
@@ -2054,7 +2121,7 @@ router.get('/today', async (req, res) => {
       streak,
     });
   } catch (e) {
-    console.error('[water] GET /today:', e);
+    log.error('[water] GET /today:', e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -2071,7 +2138,7 @@ router.delete('/log/:id', async (req, res) => {
 
     res.json({ ok: true });
   } catch (e) {
-    console.error('[water] DELETE /log:', e);
+    log.error('[water] DELETE /log:', e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -2103,7 +2170,7 @@ router.get('/containers', async (req, res) => {
     });
     res.json({ containers });
   } catch (e) {
-    console.error('[water] GET /containers:', e);
+    log.error('[water] GET /containers:', e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -2130,7 +2197,7 @@ router.post('/containers', async (req, res) => {
     });
     res.json({ ok: true, id: ref.id });
   } catch (e) {
-    console.error('[water] POST /containers:', e);
+    log.error('[water] POST /containers:', e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -2146,7 +2213,7 @@ router.post('/containers/:id/use', async (req, res) => {
     });
     res.json({ ok: true });
   } catch (e) {
-    console.error('[water] POST /containers/:id/use:', e);
+    log.error('[water] POST /containers/:id/use:', e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -2158,7 +2225,7 @@ router.delete('/containers/:id', async (req, res) => {
     await containersCol(deviceId).doc(req.params.id).delete();
     res.json({ ok: true });
   } catch (e) {
-    console.error('[water] DELETE /containers/:id:', e);
+    log.error('[water] DELETE /containers/:id:', e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -2206,9 +2273,12 @@ router.post('/calibration', async (req, res) => {
         updated_at:   admin.firestore.FieldValue.serverTimestamp(),
       }, { merge: true });
     });
+    // Bust the in-memory calibration cache so the next /log/from-photo
+    // call picks up the new ratio immediately (instead of waiting up to 5min).
+    _calCacheBust(deviceId);
     res.json({ ok: true });
   } catch (e) {
-    console.error('[water] POST /calibration:', e);
+    log.error('[water] POST /calibration:', e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -2246,221 +2316,19 @@ router.get('/logs', async (req, res) => {
       goal_source: goalState.goalSource,
     });
   } catch (e) {
-    console.error('[water] GET /logs:', e);
+    log.error('[water] GET /logs:', e);
     res.status(500).json({ error: e.message });
   }
 });
 
-// ─── GET /analysis ────────────────────────────────────────────
-router.get('/analysis', async (req, res) => {
-  try {
-    const { deviceId, range = '30' } = req.query;
-    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
-
-    const rangeDays = range === 'all' ? 365 : Math.min(parseInt(range, 10) || 30, 365);
-    const fetchLimit = Math.min(rangeDays * 14, 2000);
-
-    const [wSnap, logsSnap] = await Promise.all([
-      waterDoc(deviceId).get(),
-      logsCol(deviceId).orderBy('logged_at', 'desc').limit(fetchLimit).get(),
-    ]);
-
-    if (!wSnap.exists) return res.json({ stage: 0, stats: null });
-
-    const waterData = wSnap.data() || {};
-    const setup     = waterData.setup || {};
-    const goalState = getGoalState(setup);
-    const goalHistory = getGoalHistory(setup, waterData.setup_completed_at);
-    const goalForDate = (ds) => resolveGoalForDate(goalHistory, ds, goalState.goalMl);
-    const goalMl    = goalForDate(dateStr());
-    const logs      = logsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-    const { byDate, beverageTotals } = aggregateLogs(setup, logs);
-
-    const rangeKeys     = buildDateRangeKeys(rangeDays);
-    const goalByDate    = buildGoalMap(rangeKeys, goalHistory, goalMl);
-    const recent7Keys   = buildDateRangeKeys(7);
-    const recentGoalByDate = buildGoalMap(recent7Keys, goalHistory, goalMl);
-    const goalHistorySummary = buildGoalHistorySummary(goalHistory, rangeKeys, goalMl);
-    const daysLogged    = rangeKeys.filter(key => (byDate[key]?.log_count || 0) > 0).length;
-    const streak        = computeCurrentStreak(byDate, goalForDate);
-    const longestStreak = computeLongestStreak(byDate, goalForDate);
-    const avg7d         = Math.round(avg(recent7Keys.map(key => byDate[key]?.effective_ml || 0)));
-    const bestDay       = Math.max(0, ...rangeKeys.map(key => byDate[key]?.effective_ml || 0));
-    const goalDays      = rangeKeys.filter(key => (byDate[key]?.effective_ml || 0) >= (goalByDate[key] || goalMl)).length;
-    const avgLoggedDay  = Math.round(avg(rangeKeys.filter(key => byDate[key]?.log_count > 0).map(key => byDate[key].effective_ml)));
-    const frontloadDays = recent7Keys.filter(key => (byDate[key]?.parts?.morning || 0) >= Math.max(300, (recentGoalByDate[key] || goalMl) * 0.22)).length;
-    const lateCutoffDays = recent7Keys.filter(key => (byDate[key]?.late_ml || 0) > 250).length;
-    const hydrationScore = computeHydrationScore(byDate, recentGoalByDate);
-    const stage          = determineStage(daysLogged);
-    const dayParts       = buildDayPartBreakdown(byDate, rangeKeys, goalByDate);
-    const beverageMix    = buildBeverageMix(beverageTotals);
-    const observations   = buildObservations({
-      goalMl,
-      avg7d,
-      streak,
-      longestStreak,
-      recentKeys: recent7Keys,
-      byDate,
-      goalByDate: recentGoalByDate,
-      hydrationScore,
-      goalHistorySummary,
-    });
-
-    const heatmap = buildDateRangeKeys(28).map(key => ({
-      date: key,
-      ml: byDate[key]?.effective_ml || 0,
-      goal_ml: resolveGoalForDate(goalHistory, key, goalMl),
-      pct: clamp((byDate[key]?.effective_ml || 0) / Math.max(resolveGoalForDate(goalHistory, key, goalMl), 1), 0, 1),
-      logged: !!byDate[key]?.log_count,
-    }));
-
-    const chart = rangeKeys.map((key, index) => {
-      const d = new Date(`${key}T12:00:00`);
-      const label = `${d.getDate()} ${['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][d.getMonth()]}`;
-      const dayGoalMl = goalByDate[key] || goalMl;
-      const previousHistoryGoalMl = goalHistory
-        .filter(entry => entry.effective_from < key)
-        .slice(-1)[0]?.goal_ml;
-      const previousGoalMl = index > 0
-        ? (goalByDate[rangeKeys[index - 1]] || goalMl)
-        : (previousHistoryGoalMl || dayGoalMl);
-      return {
-        date: key,
-        ml: byDate[key]?.effective_ml || 0,
-        goal_ml: dayGoalMl,
-        hit_goal: (byDate[key]?.effective_ml || 0) >= dayGoalMl,
-        goal_changed: index > 0 && previousGoalMl !== dayGoalMl,
-        label,
-      };
-    });
-
-    const crossAgent = await buildCrossAgentInsights(deviceId, byDate, goalMl, goalByDate, rangeKeys, streak);
-
-    // Hourly breakdown for 1D range (Sawka 2007 optimal window markers)
-    let hourlyChart = null;
-    if (range === '1') {
-      const todayKey = dateStr();
-      const todayLogs = logs.filter(l => {
-        const ms = getMillis(l.logged_at);
-        return ms && new Date(ms).toISOString().slice(0, 10) === todayKey;
-      });
-      hourlyChart = Array.from({ length: 24 }, (_, h) => {
-        const hLogs = todayLogs.filter(l => new Date(getMillis(l.logged_at)).getHours() === h);
-        const ml = Math.round(hLogs.reduce((s, l) => s + (l.effective_ml || l.ml || 0), 0));
-        const label = h === 0 ? '12am' : h < 12 ? `${h}am` : h === 12 ? '12pm' : `${h - 12}pm`;
-        const window = (h >= 6 && h < 10) ? 'front_load' :
-                       (h >= 10 && h < 18) ? 'active' :
-                       (h >= 18 && h < 20) ? 'taper' : 'other';
-        return { hour: h, ml, label, window };
-      });
-    }
-
-    const patternInsights = buildPatternInsights({ byDate, rangeKeys, goalByDate, goalMl });
-
-    let aiInsight = null;
-    let personalFormula = null;
-
-    if ((range === '7' || range === '30' || range === 'all') && daysLogged >= 3) {
-      const latestGoalChangeKey = goalHistorySummary.latest_change
-        ? `${goalHistorySummary.latest_change.effective_from}_${goalHistorySummary.latest_change.to_goal_ml}`
-        : 'steady';
-      const cacheKey = `${range}_${daysLogged}_${avg7d}_${streak}_${lateCutoffDays}_${latestGoalChangeKey}`;
-      const cached = waterData.analysis_cache;
-
-      if (cached && cached.key === cacheKey) {
-        aiInsight       = cached.insight || null;
-        personalFormula = cached.formula || null;
-      } else {
-        const generated = await generateAnalysisInsight(
-          setup,
-          {
-            goal_ml: goalMl,
-            avg_goal_ml: goalHistorySummary.avg_goal_ml,
-            avg_7d: avg7d,
-            best_day: bestDay,
-            days_logged: daysLogged,
-            goal_days: goalDays,
-            streak,
-            longest_streak: longestStreak,
-            frontload_days: frontloadDays,
-            late_cutoff_days: lateCutoffDays,
-            goal_changes: goalHistorySummary.changes.map(change =>
-              `${change.effective_from}: ${change.from_goal_ml} -> ${change.to_goal_ml}`
-            ).join(', ') || 'none',
-          },
-          hydrationScore,
-          crossAgent,
-          dayParts,
-          beverageMix
-        );
-
-        aiInsight       = generated.insight;
-        personalFormula = generated.formula;
-
-        await waterDoc(deviceId).set({
-          analysis_cache: {
-            key: cacheKey,
-            insight: aiInsight,
-            formula: personalFormula,
-            generated_at: new Date().toISOString(),
-          },
-        }, { merge: true });
-      }
-    }
-
-    res.json({
-      stage,
-      goal_ml: goalMl,
-      recommended_goal_ml: goalState.recommendedGoalMl,
-      manual_goal_ml: goalState.manualGoalMl,
-      goal_source: goalState.goalSource,
-      goal_history: goalHistory,
-      goal_changes: goalHistorySummary.changes,
-      stats: {
-        days_logged: daysLogged,
-        avg_7d: avg7d,
-        avg_goal_ml: goalHistorySummary.avg_goal_ml,
-        avg_logged_day: avgLoggedDay || 0,
-        best_day: bestDay,
-        streak,
-        longest_streak: longestStreak,
-        goal_days: goalDays,
-        consistency_pct: Math.round((goalDays / Math.max(rangeKeys.length, 1)) * 100),
-        frontload_days: frontloadDays,
-        late_cutoff_days: lateCutoffDays,
-      },
-      hydration_score: hydrationScore,
-      clinical_flag: hydrationScore?.clinical_flag || null,
-      day_parts: dayParts,
-      beverage_mix: beverageMix,
-      observations,
-      pattern_insights: patternInsights,
-      ai_insight: aiInsight,
-      personal_formula: personalFormula,
-      heatmap,
-      chart: hourlyChart || chart,
-      chart_type: hourlyChart ? 'hourly' : 'daily',
-      setup: {
-        ...setup,
-        daily_goal_ml: goalMl,
-        recommended_goal_ml: goalState.recommendedGoalMl,
-        manual_goal_ml: goalState.manualGoalMl,
-        goal_source: goalState.goalSource,
-      },
-    });
-  } catch (e) {
-    console.error('[water] GET /analysis:', e);
-    res.status(500).json({ error: e.message });
-  }
-});
 
 // ════════════════════════════════════════════════════════════════
-// GET /analysis/v2 — V4 Insights tab payload
-// Mirrors /api/fasting/analysis/v2 + /api/nutrition/analysis/v2 contract.
+// GET /analysis — V4 Insights tab payload
+// Mirrors /api/fasting/analysis + /api/nutrition/analysis contract.
 // ════════════════════════════════════════════════════════════════
 const _waterAnalytics = require('./lib/water-analytics');
 
-router.get('/analysis/v2', async (req, res) => {
+router.get('/analysis', async (req, res) => {
   try {
     const { deviceId, range = '30' } = req.query;
     if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
@@ -2472,12 +2340,19 @@ router.get('/analysis/v2', async (req, res) => {
     const data  = wSnap.data() || {};
     const target_ml = data.daily_goal_ml || data.setup?.daily_goal_ml || 2500;
 
-    // Window
-    const days   = Math.max(1, Math.min(365, parseInt(range, 10) || 30));
-    const cutoff = Date.now() - days * 24 * 3600 * 1000;
+    // Registration Anchor: clamp window to signup date in user's local TZ.
+    const nowMs = Date.now();
+    const anchor = await resolveAnchor(deviceId);
+    const { computeAnalysisWindow } = require('./lib/range-helpers');
+    const win = computeAnalysisWindow(range, anchor.anchorMs, nowMs, anchor.utcOffsetMinutes);
+    const days = win.effectiveDays;
+    const cutoff = win.cutoffMs;
+    const effectiveStartDate = win.effectiveStartDate;
     const fetchLimit = Math.min(days * 25, 3000);
 
     const logsSnap = await logsCol(deviceId).orderBy('logged_at', 'desc').limit(fetchLimit).get();
+    const { dateStr: _dsLocalLogs } = require('./lib/range-helpers');
+    const _tzOffsetLogs = anchor.utcOffsetMinutes || 0;
     const allLogs  = logsSnap.docs.map(d => {
       const x = d.data();
       const ms = x.logged_at?.toMillis ? x.logged_at.toMillis() : new Date(x.logged_at || 0).getTime();
@@ -2486,7 +2361,7 @@ router.get('/analysis/v2', async (req, res) => {
         ml:          x.ml || 0,
         drink_type:  x.drink_type || 'water',
         logged_at:   ms ? new Date(ms).toISOString() : null,
-        date:        x.date || (ms ? new Date(ms).toISOString().slice(0,10) : null),
+        date:        x.date || (ms ? _dsLocalLogs(new Date(ms), _tzOffsetLogs) : null),
       };
     }).filter(l => l.logged_at && new Date(l.logged_at).getTime() >= cutoff);
 
@@ -2504,7 +2379,9 @@ router.get('/analysis/v2', async (req, res) => {
     };
     Object.values(score_gates).forEach(g => { g.pts = Math.round(g.pts); });
 
-    // Signal points (one per day in range)
+    // Signal points (one per day in range) — local-TZ keys, chart_tz_clamp law
+    const { dateStr: _dsTz } = require('./lib/range-helpers');
+    const _tzOffset = anchor.utcOffsetMinutes || 0;
     const byDate = {};
     for (const l of allLogs) {
       if (!l.date) continue;
@@ -2514,7 +2391,7 @@ router.get('/analysis/v2', async (req, res) => {
     const dayKeys = [];
     for (let i = days - 1; i >= 0; i--) {
       const d = new Date(); d.setDate(d.getDate() - i);
-      dayKeys.push(d.toISOString().slice(0,10));
+      dayKeys.push(_dsTz(d, _tzOffset));
     }
     const signal_points = dayKeys.map(k => ({
       value:     Math.round(byDate[k]?.ml || 0),
@@ -2526,17 +2403,23 @@ router.get('/analysis/v2', async (req, res) => {
     // Drink breakdown
     const drink_breakdown = _waterAnalytics.computeDrinkBreakdown(allLogs);
 
-    // Daily curve (today)
-    const todayKey   = new Date().toISOString().slice(0,10);
+    // Daily curve (today) — local-TZ key, chart_tz_clamp law
+    const todayKey   = _dsTz(new Date(), _tzOffset);
     const daily_curve = _waterAnalytics.computeDailyCurve({
       logs: allLogs, target_ml, dateKey: todayKey,
     });
 
-    // 28-day daily logs heatmap
+    // 28-day daily logs heatmap — Registration Anchor Law:
+    // never iterate past anchor, never use UTC date keys.
     const daily_logs = {};
-    for (let i = 27; i >= 0; i--) {
-      const d = new Date(); d.setDate(d.getDate() - i);
-      const k = d.toISOString().slice(0,10);
+    const { enumerateDaysFrom, dateStr: _dsLocal } = require('./lib/range-helpers');
+    const _todayKey = _dsLocal(new Date(), anchor.utcOffsetMinutes);
+    const _heatStart = (() => {
+      const dt = new Date(); dt.setDate(dt.getDate() - 27);
+      const candidate = _dsLocal(dt, anchor.utcOffsetMinutes);
+      return anchor.anchorDateStr && candidate < anchor.anchorDateStr ? anchor.anchorDateStr : candidate;
+    })();
+    for (const k of enumerateDaysFrom(_heatStart, _todayKey)) {
       const v = byDate[k]?.ml || 0;
       if (v > 0) {
         daily_logs[k] = {
@@ -2632,9 +2515,51 @@ router.get('/analysis/v2', async (req, res) => {
       };
     }
 
+    // Lifetime fetch: per-day quality = clamped(ml / target × 100) since anchor.
+    const lifetimeQualityByDate = await (async () => {
+      const out = {};
+      if (!anchor.anchorMs) return out;
+      try {
+        const snap = await logsCol(deviceId)
+          .orderBy('logged_at', 'desc')
+          .limit(Math.min(win.daysSinceAnchor * 25, 5000))
+          .get();
+        const sums = {};
+        for (const d of snap.docs) {
+          const x = d.data();
+          const ds = x.date;
+          if (!ds || typeof ds !== 'string') continue;
+          if (anchor.anchorDateStr && ds < anchor.anchorDateStr) continue;
+          sums[ds] = (sums[ds] || 0) + Number(x.effective_ml || x.ml || 0);
+        }
+        for (const [ds, ml] of Object.entries(sums)) {
+          if (ml > 0) {
+            out[ds] = Math.max(0, Math.min(100, Math.round((ml / target_ml) * 100)));
+          }
+        }
+      } catch { /* fall back to empty */ }
+      return out;
+    })();
+    const { computeStandardOutputs } = require('./lib/score-lifetime');
+    const std = computeStandardOutputs({
+      qualityByDate: lifetimeQualityByDate,
+      todayDate: win.todayDate,
+      anchorDate: anchor.anchorDateStr,
+      daysSinceAnchor: win.daysSinceAnchor,
+    });
+
     return res.json({
       setup_completed: true,
       range,
+      effective_start_date: effectiveStartDate,
+      effective_days: days,
+      days_since_anchor: win.daysSinceAnchor,
+      anchor_date: anchor.anchorDateStr,
+      is_clamped: win.isClamped,
+      score_today: std.score_today,
+      score_7d_smoothed: std.score_7d_smoothed,
+      score_lifetime: std.score_lifetime,
+      missed_days: std.missed_days,
       score,
       score_grade: grade,
       score_gates,
@@ -2660,17 +2585,17 @@ router.get('/analysis/v2', async (req, res) => {
       target_ml,
     });
   } catch (e) {
-    console.error('[water] /analysis/v2:', e);
+    log.error('[water] /analysis:', e);
     return res.status(500).json({ error: 'Failed' });
   }
 });
 
 // ════════════════════════════════════════════════════════════════
-// GET /actions/v2 — Actions tab payload
-// Mirrors /api/fasting/actions/v2 contract.
+// GET /actions — Actions tab payload
+// Mirrors /api/fasting/actions contract.
 // Cadence: "Coach reviews every 3 days" (water is daily-tempo).
 // ════════════════════════════════════════════════════════════════
-router.get('/actions/v2', async (req, res) => {
+router.get('/actions', async (req, res) => {
   try {
     const { deviceId } = req.query;
     if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
@@ -2768,119 +2693,11 @@ router.get('/actions/v2', async (req, res) => {
 
     return res.json({ cadence, prescription: null, actions, history, stats });
   } catch (e) {
-    console.error('[water] /actions/v2:', e);
+    log.error('[water] /actions:', e);
     return res.status(500).json({ error: 'Failed' });
   }
 });
 
-// ─── GET /actions ─────────────────────────────────────────────
-router.get('/_legacy/actions', async (req, res) => {
-  try {
-    const { deviceId } = req.query;
-    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
-
-    await ensureTodayActions(deviceId);
-
-    const [activeSnap, recentSnap, waterSnap] = await Promise.all([
-      actionsCol(deviceId).where('status', '==', 'active').get(),
-      actionsCol(deviceId).orderBy('generated_at', 'desc').limit(20).get(),
-      waterDoc(deviceId).get(),
-    ]);
-
-    const waterData = waterSnap.data() || {};
-    const setup     = waterData.setup || {};
-    const goalState = getGoalState(setup);
-    const goalMl    = goalState.goalMl;
-    const wake      = setup.wake_time_min ?? 420;
-    const bed       = setup.bed_time_min ?? 1380;
-    const schedule  = buildSchedule(wake, bed, goalMl);
-
-    const format = (action) => ({
-      ...action,
-      generated_at: toIso(action.generated_at),
-      completed_at: toIso(action.completed_at),
-    });
-
-    const active = sortByTimestampField(activeSnap.docs.map(mapDoc), 'generated_at', 'asc').map(format);
-    const currentGenIndex = active.length > 0
-      ? Math.max(...active.map(a => a.gen_index || 0))
-      : (waterData.last_action_gen_index || 0);
-
-    const recent = recentSnap.docs.map(mapDoc).map(format);
-    const completed = recent.filter(a =>
-      ['done', 'skipped'].includes(a.status) && (a.gen_index || 0) === currentGenIndex
-    );
-
-    const prevGenIndex = currentGenIndex > 0
-      ? Math.max(0, ...recent
-          .filter(a => a.status === 'past')
-          .map(a => a.gen_index || 0))
-      : 0;
-
-    const past = prevGenIndex > 0
-      ? recent.filter(a => a.status === 'past' && (a.gen_index || 0) === prevGenIndex)
-      : [];
-
-    res.json({
-      active,
-      completed,
-      past,
-      schedule,
-      goal_ml: goalMl,
-      recommended_goal_ml: goalState.recommendedGoalMl,
-      manual_goal_ml: goalState.manualGoalMl,
-      goal_source: goalState.goalSource,
-    });
-  } catch (e) {
-    console.error('[water] GET /actions:', e);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ─── POST /action/:id/complete ───────────────────────────────
-router.post('/_legacy/action/:id/complete', async (req, res) => {
-  try {
-    const { deviceId } = req.body;
-    const { id } = req.params;
-    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
-
-    await actionsCol(deviceId).doc(id).update({
-      status: 'done',
-      completed_at: admin.firestore.FieldValue.serverTimestamp(),
-    });
-
-    res.json({ success: true });
-  } catch (e) {
-    console.error('[water] complete action error:', e);
-    res.status(500).json({ error: 'Failed' });
-  }
-});
-
-// ─── POST /action/:id/skip ───────────────────────────────────
-router.post('/_legacy/action/:id/skip', async (req, res) => {
-  try {
-    const { deviceId } = req.body;
-    const { id } = req.params;
-    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
-
-    const actionSnap = await actionsCol(deviceId).doc(id).get();
-    const actionText = actionSnap.exists ? actionSnap.data().text : null;
-
-    await actionsCol(deviceId).doc(id).update({ status: 'skipped' });
-
-    if (actionText) {
-      const snap     = await waterDoc(deviceId).get();
-      const existing = snap.data()?.skip_history || [];
-      const updated  = [...existing, actionText].slice(-20);
-      await waterDoc(deviceId).set({ skip_history: updated }, { merge: true });
-    }
-
-    res.json({ success: true });
-  } catch (e) {
-    console.error('[water] skip action error:', e);
-    res.status(500).json({ error: 'Failed' });
-  }
-});
 
 // ─── POST /chat ───────────────────────────────────────────────
 router.post('/chat', async (req, res) => {
@@ -2890,6 +2707,8 @@ router.post('/chat', async (req, res) => {
     if (!checkChatRate(deviceId)) return res.status(429).json({ error: 'Too many messages. Wait a moment.' });
     const safeMessage = String(message).trim().slice(0, 600);
     if (!safeMessage) return res.status(400).json({ error: 'message required' });
+
+    const language = resolveLanguage(req);
 
     const context  = await getCachedContext(deviceId);
     const histSnap = await chatsCol(deviceId)
@@ -2916,7 +2735,7 @@ router.post('/chat', async (req, res) => {
       streak_milestone:'User just hit a streak milestone. Acknowledge in one sentence — no more. Then redirect to the next move.',
     };
 
-    const systemPrompt = [
+    const systemPrompt = appendLanguageInstruction([
       'You are the Water Coach inside Pulse — a precision wellness app.',
       'You coach behavior change using the user\'s actual numbers. You know IOM weight-based goals, beverage hydration multipliers, cortisol-window front-loading, taper timing, pace-gap math, sweat-rate recovery, and cross-agent links with sleep and mood.',
       '',
@@ -2936,7 +2755,7 @@ router.post('/chat', async (req, res) => {
       'USER DATA:',
       context,
       proactive_context ? `\nTHREAD: ${threadNotes[proactive_context] || `User is replying to a proactive message (type: ${proactive_context}).`}` : '',
-    ].filter(Boolean).join('\n');
+    ].filter(Boolean).join('\n'), language);
 
     const completion = await openai.chat.completions.create({
       model: 'gpt-4.1-mini',
@@ -2954,13 +2773,13 @@ router.post('/chat', async (req, res) => {
       user_message: safeMessage,
       ai_response: reply,
       is_proactive: false,
-      is_read: true,
+      is_read: true, language,
       created_at: admin.firestore.FieldValue.serverTimestamp(),
     });
 
     res.json({ reply, message_id: ref.id });
   } catch (e) {
-    console.error('[water] POST /chat:', e);
+    log.error('[water] POST /chat:', e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -3060,7 +2879,7 @@ router.get('/chat/messages', async (req, res) => {
 
     res.json({ messages, has_more: hasMore, oldest_id: docs[0]?.id || null });
   } catch (e) {
-    console.error('[water] GET /chat/messages:', e);
+    log.error('[water] GET /chat/messages:', e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -3091,7 +2910,7 @@ router.get('/chat/unread', async (req, res) => {
 
     res.json({ messages });
   } catch (e) {
-    console.error('[water] GET /chat/unread:', e);
+    log.error('[water] GET /chat/unread:', e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -3113,7 +2932,7 @@ router.post('/chat/read', async (req, res) => {
 
     res.json({ ok: true, marked: snap.docs.length });
   } catch (e) {
-    console.error('[water] POST /chat/read:', e);
+    log.error('[water] POST /chat/read:', e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -3135,13 +2954,7 @@ function dateStrLocal(localNow) {
   return `${y}-${mo}-${dd}`;
 }
 
-cron.schedule('0 * * * *', async () => {
-  try {
-    const serverNow = new Date();
-    const serverHour = serverNow.getHours();
-    // Quick pre-filter: skip if server is way outside any reasonable window
-    if (serverHour < 0 || serverHour > 23) return;
-
+const _waterCronTick = async () => {
     const usersSnap = await db().collection('wellness_users').get();
 
     for (const user of usersSnap.docs) {
@@ -3151,9 +2964,16 @@ cron.schedule('0 * * * *', async () => {
         const waterSnap = await waterDoc(deviceId).get();
         if (!waterSnap.exists || !waterSnap.data()?.setup_completed) continue;
 
+        // notif_enabled + DND gate (cron-user-context reads aliveChecks profile)
+        const notifCtx = await getUserNotifContext(db(), deviceId);
+        if (!notifCtx.allowsProactive) continue;
+
         const waterData  = waterSnap.data() || {};
-        // Use stored UTC offset for accurate local-time gating
-        const localNow   = getUserLocalNow(waterData.utc_offset_minutes ?? null);
+        // Prefer profile.utc_offset_minutes (canonical) but fall back to
+        // water-doc's older copy for back-compat with users who haven't
+        // re-opened the app since the unified profile field rolled out.
+        const offsetMin = notifCtx.utcOffsetMinutes ?? waterData.utc_offset_minutes ?? null;
+        const localNow   = getUserLocalNow(offsetMin);
         const hour       = localNow.getUTCHours();
         if (hour < 8 || hour > 21) continue;
 
@@ -3255,14 +3075,16 @@ cron.schedule('0 * * * *', async () => {
         updates.proactive_count_today = storedCount + 1;
         await waterDoc(deviceId).set(updates, { merge: true });
       } catch (uErr) {
-        console.error(`[water] proactive failed for ${deviceId}:`, uErr.message);
+        log.error(`[water] proactive failed for ${deviceId}:`, uErr.message);
       }
     }
-  } catch (e) {
-    console.error('[water] proactive cron:', e);
-  }
-});
+};
 
-console.log('[water] agent loaded ✓ — richer analysis, actions, chat, and proactive logic active');
+if (shouldRunCron()) {
+  cron.schedule('0 * * * *', withCron('water:hourly-proactives', _waterCronTick, {
+    ttlMs: 25 * 60_000,
+  }), { timezone: 'UTC' });
+}
+
 
 module.exports = router;

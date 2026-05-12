@@ -239,7 +239,7 @@ router.get('/groups', async (req, res) => {
       rulesStatus: await getUserRules(deviceId),
     });
   } catch (err) {
-    console.error('[community] /groups error:', err);
+    log.error('[community] /groups error:', err);
     res.status(500).json({ error: 'Could not load community groups' });
   }
 });
@@ -255,7 +255,7 @@ router.get('/rules-status', async (req, res) => {
       rules: RULES,
     });
   } catch (err) {
-    console.error('[community] /rules-status error:', err);
+    log.error('[community] /rules-status error:', err);
     res.status(500).json({ error: 'Could not load rules status' });
   }
 });
@@ -276,7 +276,7 @@ router.post('/rules/accept', async (req, res) => {
 
     res.json({ success: true, communityAccess, rulesStatus: { accepted: true } });
   } catch (err) {
-    console.error('[community] /rules/accept error:', err);
+    log.error('[community] /rules/accept error:', err);
     res.status(500).json({ error: 'Could not accept rules' });
   }
 });
@@ -301,7 +301,7 @@ router.get('/groups/:groupId/messages', async (req, res) => {
     const messages = snap.docs.map(mapMessage).reverse();
     res.json({ success: true, communityAccess, messages });
   } catch (err) {
-    console.error('[community] /messages error:', err);
+    log.error('[community] /messages error:', err);
     res.status(500).json({ error: 'Could not load messages' });
   }
 });
@@ -368,7 +368,7 @@ router.post('/groups/:groupId/messages', async (req, res) => {
     const created = await messageRef.get();
     res.json({ success: true, communityAccess, message: mapMessage(created) });
   } catch (err) {
-    console.error('[community] /send message error:', err);
+    log.error('[community] /send message error:', err);
     res.status(500).json({ error: 'Could not send message' });
   }
 });

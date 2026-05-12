@@ -49,6 +49,22 @@ function buildContextPack({ snapshots, userData, todayDate }) {
     return Math.max(0, Math.floor((Date.now() - ms) / (24 * 60 * 60 * 1000)));
   })();
 
+  // Registration Anchor (2026-05-13): local-TZ-midnight of signup.
+  // Used by Home headline + Insights depth ribbon + per-agent clamps.
+  const anchor = (() => {
+    const created = userData.created_at;
+    if (!created) return { anchor_date: null, days_since_anchor: null };
+    const ms = created._seconds ? created._seconds * 1000 : new Date(created).getTime();
+    if (!ms) return { anchor_date: null, days_since_anchor: null };
+    const off = Number.isFinite(userData?.profile?.utc_offset_minutes)
+      ? userData.profile.utc_offset_minutes : 0;
+    const shifted = new Date(ms + off * 60_000);
+    const y = shifted.getUTCFullYear();
+    const m = String(shifted.getUTCMonth() + 1).padStart(2, '0');
+    const d = String(shifted.getUTCDate()).padStart(2, '0');
+    return { anchor_date: `${y}-${m}-${d}`, days_since_anchor: days_active + 1 };
+  })();
+
   const total_days_logged = matrix.filter((d) =>
     AGENTS.some((a) => d.has_log[a]),
   ).length;
@@ -61,6 +77,8 @@ function buildContextPack({ snapshots, userData, todayDate }) {
     setup_state,
     cold_start_anchor: userData.cold_start_anchor || 'none',
     onboarding_answers: userData.onboarding_answers || {},
+    anchor_date: anchor.anchor_date,
+    days_since_anchor: anchor.days_since_anchor,
   };
 
   const stable_30d = matrix.slice(0, Math.max(0, matrix.length - 7)); // first 23 days

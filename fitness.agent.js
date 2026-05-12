@@ -19,6 +19,11 @@ const { OpenAI } = require("openai");
 const cron = require("node-cron");
 const { fetchAgentSnapshot } = require("./lib/cross-agent-context");
 const { callGeminiVision, hashImages } = require("./lib/vision-router");
+const { resolveLanguage, appendLanguageInstruction } = require("./lib/i18n-prompt");
+const { withCron, shouldRunCron } = require("./lib/cron-helper");
+const { getUserNotifContext } = require("./lib/cron-user-context");
+const { resolveAnchor } = require("./lib/user-anchor");
+const { assertLoggableDate, sendLogGuardError } = require("./lib/log-guard");
 const crypto = require("crypto");
 const { computeFitnessScore: _computeFitnessScore } = require('./lib/agent-scores');
 
@@ -487,7 +492,7 @@ async function buildFitnessContext(deviceId) {
       .filter(Boolean)
       .join("\n");
   } catch (e) {
-    console.error("[fitness] buildFitnessContext:", e);
+    log.error("[fitness] buildFitnessContext:", e);
     return "Context unavailable.";
   }
 }
@@ -588,7 +593,7 @@ async function buildActionContext(deviceId) {
       .filter(Boolean)
       .join("\n");
   } catch (e) {
-    console.error("[fitness] buildActionContext:", e);
+    log.error("[fitness] buildActionContext:", e);
     return "Context unavailable.";
   }
 }
@@ -1069,7 +1074,7 @@ async function gradeRecentActions(deviceId) {
     }
     if (touched > 0) await batch.commit();
   } catch (e) {
-    console.error("[fitness] gradeRecentActions:", e);
+    log.error("[fitness] gradeRecentActions:", e);
   }
 }
 
@@ -1208,7 +1213,7 @@ async function generateActionBatch(
     aiActions = Array.isArray(parsed.actions) ? parsed.actions : [];
     weeklyFocus = parsed.weekly_focus || "";
   } catch (e) {
-    console.error("[fitness] action copy AI:", e);
+    log.error("[fitness] action copy AI:", e);
     // Fallback: use pre-baked text
     aiActions = slots.map(c => ({
       title: c.surprise_hook.slice(0, 32),
@@ -1310,7 +1315,7 @@ function queueActionBatchGeneration(deviceId, opts = {}) {
     invalidateAnalysisCache(deviceId);
     })
     .catch((err) => {
-      console.error("[fitness] queueActionBatchGeneration error:", err);
+      log.error("[fitness] queueActionBatchGeneration error:", err);
       _actionGenMap.delete(deviceId);
       fitnessDoc(deviceId)
         .update({ pending_action_generation: false })
@@ -1456,7 +1461,7 @@ router.get("/setup-status", async (req, res) => {
     }
     return res.json({ setup_completed: true, setup: snap.data().setup });
   } catch (e) {
-    console.error("[fitness] setup-status:", e);
+    log.error("[fitness] setup-status:", e);
     return res.status(500).json({ error: "server error" });
   }
 });
@@ -1528,7 +1533,7 @@ router.get("/chat-prompts", async (req, res) => {
 
     res.json({ prompts: pool.slice(0, 6) });
   } catch (err) {
-    console.error("[fitness] /chat-prompts error:", err);
+    log.error("[fitness] /chat-prompts error:", err);
     res.status(500).json({ error: "Failed" });
   }
 });
@@ -1677,7 +1682,7 @@ router.post("/setup", async (req, res) => {
     queueActionBatchGeneration(deviceId, { generationKind: "setup" });
     return res.json({ success: true });
   } catch (e) {
-    console.error("[fitness] setup:", e);
+    log.error("[fitness] setup:", e);
     return res.status(500).json({ error: "server error" });
   }
 });
@@ -1772,7 +1777,11 @@ router.post("/log", async (req, res) => {
     return res.status(400).json({ error: "exercises array required" });
   }
   try {
-    const workoutDate = date || dateStr();
+    const anchor = await resolveAnchor(deviceId);
+    let workoutDate;
+    try {
+      workoutDate = assertLoggableDate(date, anchor);
+    } catch (e) { return sendLogGuardError(res, e); }
 
     // Enrich exercises with muscle groups + e1RM
     const enriched = exercises.map((ex) => ({
@@ -1941,11 +1950,11 @@ router.post("/log", async (req, res) => {
         refreshFitnessScore(deviceId).catch(() => {});
 
       } catch (bgErr) {
-        console.error("[fitness] log background:", bgErr);
+        log.error("[fitness] log background:", bgErr);
       }
     });
   } catch (e) {
-    console.error("[fitness] log:", e);
+    log.error("[fitness] log:", e);
     return res.status(500).json({ error: "server error" });
   }
 });
@@ -2003,7 +2012,7 @@ router.post("/session/start", async (req, res) => {
     if (e.message === "active_session_exists") {
       return res.status(409).json({ error: "active_session_exists" });
     }
-    console.error("[fitness] /session/start:", e);
+    log.error("[fitness] /session/start:", e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -2072,7 +2081,7 @@ router.post("/session/end", async (req, res) => {
 
     // ── Write cross-agent signals (fire-and-forget, non-blocking) ──
     writeFitnessCrossAgentSignals(deviceId, sessionData).catch(e =>
-      console.error("[fitness] cross-agent write:", e?.message));
+      log.error("[fitness] cross-agent write:", e?.message));
 
     // Trigger action regeneration after session ends
     _onFitnessLog(deviceId);
@@ -2086,7 +2095,7 @@ router.post("/session/end", async (req, res) => {
     });
   } catch (e) {
     if (e.message === "session_not_found") return res.status(404).json({ error: "session_not_found" });
-    console.error("[fitness] /session/end:", e);
+    log.error("[fitness] /session/end:", e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -2124,7 +2133,7 @@ router.post("/session/log", async (req, res) => {
     });
     res.json({ ok: true, sets_logged: enrichedSets.length });
   } catch (e) {
-    console.error("[fitness] /session/log:", e);
+    log.error("[fitness] /session/log:", e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -2138,7 +2147,10 @@ router.post('/reflection', async (req, res) => {
     const { deviceId, text, date } = req.body || {};
     if (!deviceId || !text) return res.status(400).json({ error: 'deviceId and text required' });
     const trimmed = String(text).slice(0, 200);
-    const target = date || dateStr();
+    const anchor = await resolveAnchor(deviceId);
+    let target;
+    try { target = assertLoggableDate(date, anchor); }
+    catch (e) { return sendLogGuardError(res, e); }
 
     // Attach to latest matching workout doc (best effort)
     const snap = await workoutsCol(deviceId)
@@ -2166,7 +2178,7 @@ router.post('/reflection', async (req, res) => {
 
     res.json({ ok: true });
   } catch (e) {
-    console.error('[fitness] /reflection:', e);
+    log.error('[fitness] /reflection:', e);
     res.status(500).json({ error: 'server error' });
   }
 });
@@ -2248,7 +2260,7 @@ router.post("/describe", async (req, res) => {
         // No matching workout — fall through to normal parse path so
         // user gets a helpful "we couldn't find that day's workout" UX.
       } catch (e) {
-        console.warn('[fitness] replay lookup fail:', e?.message);
+        log.warn('[fitness] replay lookup fail:', e?.message);
       }
     }
 
@@ -2392,7 +2404,7 @@ router.post("/describe", async (req, res) => {
         parsed = JSON.parse(raw);
         usedModel = "gpt-4.1-mini";
       } catch (e) {
-        console.error("[fitness] /describe parse fail:", e?.message);
+        log.error("[fitness] /describe parse fail:", e?.message);
         return res.status(502).json({ error: "AI response unparseable" });
       }
     }
@@ -2501,7 +2513,7 @@ router.post("/describe", async (req, res) => {
           }
         }
       } catch (e) {
-        console.warn('[fitness] cleanup-reparse fail:', e?.message);
+        log.warn('[fitness] cleanup-reparse fail:', e?.message);
       }
     }
 
@@ -2523,7 +2535,7 @@ router.post("/describe", async (req, res) => {
       model:            usedModel,
     });
   } catch (e) {
-    console.error("[fitness] /describe:", e);
+    log.error("[fitness] /describe:", e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -2563,7 +2575,7 @@ router.post("/calibration", async (req, res) => {
     });
     res.json({ ok: true });
   } catch (e) {
-    console.error("[fitness] /calibration:", e);
+    log.error("[fitness] /calibration:", e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -2670,16 +2682,22 @@ router.get("/today", async (req, res) => {
       if (!calDates[w.date]) calDates[w.date] = { has_pr: false };
       if ((w.personal_records || []).length > 0) calDates[w.date].has_pr = true;
     }
+    // Registration Anchor Law: never iterate past anchor.
     const calendarDays = [];
-    for (let i = 29; i >= 0; i--) {
-      const d = new Date();
-      d.setDate(d.getDate() - i);
-      const ds = dateStr(d);
-      calendarDays.push({
-        date: ds,
-        has_workout: !!calDates[ds],
-        has_pr: calDates[ds]?.has_pr || false,
-      });
+    {
+      const _anchor = await resolveAnchor(deviceId);
+      const { enumerateDaysFrom: _enum } = require('./lib/range-helpers');
+      const _todayKey = dateStr();
+      const _dt = new Date(); _dt.setDate(_dt.getDate() - 29);
+      const _candidate = dateStr(_dt);
+      const _start = _anchor.anchorDateStr && _candidate < _anchor.anchorDateStr ? _anchor.anchorDateStr : _candidate;
+      for (const ds of _enum(_start, _todayKey)) {
+        calendarDays.push({
+          date: ds,
+          has_workout: !!calDates[ds],
+          has_pr: calDates[ds]?.has_pr || false,
+        });
+      }
     }
 
     // Streak + this-week count from 30-day data
@@ -2956,7 +2974,7 @@ router.get("/today", async (req, res) => {
         }
       }
     } catch (e) {
-      console.warn('[fitness] same_day_suggestion fail:', e?.message);
+      log.warn('[fitness] same_day_suggestion fail:', e?.message);
     }
 
     return res.json({
@@ -2972,7 +2990,7 @@ router.get("/today", async (req, res) => {
       same_day_suggestion,
     });
   } catch (e) {
-    console.error("[fitness] today:", e);
+    log.error("[fitness] today:", e);
     return res.status(500).json({ error: "server error" });
   }
 });
@@ -2996,7 +3014,7 @@ router.get("/workout-dates", async (req, res) => {
     }
     return res.json({ dates });
   } catch (e) {
-    console.error("[fitness] workout-dates:", e);
+    log.error("[fitness] workout-dates:", e);
     return res.status(500).json({ error: "server error" });
   }
 });
@@ -3024,7 +3042,7 @@ router.get("/day", async (req, res) => {
       },
     });
   } catch (e) {
-    console.error("[fitness] day:", e);
+    log.error("[fitness] day:", e);
     return res.status(500).json({ error: "server error" });
   }
 });
@@ -3060,7 +3078,7 @@ router.get("/last-session", async (req, res) => {
       },
     });
   } catch (e) {
-    console.error("[fitness] last-session:", e);
+    log.error("[fitness] last-session:", e);
     return res.status(500).json({ error: "server error" });
   }
 });
@@ -3106,7 +3124,7 @@ router.post("/check-in", async (req, res) => {
     });
     return res.json({ score: combined, recommendation, intensity });
   } catch (e) {
-    console.error("[fitness] check-in:", e);
+    log.error("[fitness] check-in:", e);
     return res.status(500).json({ error: "server error" });
   }
 });
@@ -3126,7 +3144,7 @@ router.post("/check-in", async (req, res) => {
 //   correlations:          [{ label, percent, accent }]
 //   observations:          [{ title, body, accent }]
 //   insight, personal_formula, insight_cached_at, range_meta
-// ─── GET /analysis/v2 — V4 frontend tab payload ────────────────
+// ─── GET /analysis — V4 frontend tab payload ────────────────
 // Matches the contract emitted by Water + Nutrition V4 endpoints:
 // fitness_score, score_grade, signal_points, daily_logs,
 // top_exercises, bottom_exercises, ai_reads, aha_moments,
@@ -3288,7 +3306,7 @@ function computeStrengthTrend(workouts, rangeDays) {
   }).filter(Boolean);
 }
 
-// ─── LLM-driven insights for /analysis/v2 ─────────────────────
+// ─── LLM-driven insights for /analysis ─────────────────────
 // Caches per (deviceId, range) for 10 minutes so tab switches don't burn
 // LLM tokens. Cross-agent context (sleep, mind, water, protein) read only
 // from cross_agent/today_signals (sandbox-safe — no sibling reads).
@@ -3439,7 +3457,7 @@ async function _generateFitnessV2Insights(deviceId, range, ctx) {
       const raw = completion.choices?.[0]?.message?.content?.trim() || '{}';
       parsed = JSON.parse(raw);
     } catch (e) {
-      console.warn('[fitness] V2 LLM both paths failed:', e?.message);
+      log.warn('[fitness] V2 LLM both paths failed:', e?.message);
       return null;
     }
   }
@@ -3543,19 +3561,28 @@ function _fallbackHeadline(ctx) {
   return `${parts.join(' · ')}. ${tail}`.trim();
 }
 
-router.get("/analysis/v2", async (req, res) => {
+router.get("/analysis", async (req, res) => {
   try {
     const { deviceId, range = "30" } = req.query;
     if (!deviceId) return res.status(400).json({ error: "deviceId required" });
 
-    const rangeDays = Math.max(1, Math.min(365, parseInt(range, 10) || 30));
-    const cutoffMs  = Date.now() - rangeDays * 86400000;
+    const nowMs = Date.now();
+    const anchor = await resolveAnchor(deviceId);
+    const { computeAnalysisWindow } = require("./lib/range-helpers");
+    const win = computeAnalysisWindow(range, anchor.anchorMs, nowMs, anchor.utcOffsetMinutes);
+    const rangeDays = win.effectiveDays;
+    const cutoffMs = win.cutoffMs;
+    const effectiveDays = win.effectiveDays;
+    const effectiveStartDate = win.effectiveStartDate;
 
+    // Fetch wide enough to cover anchor → today for lifetime calc,
+    // then filter to the requested window for the chart payload.
+    const lifetimeFetchLimit = Math.min(Math.max(win.daysSinceAnchor * 3, rangeDays * 3, 200), 2000);
     const [fSnap, wSnap] = await Promise.all([
       fitnessDoc(deviceId).get(),
       workoutsCol(deviceId)
         .orderBy("logged_at", "desc")
-        .limit(Math.min(rangeDays * 3, 800))
+        .limit(lifetimeFetchLimit)
         .get()
         .catch(() => ({ docs: [] })),
     ]);
@@ -3565,15 +3592,28 @@ router.get("/analysis/v2", async (req, res) => {
     }
 
     const setup = fSnap.data();
-    const workouts = wSnap.docs
-      .map((d) => d.data())
-      .filter((w) => getMillis(w.logged_at) >= cutoffMs);
+    const allWorkouts = wSnap.docs.map((d) => d.data());
+    // Lifetime set = all workouts since anchor (used only for score_lifetime).
+    const anchorMsLocal = anchor.anchorMs || 0;
+    const lifetimeWorkouts = anchorMsLocal > 0
+      ? allWorkouts.filter((w) => getMillis(w.logged_at) >= anchorMsLocal)
+      : allWorkouts;
+    // Window set = filtered to the requested range (used for chart + window score).
+    const workouts = allWorkouts.filter((w) => getMillis(w.logged_at) >= cutoffMs);
 
     if (workouts.length === 0) {
       return res.json({
         setup_completed: true,
         range,
-        fitness_score: { score: 0, label: "Begin", components: { volume: 0, intensity: 0, consistency: 0, recovery: 0 } },
+        effective_start_date: effectiveStartDate,
+        effective_days: effectiveDays,
+        days_since_anchor: win.daysSinceAnchor,
+        anchor_date: anchor.anchorDateStr,
+        is_clamped: win.isClamped,
+        score_today: null,
+        score_lifetime: null,
+        missed_days: 0,
+        fitness_score: { score: null, label: "Begin", components: { volume: 0, intensity: 0, consistency: 0, recovery: 0 } },
         score_grade:    { letter: "—" },
         signal_points:  [],
         daily_logs:     {},
@@ -3805,15 +3845,53 @@ router.get("/analysis/v2", async (req, res) => {
     try {
       llmOutput = await _generateFitnessV2Insights(deviceId, range, insightContext);
     } catch (e) {
-      console.warn("[fitness] V2 insights generation failed:", e?.message);
+      log.warn("[fitness] V2 insights generation failed:", e?.message);
     }
     const ai_reads    = llmOutput?.ai_reads    || _fallbackAiReads(insightContext);
     const aha_moments = llmOutput?.aha_moments || _fallbackAhaMoments(insightContext);
     const headline    = llmOutput?.hero_headline || _fallbackHeadline(insightContext);
 
+    // Standard outputs: score_today / score_7d_smoothed / score_lifetime / missed_days
+    // Per-day quality = mean of session_quality across that day's workouts.
+    // Computed over LIFETIME workouts (anchor → today) so score_lifetime is
+    // independent of the requested range.
+    const dayQualityByDate = (() => {
+      const acc = {};
+      for (const w of lifetimeWorkouts) {
+        if (!w.date) continue;
+        if (!acc[w.date]) acc[w.date] = [];
+        acc[w.date].push(w.session_quality || 60);
+      }
+      const out = {};
+      for (const [k, arr] of Object.entries(acc)) {
+        out[k] = arr.reduce((a, b) => a + b, 0) / arr.length;
+      }
+      return out;
+    })();
+    const { computeStandardOutputs } = require('./lib/score-lifetime');
+    const std = computeStandardOutputs({
+      qualityByDate: dayQualityByDate,
+      todayDate: win.todayDate,
+      anchorDate: anchor.anchorDateStr,
+      daysSinceAnchor: win.daysSinceAnchor,
+    });
+    const score_today = std.score_today;
+    const score_lifetime = std.score_lifetime;
+    const missed_days = std.missed_days;
+    const score_7d_smoothed = std.score_7d_smoothed;
+
     res.json({
       setup_completed: true,
       range,
+      effective_start_date: effectiveStartDate,
+      effective_days: effectiveDays,
+      days_since_anchor: win.daysSinceAnchor,
+      anchor_date: anchor.anchorDateStr,
+      is_clamped: win.isClamped,
+      score_today,
+      score_7d_smoothed,
+      score_lifetime,
+      missed_days,
       fitness_score: {
         score,
         label: score >= 80 ? "Strong block" : score >= 70 ? "On track" : score >= 60 ? "Building" : "Begin",
@@ -3848,17 +3926,17 @@ router.get("/analysis/v2", async (req, res) => {
       sets_target: SETS_TARGET,
     });
   } catch (e) {
-    console.error("[fitness] /analysis/v2:", e);
+    log.error("[fitness] /analysis:", e);
     res.status(500).json({ error: "server error" });
   }
 });
 
 // ════════════════════════════════════════════════════════════════
-// GET /actions/v2 — Actions tab payload (Nutrition/Mind canon shape)
+// GET /actions — Actions tab payload (Nutrition/Mind canon shape)
 // Cadence is **session-based** for fitness (every 3 sessions or 3 days).
 // Cross-agent signals from cross_agent/today_signals only (sandbox law).
 // ════════════════════════════════════════════════════════════════
-router.get("/actions/v2", async (req, res) => {
+router.get("/actions", async (req, res) => {
   try {
     const { deviceId } = req.query;
     if (!deviceId) return res.status(400).json({ error: "deviceId required" });
@@ -3976,915 +4054,11 @@ router.get("/actions/v2", async (req, res) => {
 
     return res.json({ cadence, prescription, actions, history, stats });
   } catch (err) {
-    console.error('[fitness] /actions/v2 error:', err);
+    log.error('[fitness] /actions error:', err);
     return res.status(500).json({ error: 'server error' });
   }
 });
 
-router.get("/analysis", async (req, res) => {
-  const { deviceId, range = "30" } = req.query;
-  if (!deviceId) return res.status(400).json({ error: "deviceId required" });
-
-  // Range parsing — supports 7, 30, 90, "all"
-  const rangeKey = String(range).toLowerCase();
-  const isAll = rangeKey === "all";
-  const rangeN = isAll ? 9999 : parseInt(rangeKey, 10) || 30;
-  const rangeLabel = isAll ? "ALL" : `${rangeN}D`;
-
-  // 60s response cache + in-flight stampede protection
-  const cacheKey = `${deviceId}:${rangeKey}`;
-  const cached = _analysisCache.get(cacheKey);
-  if (cached && Date.now() - cached.builtAt < ANALYSIS_TTL) {
-    return res.json(cached.body);
-  }
-  const inflight = _analysisLocks.get(cacheKey);
-  if (inflight) {
-    try { return res.json(await inflight); } catch { /* fall through */ }
-  }
-
-  let resolveLock, rejectLock;
-  const lockPromise = new Promise((resolve, reject) => { resolveLock = resolve; rejectLock = reject; });
-  _analysisLocks.set(cacheKey, lockPromise);
-
-  try {
-    const [fSnap, allSnap] = await Promise.all([
-      fitnessDoc(deviceId).get(),
-      workoutsCol(deviceId).orderBy("logged_at", "desc").limit(500).get(),
-    ]);
-    const data = fSnap.data() || {};
-
-    const allWorkouts = allSnap.docs.map(mapDoc);
-    const cutoffMs = isAll ? 0 : Date.now() - rangeN * 24 * 3600 * 1000;
-    const inRange = isAll
-      ? allWorkouts.slice()
-      : allWorkouts.filter((w) => getMillis(w.logged_at) >= cutoffMs);
-
-    if (allWorkouts.length === 0) {
-      return res.json({
-        fitness_score: { score: 0, label: "Start", components: { consistency: 0, volume: 0, progression: 0, intensity: 0 } },
-        stats: { total_workouts: 0, current_streak: 0, longest_streak: 0, total_sets: 0,
-          total_volume_kg: 0, avg_weekly_sets: 0, days_logged: 0, prs_count: 0,
-          top_exercise: null, range_label: rangeLabel },
-        signal_points_volume: [],
-        signal_points_strength: [],
-        strong_points: [],
-        weak_points: [],
-        recent_timeline: [],
-        correlations: [],
-        observations: [],
-        insight: "",
-        personal_formula: "",
-        insight_cached_at: null,
-        range_meta: { label: rangeLabel, days: isAll ? null : rangeN, summary: "Log your first workout" },
-      });
-    }
-
-    // ── Streaks ──────────────────────────────────────────────
-    const currentStreak = computeStreak(allWorkouts);
-    const longestStreak = (() => {
-      const dates = [...new Set(allWorkouts.map((w) => w.date).filter(Boolean))].sort();
-      if (!dates.length) return 0;
-      let best = 1, cur = 1;
-      for (let i = 1; i < dates.length; i++) {
-        const prev = new Date(dates[i - 1]);
-        const curD = new Date(dates[i]);
-        const diff = Math.round((curD - prev) / 86400000);
-        if (diff === 1) { cur++; if (cur > best) best = cur; }
-        else cur = 1;
-      }
-      return best;
-    })();
-
-    // ── Stats ────────────────────────────────────────────────
-    const uniqueDays = new Set(inRange.map((w) => w.date).filter(Boolean));
-    const daysLogged = uniqueDays.size;
-    const totalSets = inRange.reduce((s, w) => s + (w.total_sets || 0), 0);
-    const totalVolume = inRange.reduce((s, w) => s + (w.total_volume_kg || 0), 0);
-    const prsCount = inRange.reduce((s, w) => s + (w.personal_records || []).length, 0);
-    const effectiveDays = isAll
-      ? Math.max(7, Math.ceil(((Date.now() - getMillis(allWorkouts[allWorkouts.length - 1].logged_at)) / 86400000)))
-      : rangeN;
-    const avgWeeklySets = effectiveDays >= 7 ? round(totalSets / (effectiveDays / 7), 0) : totalSets;
-
-    // Top exercise (by frequency in range)
-    const exCount = {};
-    for (const w of inRange) {
-      for (const ex of w.exercises || []) {
-        if (!ex.name) continue;
-        const key = ex.name.toLowerCase();
-        exCount[key] = (exCount[key] || 0) + 1;
-      }
-    }
-    const topExerciseEntry = Object.entries(exCount).sort(([, a], [, b]) => b - a)[0];
-    const topExercise = topExerciseEntry
-      ? (inRange.flatMap((w) => w.exercises || []).find((e) => e.name?.toLowerCase() === topExerciseEntry[0])?.name || null)
-      : null;
-
-    // ════════════════════════════════════════════════════════════
-    // FITNESS SCORE — 4 research-backed components (0-100 each)
-    // ════════════════════════════════════════════════════════════
-
-    // Sorted ASC dates for gap math
-    const sortedDates = [...uniqueDays].sort();
-    const targetDaysPerWeek = (data.setup?.training_days?.length) || (data.setup?.days_per_week) || 3;
-    const expectedDays = Math.max(1, Math.round((effectiveDays / 7) * targetDaysPerWeek));
-    const targetGapDays = 7 / targetDaysPerWeek;
-
-    // ── (1) CONSISTENCY (35%) — adherence × gap-distribution penalty ──
-    // Source: Mujika & Padilla 2010 "Detraining" — gap variance > mean kills adherence.
-    // Formula: adherence × (1 - clamp(CV, 0, 1)) where CV = stdDev(gaps)/mean(gaps).
-    // A user logging Mon/Wed/Fri scores 100. Same total spread chaotically scores 30.
-    const consistencyScore = (() => {
-      if (sortedDates.length === 0) return 0;
-      const adherence = Math.min(1, daysLogged / expectedDays); // 0..1
-      if (sortedDates.length < 2) return Math.round(adherence * 100);
-      const gaps = [];
-      for (let i = 1; i < sortedDates.length; i++) {
-        const a = new Date(sortedDates[i - 1] + "T12:00:00");
-        const b = new Date(sortedDates[i] + "T12:00:00");
-        gaps.push(Math.max(1, Math.round((b - a) / 86400000)));
-      }
-      const meanGap = gaps.reduce((s, g) => s + g, 0) / gaps.length;
-      const variance = gaps.reduce((s, g) => s + (g - meanGap) ** 2, 0) / gaps.length;
-      const stdGap = Math.sqrt(variance);
-      const cv = meanGap > 0 ? stdGap / meanGap : 1;
-      // Reward gaps near target; penalize chaos
-      const gapDistributionFactor = Math.max(0, 1 - Math.min(1, cv));
-      // Penalize avg gap drift from target (e.g. target 2.3 days, actual 6 = bad)
-      const gapTargetFactor = Math.max(0, 1 - Math.min(1, Math.abs(meanGap - targetGapDays) / Math.max(targetGapDays, 1)));
-      const blended = (gapDistributionFactor * 0.6 + gapTargetFactor * 0.4);
-      return Math.round(adherence * blended * 100);
-    })();
-
-    // ── (2) VOLUME (25%) — % of muscle-groups in MAV band (Renaissance Periodization) ──
-    // Source: Israetel et al. 2019. MEV = minimum effective volume, MAV = optimal range, MRV = max recoverable.
-    // Each muscle scores: 0 below MEV, 100 at MAV midpoint, ramps down past MRV.
-    const volumeScore = (() => {
-      // Compute weekly volume per muscle averaged over (effectiveDays / 7) weeks
-      const weeks = Math.max(1, effectiveDays / 7);
-      const muscleVolPerWeek = {};
-      for (const w of inRange) {
-        for (const ex of w.exercises || []) {
-          const m = ex.muscle_group;
-          if (!m || m === "other" || m === "cardio") continue;
-          muscleVolPerWeek[m] = (muscleVolPerWeek[m] || 0) + (ex.sets?.length || 0);
-        }
-      }
-      const muscleScores = [];
-      for (const [m, lm] of Object.entries(VOLUME_LANDMARKS)) {
-        const wkSets = (muscleVolPerWeek[m] || 0) / weeks;
-        if (wkSets === 0) continue;
-        const mavMid = (lm.MAV[0] + lm.MAV[1]) / 2;
-        let score;
-        if (wkSets < lm.MEV) {
-          score = (wkSets / lm.MEV) * 50; // 0..50 below MEV
-        } else if (wkSets <= lm.MAV[1]) {
-          // ramp from 50 (at MEV) → 100 (at MAV mid) → 90 (at MAV high)
-          if (wkSets <= mavMid) score = 50 + ((wkSets - lm.MEV) / (mavMid - lm.MEV)) * 50;
-          else score = 100 - ((wkSets - mavMid) / (lm.MAV[1] - mavMid)) * 10;
-        } else if (wkSets <= lm.MRV) {
-          score = 90 - ((wkSets - lm.MAV[1]) / (lm.MRV - lm.MAV[1])) * 30; // 90→60
-        } else {
-          score = Math.max(20, 60 - (wkSets - lm.MRV) * 4); // overtraining penalty
-        }
-        muscleScores.push(score);
-      }
-      if (!muscleScores.length) return 0;
-      // Penalize narrow training: untrained muscles drag score down
-      const trainedCount = muscleScores.length;
-      const muscleAvg = muscleScores.reduce((a, b) => a + b, 0) / trainedCount;
-      const breadthBonus = Math.min(1, trainedCount / 6); // 6 muscle groups = full credit
-      return Math.round(muscleAvg * breadthBonus);
-    })();
-
-    // ── (3) PROGRESSION (25%) — linear regression slope on top 3 lifts ──
-    // Source: Schoenfeld 2010 J Strength Cond Res — slope is the only honest metric (PRs are gameable).
-    // We fit kg-per-week slope on each top lift's max-weight series and average.
-    const progressionScore = (() => {
-      if (inRange.length < 3) return Math.min(40, inRange.length * 12);
-      // Build per-exercise time series (date → max kg)
-      const exSeries = {};
-      for (const w of inRange) {
-        if (!w.date) continue;
-        const dayMs = new Date(w.date + "T12:00:00").getTime();
-        for (const ex of w.exercises || []) {
-          if (!ex.name) continue;
-          const key = ex.name.toLowerCase();
-          const maxW = Math.max(...(ex.sets || []).map((s) => s.weight_kg || 0));
-          if (maxW <= 0) continue;
-          if (!exSeries[key]) exSeries[key] = { name: ex.name, points: [] };
-          exSeries[key].points.push({ t: dayMs, kg: maxW });
-        }
-      }
-      const series = Object.values(exSeries).filter((s) => s.points.length >= 3);
-      if (!series.length) return 20;
-      series.sort((a, b) => b.points.length - a.points.length);
-      const top = series.slice(0, 3);
-      let totalKgPerWeek = 0;
-      let validLifts = 0;
-      for (const s of top) {
-        const pts = s.points.sort((a, b) => a.t - b.t);
-        // Simple linear regression y = mx + b (x in weeks since first point)
-        const t0 = pts[0].t;
-        const xs = pts.map((p) => (p.t - t0) / (7 * 86400000));
-        const ys = pts.map((p) => p.kg);
-        const n = pts.length;
-        const meanX = xs.reduce((a, b) => a + b, 0) / n;
-        const meanY = ys.reduce((a, b) => a + b, 0) / n;
-        let num = 0, den = 0;
-        for (let i = 0; i < n; i++) { num += (xs[i] - meanX) * (ys[i] - meanY); den += (xs[i] - meanX) ** 2; }
-        const slope = den > 0 ? num / den : 0; // kg per week
-        // Normalize against starting weight: 1% per week = 100, 0% = 50, negative = below 50
-        const baseKg = ys[0] || 1;
-        const pctPerWk = (slope / baseKg) * 100;
-        // 1% / week = elite progression for natural lifters (Helms 2019)
-        const liftScore = clamp(50 + pctPerWk * 50, 0, 100);
-        totalKgPerWeek += liftScore;
-        validLifts++;
-      }
-      return validLifts ? Math.round(totalKgPerWeek / validLifts) : 30;
-    })();
-
-    // ── (4) INTENSITY (15%) — weekly stimulus vs hypertrophy threshold ──
-    // Source: Schoenfeld meta 2017 — 10+ sets/muscle/week minimum for hypertrophy.
-    // Score = (avgWeeklyTotalSets / 36) where 36 = 6 muscles × 6 sets minimum baseline.
-    const intensityScore = (() => {
-      if (effectiveDays < 1) return 0;
-      const wkSets = totalSets / Math.max(1, effectiveDays / 7);
-      if (wkSets === 0) return 0;
-      // Sweet spot: 30-60 sets/week. Below = under-stimulus. Above = overtraining.
-      if (wkSets >= 30 && wkSets <= 60) return 100;
-      if (wkSets < 30) return Math.round((wkSets / 30) * 100);
-      // Above 60 = penalty (recovery limits per Israetel)
-      return Math.max(40, Math.round(100 - (wkSets - 60) * 1.5));
-    })();
-
-    // Use shared agent-scores formula (applies maturity factor) for cross-screen consistency
-    const fitness_score = _computeFitnessScore({
-      consistency:  consistencyScore,
-      volume:       volumeScore,
-      progression:  progressionScore,
-      intensity:    intensityScore,
-      days_logged:  daysLogged,
-    }) || {
-      score: Math.round(consistencyScore * 0.35 + volumeScore * 0.25 + progressionScore * 0.25 + intensityScore * 0.15),
-      label: 'Building',
-      components: { consistency: consistencyScore, volume: volumeScore, progression: progressionScore, intensity: intensityScore },
-    };
-
-    // Cache the comprehensive analysis score (overwrites the log-time estimate)
-    fitnessDoc(deviceId).update({
-      current_score:    fitness_score.score,
-      score_label:      fitness_score.label,
-      score_components: fitness_score.components,
-      score_updated_at: admin.firestore.FieldValue.serverTimestamp(),
-    }).catch(() => {});
-
-    // ── Signal Points Volume — one point per CALENDAR DAY in range ──
-    // Logged days: { value: sets, completed: true, ...gap-aware metadata }
-    // Rest/missed days: { value: 0, completed: false } — rendered as dim dot
-    // For ALL range, we cap window so chart stays sane: from first log → today
-    const dayMap = {};
-    for (const w of inRange) {
-      if (!w.date) continue;
-      const e = dayMap[w.date] || { date: w.date, sets: 0, volume: 0, had_pr: false, muscles: new Set() };
-      e.sets += w.total_sets || 0;
-      e.volume += w.total_volume_kg || 0;
-      e.had_pr = e.had_pr || (w.personal_records || []).length > 0;
-      for (const ex of w.exercises || []) if (ex.muscle_group) e.muscles.add(ex.muscle_group);
-      dayMap[w.date] = e;
-    }
-
-    // Median sets across LOGGED days — used to classify lag vs spike
-    const loggedSetsValues = Object.values(dayMap).map((d) => d.sets).sort((a, b) => a - b);
-    const median = loggedSetsValues.length
-      ? loggedSetsValues.length % 2
-        ? loggedSetsValues[(loggedSetsValues.length - 1) / 2]
-        : (loggedSetsValues[loggedSetsValues.length / 2 - 1] + loggedSetsValues[loggedSetsValues.length / 2]) / 2
-      : 0;
-
-    const DOW_NAMES = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
-
-    // Build calendar window
-    const todayMid = new Date(); todayMid.setHours(12, 0, 0, 0);
-    let windowStart;
-    if (isAll) {
-      // ALL: from first ever log → today (capped at 180 days for chart sanity)
-      const firstLogged = Object.keys(dayMap).sort()[0];
-      windowStart = firstLogged ? new Date(firstLogged + "T12:00:00") : todayMid;
-      const daysSpan = Math.ceil((todayMid - windowStart) / 86400000) + 1;
-      if (daysSpan > 180) {
-        windowStart = new Date(todayMid.getTime() - 179 * 86400000);
-      }
-    } else {
-      windowStart = new Date(todayMid.getTime() - (rangeN - 1) * 86400000);
-    }
-
-    const totalDays = Math.max(1, Math.ceil((todayMid - windowStart) / 86400000) + 1);
-    let lastLoggedDate = null;
-    const signal_points_volume_full = [];
-    for (let i = 0; i < totalDays; i++) {
-      const dt = new Date(windowStart.getTime() + i * 86400000);
-      const dKey = dt.toISOString().slice(0, 10);
-      const monthShort = dt.toLocaleDateString("en", { month: "short" });
-      const logged = dayMap[dKey];
-      const gapDays = lastLoggedDate
-        ? Math.max(1, Math.round((dt - new Date(lastLoggedDate + "T12:00:00")) / 86400000))
-        : 0;
-      if (logged) {
-        let band = "normal";
-        if (median > 0) {
-          if (logged.sets >= median * 1.5) band = "spike";
-          else if (logged.sets <= median * 0.5) band = "lag";
-        }
-        signal_points_volume_full.push({
-          date: dKey,
-          label: `${monthShort} ${dt.getDate()}`,
-          value: logged.sets,
-          volume_kg: round(logged.volume, 0),
-          had_pr: logged.had_pr,
-          completed: true,
-          gap_before_days: gapDays,
-          is_after_long_gap: gapDays >= 7,
-          day_of_week: DOW_NAMES[dt.getDay()],
-          intensity_band: band,
-          muscle_groups: [...logged.muscles],
-        });
-        lastLoggedDate = dKey;
-      } else {
-        signal_points_volume_full.push({
-          date: dKey,
-          label: `${monthShort} ${dt.getDate()}`,
-          value: 0,
-          volume_kg: 0,
-          had_pr: false,
-          completed: false,
-          gap_before_days: 0,
-          is_after_long_gap: false,
-          day_of_week: DOW_NAMES[dt.getDay()],
-          intensity_band: "rest",
-          muscle_groups: [],
-        });
-      }
-    }
-
-    // Downsample if too many points (keeps the chart readable + fast)
-    const MAX_POINTS = 90;
-    let signal_points_volume;
-    if (signal_points_volume_full.length <= MAX_POINTS) {
-      signal_points_volume = signal_points_volume_full;
-    } else {
-      // Bucket-merge consecutive days; preserve completed days inside each bucket
-      const bucketSize = Math.ceil(signal_points_volume_full.length / MAX_POINTS);
-      signal_points_volume = [];
-      for (let i = 0; i < signal_points_volume_full.length; i += bucketSize) {
-        const slice = signal_points_volume_full.slice(i, i + bucketSize);
-        const trained = slice.filter((p) => p.completed);
-        if (trained.length === 0) {
-          // pure rest bucket — represent as one rest day
-          const mid = slice[Math.floor(slice.length / 2)];
-          signal_points_volume.push({ ...mid, label: mid.label });
-        } else {
-          // merge logged days (sum sets/volume)
-          const sets = trained.reduce((s, p) => s + p.value, 0);
-          const vol = trained.reduce((s, p) => s + p.volume_kg, 0);
-          const muscles = [...new Set(trained.flatMap((p) => p.muscle_groups))];
-          const had_pr = trained.some((p) => p.had_pr);
-          const last = trained[trained.length - 1];
-          signal_points_volume.push({
-            ...last,
-            value: sets,
-            volume_kg: vol,
-            muscle_groups: muscles,
-            had_pr,
-          });
-        }
-      }
-    }
-
-    const median_sets = median;
-
-    // ── Signal Points Strength — top 3 exercises with weight progression ──
-    const exFreq = {};
-    for (const w of inRange) {
-      for (const ex of w.exercises || []) {
-        if (!ex.name) continue;
-        const key = ex.name.toLowerCase();
-        if (!exFreq[key]) exFreq[key] = { name: ex.name, count: 0, sessions: [] };
-        exFreq[key].count++;
-        const maxW = Math.max(...(ex.sets || []).map((s) => s.weight_kg || 0));
-        if (maxW > 0) {
-          exFreq[key].sessions.push({
-            date: w.date,
-            max: maxW,
-            sets_count: (ex.sets || []).length,
-            session_vol: Math.round((ex.sets || []).reduce((a, s) => a + (s.weight_kg || 0) * (s.reps || 0), 0)),
-          });
-        }
-      }
-    }
-    const topStrengthExs = Object.values(exFreq)
-      .filter((e) => e.sessions.length >= 2)
-      .sort((a, b) => b.count - a.count)
-      .slice(0, 3);
-    const signal_points_strength = topStrengthExs.map((ex) => {
-      const sorted = [...ex.sessions].sort((a, b) => (a.date || "").localeCompare(b.date || ""));
-      return {
-        exercise: ex.name,
-        points: sorted.map((s) => {
-          const dt = new Date(s.date);
-          const monthShort = dt.toLocaleDateString("en", { month: "short" });
-          return {
-            date: s.date,
-            label: `${monthShort} ${dt.getDate()}`,
-            value: round(s.max, 1),
-            sets_count: s.sets_count,
-            session_vol: s.session_vol,
-          };
-        }),
-      };
-    });
-
-    // ── Strong Points — top 3 muscle groups by sets in range ──
-    const muscleSetsInRange = {};
-    const muscleSessionsInRange = {};
-    for (const w of inRange) {
-      const muscleSet = new Set();
-      for (const ex of w.exercises || []) {
-        const m = ex.muscle_group;
-        if (!m || m === "other" || m === "cardio") continue;
-        muscleSetsInRange[m] = (muscleSetsInRange[m] || 0) + (ex.sets?.length || 0);
-        muscleSet.add(m);
-      }
-      for (const m of muscleSet) {
-        muscleSessionsInRange[m] = (muscleSessionsInRange[m] || 0) + 1;
-      }
-    }
-    const totalMuscleSets = Object.values(muscleSetsInRange).reduce((a, b) => a + b, 0) || 1;
-    const muscleEntries = Object.entries(muscleSetsInRange)
-      .map(([muscle, sets]) => ({
-        muscle,
-        sets,
-        sessions: muscleSessionsInRange[muscle] || 0,
-        pct_of_total: Math.round((sets / totalMuscleSets) * 100),
-      }))
-      .sort((a, b) => b.sets - a.sets);
-
-    const strong_points = muscleEntries.slice(0, 3).map((e, i) => {
-      const accent = i === 0 ? "green" : i === 1 ? "blue" : "purple";
-      const label = i === 0 ? "DOMINANT" : i === 1 ? "STRONG" : "ACTIVE";
-      const body = `${e.sets} sets across ${e.sessions} session${e.sessions !== 1 ? "s" : ""} — ${e.pct_of_total}% of your total volume.`;
-      return { muscle: e.muscle, sets: e.sets, sessions: e.sessions, label, body, accent, pct_of_total: e.pct_of_total };
-    });
-
-    // ── Weak Points — muscles not trained in 7+ days OR below MEV ──
-    const lastTrainedMap = {};
-    for (const w of [...allWorkouts].sort((a, b) => (b.date || "").localeCompare(a.date || ""))) {
-      for (const ex of w.exercises || []) {
-        const m = ex.muscle_group;
-        if (m && !lastTrainedMap[m] && m !== "other" && m !== "cardio") lastTrainedMap[m] = w.date;
-      }
-    }
-    const today = new Date(); today.setHours(0, 0, 0, 0);
-    const importantMuscles = ["chest", "back", "quads", "hamstrings", "shoulders", "biceps", "triceps", "glutes", "calves", "abs"];
-    const weak_points = importantMuscles
-      .map((m) => {
-        const lastDate = lastTrainedMap[m];
-        if (!lastDate) {
-          return {
-            muscle: m,
-            days_since: 999,
-            severity: "high",
-            body: `Never logged. Add ${m} work to build a complete physique.`,
-          };
-        }
-        const lastDt = new Date(lastDate + "T12:00:00");
-        const days = Math.floor((today - lastDt) / 86400000);
-        if (days < 7) return null;
-        const severity = days >= 14 ? "high" : "warning";
-        return {
-          muscle: m,
-          days_since: days,
-          severity,
-          body: `Not trained in ${days} days. ${days >= 14 ? "Major loss in stimulus — research shows muscle protein synthesis drops after 10 days." : "One session this week locks in your current gains."}`,
-        };
-      })
-      .filter(Boolean)
-      .sort((a, b) => b.days_since - a.days_since)
-      .slice(0, 3);
-
-    // ── Muscle Grid — 8-tile drill-down summary ──
-    // Each tile: muscle, sets in range, sessions, % change vs prior period,
-    // last_trained, status vs MEV/MAV/MRV. Tap tile → opens MuscleDetailSheet.
-    const muscle_grid = (() => {
-      const TARGET = ["chest", "back", "quads", "hamstrings", "shoulders", "biceps", "triceps", "glutes"];
-      // Prior period — same length immediately before current range
-      const priorEnd   = isAll ? 0 : Date.now() - rangeN * 24 * 3600 * 1000;
-      const priorStart = isAll ? 0 : Date.now() - rangeN * 2 * 24 * 3600 * 1000;
-      const priorWindow = isAll ? [] : allWorkouts.filter((w) => {
-        const t = getMillis(w.logged_at);
-        return t >= priorStart && t < priorEnd;
-      });
-      const setsForWindow = (window) => {
-        const out = {};
-        for (const w of window) {
-          for (const ex of w.exercises || []) {
-            const m = ex.muscle_group;
-            if (!m || m === "other" || m === "cardio") continue;
-            out[m] = (out[m] || 0) + (ex.sets?.length || 0);
-          }
-        }
-        return out;
-      };
-      const cur = setsForWindow(inRange);
-      const prev = setsForWindow(priorWindow);
-      const weeks = Math.max(1, effectiveDays / 7);
-      return TARGET.map((m) => {
-        const sets = cur[m] || 0;
-        const prevSets = prev[m] || 0;
-        const sessions = (() => {
-          let n = 0;
-          for (const w of inRange) {
-            if ((w.exercises || []).some((e) => e.muscle_group === m)) n++;
-          }
-          return n;
-        })();
-        const wkSets = sets / weeks;
-        const lm = VOLUME_LANDMARKS[m];
-        let status = "untrained";
-        if (sets > 0) {
-          if (!lm) status = "active";
-          else if (wkSets < lm.MEV) status = "below_mev";
-          else if (wkSets <= lm.MAV[1]) status = "in_mav";
-          else if (wkSets <= lm.MRV) status = "above_mav";
-          else status = "above_mrv";
-        }
-        const deltaPct = prevSets > 0
-          ? Math.round(((sets - prevSets) / prevSets) * 100)
-          : sets > 0 && !isAll ? 100 : null;
-        const lastDate = lastTrainedMap[m] || null;
-        const daysSince = lastDate
-          ? Math.floor((today - new Date(lastDate + "T12:00:00")) / 86400000)
-          : null;
-        return {
-          muscle: m,
-          sets,
-          sessions,
-          weekly_sets: round(wkSets, 1),
-          status,
-          delta_pct: deltaPct,
-          last_trained: lastDate,
-          days_since: daysSince,
-        };
-      });
-    })();
-
-    // ── Recent Timeline (last 10 sessions) ──
-    const recent_timeline = allWorkouts.slice(0, 10).map((w) => {
-      const sets = w.total_sets || 0;
-      const intensity = sets >= 20 ? "hard" : sets >= 10 ? "moderate" : "light";
-      const muscleGroups = [...new Set((w.exercises || []).map((e) => e.muscle_group).filter(Boolean))];
-      const exs = (w.exercises || []).slice(0, 6).map((e) => ({
-        name: e.name,
-        sets: e.sets?.length || 0,
-        max_weight_kg: Math.max(0, ...(e.sets || []).map((s) => s.weight_kg || 0)),
-      }));
-      const topEx = exs.reduce((best, e) => (e.max_weight_kg > (best?.max_weight_kg || 0) ? e : best), null);
-      return {
-        date_str: w.date,
-        intensity,
-        muscle_groups: muscleGroups,
-        total_sets: sets,
-        total_volume_kg: round(w.total_volume_kg || 0, 0),
-        had_pr: (w.personal_records || []).length > 0,
-        top_exercise: topEx?.name || null,
-        top_lift_kg: topEx?.max_weight_kg || 0,
-        exercises: exs,
-      };
-    });
-
-    // ── Correlations — what drives your PRs (premium pattern insights) ──
-    const correlations = (() => {
-      const out = [];
-      // 1. Best day of week
-      if (allWorkouts.length >= 6) {
-        const dayMap2 = {};
-        const dayPRs = {};
-        for (const w of allWorkouts) {
-          if (!w.date) continue;
-          const dow = new Date(w.date + "T12:00:00").getDay();
-          dayMap2[dow] = (dayMap2[dow] || 0) + 1;
-          if ((w.personal_records || []).length > 0) dayPRs[dow] = (dayPRs[dow] || 0) + 1;
-        }
-        const dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-        const bestDow = Object.entries(dayMap2).sort(([, a], [, b]) => b - a)[0];
-        if (bestDow) {
-          const dow = +bestDow[0];
-          const pct = Math.round((bestDow[1] / allWorkouts.length) * 100);
-          out.push({
-            label: `${dayNames[dow]} sessions`,
-            percent: pct,
-            accent: "amber",
-            detail: `${bestDow[1]} workouts — your most consistent day`,
-          });
-        }
-      }
-
-      // 2. Top exercise PR rate
-      if (topStrengthExs.length > 0) {
-        const top = topStrengthExs[0];
-        const sessions = top.sessions.length;
-        const gains = top.sessions.length >= 2
-          ? top.sessions[top.sessions.length - 1].max - top.sessions[0].max
-          : 0;
-        if (gains > 0) {
-          const pct = Math.min(100, Math.round((gains / Math.max(top.sessions[0].max, 1)) * 100));
-          out.push({
-            label: `${top.name} growth`,
-            percent: pct,
-            accent: "green",
-            detail: `+${round(gains, 1)}kg over ${sessions} sessions`,
-          });
-        }
-      }
-
-      // 3. Set density (avg sets/session as % of optimal 12)
-      if (inRange.length > 0) {
-        const avgSetsPerWorkout = totalSets / inRange.length;
-        const setDensity = Math.min(100, Math.round((avgSetsPerWorkout / 12) * 100));
-        out.push({
-          label: "Set density",
-          percent: setDensity,
-          accent: setDensity >= 80 ? "green" : setDensity >= 50 ? "amber" : "red",
-          detail: `${round(avgSetsPerWorkout, 1)} sets/session avg`,
-        });
-      }
-
-      // 4. Muscle balance — how spread your training is
-      if (muscleEntries.length > 0) {
-        const top3 = muscleEntries.slice(0, 3).reduce((s, e) => s + e.sets, 0);
-        const balance = totalMuscleSets > 0 ? Math.round(((totalMuscleSets - top3) / totalMuscleSets) * 100 + 30) : 0;
-        out.push({
-          label: "Training spread",
-          percent: clamp(balance, 0, 100),
-          accent: balance >= 50 ? "green" : "amber",
-          detail: `${muscleEntries.length} muscles trained`,
-        });
-      }
-
-      // 5. PR frequency
-      if (inRange.length >= 3) {
-        const prRate = Math.round((prsCount / inRange.length) * 100);
-        out.push({
-          label: "PR frequency",
-          percent: Math.min(100, prRate * 3),
-          accent: prRate >= 20 ? "green" : prRate >= 10 ? "amber" : "purple",
-          detail: `${prsCount} PR${prsCount !== 1 ? "s" : ""} in ${inRange.length} workouts`,
-        });
-      }
-
-      return out.slice(0, 5);
-    })();
-
-    // ── Observations ────────────────────────────────────────
-    const muscleVol7d = calcVolumeByMuscle(allWorkouts);
-    const muscleBalance = calcMuscleBalance(allWorkouts);
-    const observations = generateObservations(allWorkouts, currentStreak, muscleBalance, muscleVol7d);
-
-    // ── AI Insight (24h cache) — STRUCTURED 5-CARD OUTPUT ──────
-    // Schema:
-    //   insights[]: { type, icon, title, body }
-    //     types: 'win' | 'gap' | 'pattern' | 'risk' | 'pr'
-    //   next_session: { recommendation, reason, target_sets }
-    //   formula: <one-sentence personal rule>
-    let insight = "";
-    let formula = "";
-    let insightCachedAt = null;
-    let insight_cards = [];
-    let next_session = null;
-    try {
-      const cachedInsight = data.analysis_cache;
-      const cachedMs = getMillis(cachedInsight?.cached_at);
-      const cacheValid = cachedInsight?.insight && (Date.now() - cachedMs) < 24 * 3600 * 1000;
-      if (cacheValid) {
-        insight = cachedInsight.insight || "";
-        formula = cachedInsight.formula || "";
-        insight_cards = cachedInsight.insight_cards || [];
-        next_session = cachedInsight.next_session || null;
-        insightCachedAt = cachedMs ? new Date(cachedMs).toISOString() : null;
-      } else if (inRange.length >= 2) {
-        // Build a richer context with actual gap data + per-muscle status
-        const ctx = await buildActionContext(deviceId);
-        const gapStats = (() => {
-          if (sortedDates.length < 2) return "no gaps yet";
-          const gaps = [];
-          for (let i = 1; i < sortedDates.length; i++) {
-            const a = new Date(sortedDates[i - 1] + "T12:00:00");
-            const b = new Date(sortedDates[i] + "T12:00:00");
-            gaps.push(Math.round((b - a) / 86400000));
-          }
-          const longGaps = gaps.filter((g) => g >= 7);
-          return `gaps days=[${gaps.join(",")}], longest=${Math.max(...gaps)}d, ${longGaps.length} gap(s) ≥7 days`;
-        })();
-        const muscleSummary = muscle_grid
-          .filter((m) => m.sets > 0)
-          .map((m) => `${m.muscle}:${m.sets}sets/${m.sessions}sess(${m.weekly_sets}wk,${m.status}${m.delta_pct !== null ? `,${m.delta_pct >= 0 ? "+" : ""}${m.delta_pct}%vs.prior` : ""})`)
-          .join(", ");
-        const scoreDetail = `score=${fitness_score.score}/100 (consistency=${consistencyScore}, volume=${volumeScore}, progression=${progressionScore}, intensity=${intensityScore})`;
-
-        const enrichedCtx = `${ctx}\n\nRange=${rangeLabel}, ${inRange.length} workouts, ${daysLogged} unique days.\n${scoreDetail}\nGap analysis: ${gapStats}\nMuscle grid: ${muscleSummary || "none"}`;
-
-        const aiRes = await openai.chat.completions.create({
-          model: "gpt-4.1-mini",
-          max_completion_tokens: 700,
-          response_format: { type: "json_object" },
-          messages: [
-            {
-              role: "system",
-              content:
-                "You are an elite, blunt, data-driven strength coach writing for a PREMIUM app. " +
-                "Output STRICT JSON — no prose. Every field cites exact numbers from the user's data.\n\n" +
-                "Schema:\n" +
-                "{\n" +
-                '  "insights": [\n' +
-                '    { "type": "win"|"gap"|"pattern"|"risk"|"pr", "icon": "<emoji>", "title": "<≤40 chars>", "body": "<1 sentence with exact numbers>" }\n' +
-                "  ],\n" +
-                '  "next_session": { "recommendation": "<≤30 chars>", "reason": "<1 sentence with numbers>", "target_sets": <int> },\n' +
-                '  "formula": "<1 sentence personal rule, must reference at least one specific exercise/muscle/day>"\n' +
-                "}\n\n" +
-                "Rules:\n" +
-                "• Generate EXACTLY 5 insights, one of each type when possible (win, gap, pattern, risk, pr). If no gap exists, use 'pattern'. If no PR, use 'pattern'.\n" +
-                "• Every body MUST cite an exact number from the data (kg, sets, days, %, count).\n" +
-                "• 'gap' type = call out specific date ranges where they missed days (e.g. 'You skipped Feb 5–Mar 1, 24 days off').\n" +
-                "• 'win' type = highest impact strength gain or adherence stat.\n" +
-                "• 'pattern' type = day-of-week / muscle-group cadence with numbers.\n" +
-                "• 'risk' type = MEV undertrained or MRV overtrained muscles, cite the threshold.\n" +
-                "• 'pr' type = exact lift, weight delta, sessions count.\n" +
-                "• next_session MUST be specific (e.g. 'Pull day' not 'do something').\n" +
-                "• formula MUST be specific (e.g. 'Your squat peaks Tuesdays after a Friday rest').\n" +
-                "• NO motivational fluff. NO generic advice. NO cross-agent talk (no sleep/water/mood). Strictly fitness data.",
-            },
-            { role: "user", content: enrichedCtx },
-          ],
-        });
-        const raw = aiRes.choices[0].message.content.trim();
-        let parsed;
-        try { parsed = JSON.parse(raw); } catch { parsed = {}; }
-        insight_cards = Array.isArray(parsed.insights) ? parsed.insights.slice(0, 5) : [];
-        next_session = parsed.next_session || null;
-        formula = parsed.formula || "";
-        // Backwards-compat plain insight (joined cards)
-        insight = insight_cards.map((c) => `${c.icon || ""} ${c.body || ""}`).join(" ");
-        insightCachedAt = new Date().toISOString();
-        fitnessDoc(deviceId).update({
-          analysis_cache: {
-            insight, formula, insight_cards, next_session,
-            cached_at: admin.firestore.FieldValue.serverTimestamp(),
-          },
-        }).catch(() => {});
-      }
-    } catch (e) {
-      console.error("[fitness] insight gen:", e);
-    }
-
-    // ── ATL/CTL Series (Training Load Model) ────────────────────
-    // CTL = 42-day EMA of daily TSS (Training Stress Score ≈ total_sets).
-    // ATL = 7-day EMA of daily TSS. Form = CTL - ATL.
-    // Borrowed from cycling TrainingPeaks model, applied to strength.
-    const atl_ctl_series = (() => {
-      const allSorted = [...allWorkouts].sort((a, b) => (a.date || '').localeCompare(b.date || ''));
-      if (allSorted.length < 3) return [];
-      // Build daily TSS map
-      const tssMap = {};
-      for (const w of allSorted) {
-        if (!w.date) continue;
-        tssMap[w.date] = (tssMap[w.date] || 0) + (w.total_sets || 0);
-      }
-      // Fill date range from first workout to today
-      const firstDate = allSorted[0].date;
-      const days = [];
-      const cur = new Date(firstDate + 'T12:00:00');
-      const todayD = new Date(); todayD.setHours(0, 0, 0, 0);
-      while (cur <= todayD) {
-        days.push(dateStr(cur));
-        cur.setDate(cur.getDate() + 1);
-      }
-      let ctl = 0, atl = 0;
-      const series = [];
-      const alphaCtl = 2 / (42 + 1);
-      const alphaAtl = 2 / (7 + 1);
-      for (const d of days) {
-        const tss = tssMap[d] || 0;
-        ctl = ctl + alphaCtl * (tss - ctl);
-        atl = atl + alphaAtl * (tss - atl);
-        series.push({ date: d, ctl: Math.round(ctl * 10) / 10, atl: Math.round(atl * 10) / 10, form: Math.round((ctl - atl) * 10) / 10 });
-      }
-      // Return last 60 days of series
-      return series.slice(-60);
-    })();
-
-    // ── Deload Status ────────────────────────────────────────────
-    const deload_status = (() => {
-      const last3 = allWorkouts.slice(0, 3);
-      if (last3.length < 3) return null;
-      const avgSets = last3.reduce((s, w) => s + (w.total_sets || 0), 0) / 3;
-      const over14dSets = allWorkouts.filter(w => {
-        const ms = getMillis(w.logged_at);
-        return ms >= Date.now() - 14 * 86400000 && ms < Date.now() - 7 * 86400000;
-      }).reduce((s, w) => s + (w.total_sets || 0), 0);
-      const over7dSets = allWorkouts.filter(w => getMillis(w.logged_at) >= Date.now() - 7 * 86400000).reduce((s, w) => s + (w.total_sets || 0), 0);
-      const consecutive_heavy = last3.filter(w => (w.total_sets || 0) >= 20).length;
-      const recommended = consecutive_heavy >= 3 || (over7dSets > 0 && over14dSets > 0 && over7dSets / over14dSets > 1.4);
-      return {
-        recommended,
-        reason: recommended
-          ? consecutive_heavy >= 3
-            ? `${consecutive_heavy} consecutive heavy sessions (≥20 sets). Planned deload = supercompensation.`
-            : `Volume up ${Math.round((over7dSets / over14dSets - 1) * 100)}% vs prior week — deload to absorb gains.`
-          : 'Training load balanced — continue current plan.',
-        avg_sets_last3: Math.round(avgSets * 10) / 10,
-      };
-    })();
-
-    // ── Stage (matches determineStage pattern used by all agents) ──
-    const stage = (() => {
-      const n = allWorkouts.length;
-      if (!n)   return 0;
-      if (n < 4)  return 1;
-      if (n < 10) return 2;
-      if (n < 30) return 3;
-      if (n < 60) return 4;
-      return 5;
-    })();
-
-    const responseBody = {
-      fitness_score,
-      stage,
-      stats: {
-        total_workouts: inRange.length,
-        current_streak: currentStreak,
-        longest_streak: longestStreak,
-        total_sets: totalSets,
-        total_volume_kg: round(totalVolume, 0),
-        avg_weekly_sets: avgWeeklySets,
-        days_logged: daysLogged,
-        prs_count: prsCount,
-        top_exercise: topExercise,
-        range_label: rangeLabel,
-      },
-      signal_points_volume,
-      signal_points_strength,
-      median_sets,
-      strong_points,
-      weak_points,
-      muscle_grid,
-      recent_timeline,
-      correlations,
-      observations,
-      insight,
-      insight_cards,
-      next_session,
-      personal_formula: formula,
-      insight_cached_at: insightCachedAt,
-      atl_ctl_series,
-      deload_status,
-      range_meta: (() => {
-        // Compute date window text
-        const fmtD = (d) => d.toLocaleDateString("en", { month: "short", day: "numeric" });
-        let summary, dateRange;
-        if (isAll && allWorkouts.length) {
-          const first = new Date(
-            (allWorkouts[allWorkouts.length - 1].date || dateStr()) + "T12:00:00"
-          );
-          const last = new Date();
-          dateRange = `${fmtD(first)} – ${fmtD(last)}`;
-          summary = `${dateRange} · ${allWorkouts.length} workouts`;
-        } else {
-          const start = new Date(); start.setDate(start.getDate() - rangeN + 1);
-          const end = new Date();
-          dateRange = `${fmtD(start)} – ${fmtD(end)}`;
-          summary = `${dateRange} · ${inRange.length} workouts`;
-        }
-        return {
-          label: rangeLabel,
-          days: isAll ? null : rangeN,
-          summary,
-          date_range: dateRange,
-        };
-      })(),
-    };
-
-    _analysisCache.set(cacheKey, { body: responseBody, builtAt: Date.now() });
-    _analysisLocks.delete(cacheKey);
-    resolveLock(responseBody);
-    return res.json(responseBody);
-  } catch (e) {
-    console.error("[fitness] analysis:", e);
-    _analysisLocks.delete(cacheKey);
-    rejectLock(e);
-    return res.status(500).json({ error: "server error" });
-  }
-});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /muscle-trends — drill-down for a single muscle group across a range
@@ -5049,271 +4223,7 @@ router.get("/muscle-trends", async (req, res) => {
       volume_points,
     });
   } catch (e) {
-    console.error("[fitness] muscle-trends:", e);
-    return res.status(500).json({ error: "server error" });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────────
-// GET /actions — v2 response shape:
-//   {
-//     spotlight:   <action|null>,    // role==='spotlight'
-//     secondaries: [<action>...],    // role==='secondary'
-//     micro:       <action|null>,    // role==='micro'
-//     outcome_card:<{...}|null>,     // most recent graded action awaiting surface
-//     weekly_focus:<string>,
-//     meta:        {...}
-//   }
-//   Backwards-compat: also returns active/completed/skipped arrays.
-// ─────────────────────────────────────────────────────────────────
-router.get("/_legacy/actions", async (req, res) => {
-  const { deviceId } = req.query;
-  if (!deviceId) return res.status(400).json({ error: "deviceId required" });
-  try {
-    const fSnap = await fitnessDoc(deviceId).get();
-    const fData = fSnap.data() || {};
-    const pending = fData.pending_action_generation || false;
-    const weeklyFocus = fData.last_weekly_focus || "";
-    const noActionsReason = fData.no_actions_reason || null;
-
-    const workoutCount = fData.workout_count_since_last_batch || 0;
-    const progressToNext = workoutCount % ACTION_BATCH_SIZE;
-
-    const snap = await actionsCol(deviceId)
-      .where("status", "in", ["active", "completed", "skipped"])
-      .limit(80)
-      .get();
-    snap.docs.sort(
-      (a, b) => getMillis(b.data().generated_at) - getMillis(a.data().generated_at),
-    );
-    const all = snap.docs.map(mapDoc);
-    const batchKey =
-      all.find((a) => a.status === "active")?.batch_key || all[0]?.batch_key;
-    const inBatch = batchKey
-      ? all.filter((a) => a.batch_key === batchKey)
-      : all.slice(0, 4);
-
-    const serialize = (d) => ({
-      ...d,
-      generated_at: toIso(d.generated_at),
-      expires_at: toIso(d.expires_at),
-      completed_at: toIso(d.completed_at),
-      skipped_at: toIso(d.skipped_at),
-      graded_at: toIso(d.graded_at),
-    });
-
-    const inBatchSerialized = inBatch.map(serialize);
-    const active    = inBatchSerialized.filter((a) => a.status === "active");
-    const completed = inBatchSerialized.filter((a) => a.status === "completed");
-    const skipped   = inBatchSerialized.filter((a) => a.status === "skipped");
-
-    // v2 slots — pull by role from active set
-    const spotlight   = active.find((a) => a.role === "spotlight") || null;
-    const secondaries = active.filter((a) => a.role === "secondary");
-    const micro       = active.find((a) => a.role === "micro") || null;
-
-    // Outcome card: most recent graded action that hasn't been shown yet
-    const allRecent = all.map(serialize);
-    const ungrasped = allRecent.find((a) => a.outcome_grade && !a.outcome_surfaced);
-    const outcome_card = ungrasped ? {
-      action_id: ungrasped.id,
-      grade: ungrasped.outcome_grade,
-      title: ungrasped.title,
-      surprise_hook: ungrasped.surprise_hook || "",
-      promised: ungrasped.success_criterion,
-      delivered_value: ungrasped.outcome_value || 0,
-      proof: ungrasped.proof,
-      archetype: ungrasped.archetype,
-      category: ungrasped.category,
-    } : null;
-
-    // First-batch detection
-    let sessionsUntilFirst = 0;
-    if (!batchKey && !pending) {
-      const wCount = (await workoutsCol(deviceId).count().get()).data().count;
-      sessionsUntilFirst = Math.max(0, ACTION_BATCH_SIZE - wCount);
-    }
-    const sessionsUntilNext =
-      active.length === 0 && completed.length > 0
-        ? ACTION_BATCH_SIZE - progressToNext
-        : 0;
-
-    // Track-record summary (last 30 days)
-    const trackCutoff = Date.now() - 30 * 86400000;
-    const recent30 = allRecent.filter((a) => {
-      const ms = a.generated_at ? new Date(a.generated_at).getTime() : 0;
-      return ms >= trackCutoff;
-    });
-    const graded30 = recent30.filter((a) => a.outcome_grade);
-    const kept30   = recent30.filter((a) => a.outcome_grade === "kept").length;
-    const trackRecord = {
-      total: graded30.length,
-      kept: kept30,
-      kept_rate: graded30.length ? Math.round((kept30 / graded30.length) * 100) : 0,
-    };
-
-    return res.json({
-      // v2 shape
-      spotlight,
-      secondaries,
-      micro,
-      outcome_card,
-      weekly_focus: weeklyFocus,
-      track_record: trackRecord,
-      // backwards-compat
-      active,
-      completed,
-      skipped,
-      meta: {
-        batch_kind: inBatch[0]?.batch_kind || "pattern",
-        generated_at: toIso(inBatch[0]?.generated_at),
-        pending_generation: pending,
-        progress_to_next_batch: progressToNext,
-        sessions_until_first_batch: sessionsUntilFirst,
-        sessions_until_next: sessionsUntilNext,
-        no_actions_reason: noActionsReason,
-      },
-    });
-  } catch (e) {
-    console.error("[fitness] actions:", e);
-    return res.status(500).json({ error: "server error" });
-  }
-});
-
-// GET /actions/history — full history with outcome grades
-router.get("/_legacy/actions/history", async (req, res) => {
-  const { deviceId, range = "30" } = req.query;
-  if (!deviceId) return res.status(400).json({ error: "deviceId required" });
-  const rangeN = parseInt(range, 10) || 30;
-  try {
-    const cutoffMs = Date.now() - rangeN * 86400000;
-    const snap = await actionsCol(deviceId)
-      .orderBy("generated_at", "desc")
-      .limit(150)
-      .get();
-    const all = snap.docs.map(mapDoc).filter((a) => {
-      const ms = getMillis(a.generated_at);
-      return ms >= cutoffMs;
-    });
-
-    const serialize = (d) => ({
-      ...d,
-      generated_at: toIso(d.generated_at),
-      expires_at: toIso(d.expires_at),
-      completed_at: toIso(d.completed_at),
-      skipped_at: toIso(d.skipped_at),
-      graded_at: toIso(d.graded_at),
-    });
-
-    const items = all.map(serialize);
-    const graded = items.filter((a) => a.outcome_grade);
-    const kept = graded.filter((a) => a.outcome_grade === "kept").length;
-    const partial = graded.filter((a) => a.outcome_grade === "partial").length;
-    const abandoned = graded.filter((a) => a.outcome_grade === "abandoned").length;
-
-    // Most-kept category
-    const catCounts = {};
-    for (const a of graded.filter((g) => g.outcome_grade === "kept")) {
-      const c = a.category || "science";
-      catCounts[c] = (catCounts[c] || 0) + 1;
-    }
-    const mostKeptCategory = Object.entries(catCounts).sort(([, a], [, b]) => b - a)[0]?.[0] || null;
-
-    return res.json({
-      range_days: rangeN,
-      total: items.length,
-      graded: graded.length,
-      kept, partial, abandoned,
-      kept_rate: graded.length ? Math.round((kept / graded.length) * 100) : 0,
-      most_kept_category: mostKeptCategory,
-      items,
-    });
-  } catch (e) {
-    console.error("[fitness] actions history:", e);
-    return res.status(500).json({ error: "server error" });
-  }
-});
-
-// POST /action/:id/complete — user committed, will be graded later
-router.post("/_legacy/action/:id/complete", async (req, res) => {
-  const { id } = req.params;
-  const { deviceId } = req.body;
-  if (!deviceId) return res.status(400).json({ error: "deviceId required" });
-  try {
-    await actionsCol(deviceId).doc(id).update({
-      status: "completed",
-      completed_at: admin.firestore.FieldValue.serverTimestamp(),
-    });
-    // Trigger grading immediately in case the criterion is already met
-    gradeRecentActions(deviceId).catch(() => {});
-    return res.json({ success: true });
-  } catch (e) {
-    console.error("[fitness] action complete:", e);
-    return res.status(500).json({ error: "server error" });
-  }
-});
-
-// POST /action/:id/skip
-router.post("/_legacy/action/:id/skip", async (req, res) => {
-  const { id } = req.params;
-  const { deviceId } = req.body;
-  if (!deviceId) return res.status(400).json({ error: "deviceId required" });
-  try {
-    await actionsCol(deviceId).doc(id).update({
-      status: "skipped",
-      skipped_at: admin.firestore.FieldValue.serverTimestamp(),
-      outcome_grade: "abandoned",
-    });
-    return res.json({ success: true });
-  } catch (e) {
-    console.error("[fitness] action skip:", e);
-    return res.status(500).json({ error: "server error" });
-  }
-});
-
-// POST /action/:id/snooze — push expires_at +3d, max 2 snoozes
-router.post("/_legacy/action/:id/snooze", async (req, res) => {
-  const { id } = req.params;
-  const { deviceId } = req.body;
-  if (!deviceId) return res.status(400).json({ error: "deviceId required" });
-  try {
-    const ref = actionsCol(deviceId).doc(id);
-    const snap = await ref.get();
-    if (!snap.exists) return res.status(404).json({ error: "not found" });
-    const data = snap.data();
-    const snoozes = data.snooze_count || 0;
-    if (snoozes >= 2) {
-      return res.status(400).json({ error: "max snoozes reached" });
-    }
-    const currentExpires = getMillis(data.expires_at) || Date.now() + 7 * 86400000;
-    const newExpires = Math.max(currentExpires, Date.now()) + 3 * 86400000;
-    await ref.update({
-      expires_at: admin.firestore.Timestamp.fromMillis(newExpires),
-      snooze_count: snoozes + 1,
-      snoozed_at: admin.firestore.FieldValue.serverTimestamp(),
-    });
-    return res.json({ success: true, new_expires_at: new Date(newExpires).toISOString() });
-  } catch (e) {
-    console.error("[fitness] action snooze:", e);
-    return res.status(500).json({ error: "server error" });
-  }
-});
-
-// POST /action/:id/feedback — { helpful: true|false, note? }
-// Stored on the action; surfaces to AI for future batches.
-router.post("/_legacy/action/:id/feedback", async (req, res) => {
-  const { id } = req.params;
-  const { deviceId, helpful, note } = req.body;
-  if (!deviceId) return res.status(400).json({ error: "deviceId required" });
-  try {
-    await actionsCol(deviceId).doc(id).update({
-      feedback_helpful: helpful === true || helpful === false ? helpful : null,
-      feedback_note: note ? String(note).slice(0, 200) : null,
-      feedback_at: admin.firestore.FieldValue.serverTimestamp(),
-    });
-    return res.json({ success: true });
-  } catch (e) {
-    console.error("[fitness] action feedback:", e);
+    log.error("[fitness] muscle-trends:", e);
     return res.status(500).json({ error: "server error" });
   }
 });
@@ -5475,7 +4385,7 @@ router.get('/chat-state', async (req, res) => {
       streak: fSnap.data()?.streak || 0,
     });
   } catch (err) {
-    console.error('[fitness] /chat-state error:', err);
+    log.error('[fitness] /chat-state error:', err);
     res.status(500).json({ error: 'state failed' });
   }
 });
@@ -5486,6 +4396,8 @@ router.post("/chat", async (req, res) => {
     return res.status(400).json({ error: "deviceId and message required" });
   if (!checkChatRate(deviceId))
     return res.status(429).json({ error: "Too many messages. Wait a moment." });
+
+  const language = resolveLanguage(req);
 
   try {
     const context = await getCachedContext(deviceId);
@@ -5530,7 +4442,7 @@ router.post("/chat", async (req, res) => {
 
     const crossContext = await _readChatCrossAgent(deviceId);
 
-    const systemPrompt = [
+    const systemPrompt = appendLanguageInstruction([
       `You are an expert fitness coach inside a premium app. You have access to this user's complete training history AND live signals from sleep, mind, nutrition, water, and fasting.`,
       `User profile: goal=${_humanGoal(setup.primary_goal)}, level=${_humanLevel(setup.training_level)}, split=${_humanSplit(splitLabel === 'unstructured' ? 'none' : splitLabel)}, equipment=${_humanEquip(setup.equipment)}, injuries=${setup.injury_notes || "none"}.`,
       `Training schedule: ${trainingDaysStr}. Gym time: ${setup.gym_time || "07:00"}. Supplements: ${supplements}.`,
@@ -5539,7 +4451,7 @@ router.post("/chat", async (req, res) => {
       `Rules: Be specific and data-driven. Reference exact exercise names, weights, volumes, and dates from their data. When cross-agent signals are present (poor sleep, high anxiety, low protein, dehydration, active fast), weight them — don't just acknowledge them.`,
       `Use MEV/MAV/MRV landmarks when discussing volume. Reference progressive overload, periodization, deload needs when relevant.`,
       `Keep replies concise (2-4 sentences max, or a numbered list when steps are needed). No generic advice. No filler.`,
-    ].join("\n");
+    ].join("\n"), language);
 
     const messages = [
       { role: "system", content: systemPrompt },
@@ -5560,21 +4472,21 @@ router.post("/chat", async (req, res) => {
         role: "user",
         content: message,
         is_proactive: false,
-        is_read: true,
+        is_read: true, language,
         created_at: admin.firestore.FieldValue.serverTimestamp(),
       }),
       chatsCol(deviceId).add({
         role: "assistant",
         content: reply,
         is_proactive: false,
-        is_read: true,
+        is_read: true, language,
         created_at: admin.firestore.FieldValue.serverTimestamp(),
       }),
     ]);
 
     return res.json({ reply, message_id: aiRef.id });
   } catch (e) {
-    console.error("[fitness] chat:", e);
+    log.error("[fitness] chat:", e);
     return res.status(500).json({ error: "server error" });
   }
 });
@@ -5640,7 +4552,7 @@ router.get("/chat", async (req, res) => {
     }));
     return res.json({ messages });
   } catch (e) {
-    console.error("[fitness] chat GET:", e);
+    log.error("[fitness] chat GET:", e);
     return res.status(500).json({ error: "server error" });
   }
 });
@@ -5665,7 +4577,7 @@ router.get("/chat/unread", async (req, res) => {
     }));
     return res.json({ messages });
   } catch (e) {
-    console.error("[fitness] chat/unread:", e);
+    log.error("[fitness] chat/unread:", e);
     return res.status(500).json({ error: "server error" });
   }
 });
@@ -5686,7 +4598,7 @@ router.post("/chat/read", async (req, res) => {
     }
     return res.json({ success: true });
   } catch (e) {
-    console.error("[fitness] chat/read:", e);
+    log.error("[fitness] chat/read:", e);
     return res.status(500).json({ error: "server error" });
   }
 });
@@ -5694,12 +4606,7 @@ router.post("/chat/read", async (req, res) => {
 // ----------------------------------------------------------------
 // Hourly proactive cron
 // ----------------------------------------------------------------
-cron.schedule("0 * * * *", async () => {
-  try {
-    const now = new Date();
-    const hour = now.getHours();
-    if (hour < 6 || hour > 22) return;
-
+const _fitnessCronTick = async () => {
     const snap = await db().collection("wellness_users").limit(200).get();
     for (const userDoc2 of snap.docs) {
       const deviceId = userDoc2.id;
@@ -5707,13 +4614,19 @@ cron.schedule("0 * * * *", async () => {
         const fSnap = await fitnessDoc(deviceId).get();
         if (!fSnap.exists || !fSnap.data()?.setup?.primary_goal) continue;
 
+        // notif_enabled + DND + user-local time gate.
+        const notifCtx = await getUserNotifContext(db(), deviceId);
+        if (!notifCtx.allowsProactive) continue;
+        const hour = notifCtx.localHour;
+        if (hour < 6 || hour > 22) continue;
+
         const setup = fSnap.data().setup || {};
         const reminderHour = parseInt(
           (setup.gym_time || setup.reminder_time || "07:00").split(":")[0],
           10,
         );
         const proactiveToday = fSnap.data().proactive_today || "";
-        const today = dateStr();
+        const today = notifCtx.localDateStr;
 
         if (proactiveToday === today) continue;
 
@@ -5724,7 +4637,9 @@ cron.schedule("0 * * * *", async () => {
         const workouts = allSnap.docs.map(mapDoc);
         const streak = computeStreak(workouts);
 
-        // Streak milestone — respect global daily budget (1/day max)
+        // Streak milestone — respect global daily budget (1/day max).
+        // Compares user-LOCAL hour to setup.reminder_hour so reminders land
+        // at the user's actual chosen time, not server UTC.
         if (
           [7, 14, 30, 60, 90].includes(streak) &&
           hour === reminderHour
@@ -5740,6 +4655,7 @@ cron.schedule("0 * * * *", async () => {
             content: msg,
             is_proactive: true,
             proactive_type: "streak_milestone",
+            language: notifCtx.language,
             is_read: false,
             created_at: admin.firestore.FieldValue.serverTimestamp(),
           });
@@ -5750,9 +4666,11 @@ cron.schedule("0 * * * *", async () => {
         /* non-fatal per user */
       }
     }
-  } catch (e) {
-    console.error("[fitness] cron:", e);
-  }
-});
+};
+if (shouldRunCron()) {
+  cron.schedule("0 * * * *", withCron('fitness:hourly-milestones', _fitnessCronTick, {
+    ttlMs: 25 * 60_000,
+  }), { timezone: 'UTC' });
+}
 
 module.exports = router;

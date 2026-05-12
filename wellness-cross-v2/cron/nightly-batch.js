@@ -24,9 +24,7 @@ async function listActiveUsers() {
 
 async function nightlyBatch({ todayDate } = {}) {
   const today = todayDate || new Date().toISOString().slice(0, 10);
-  console.log(`[v2 cron] nightly batch starting for ${today}`);
   const users = await listActiveUsers();
-  console.log(`[v2 cron] ${users.length} active users`);
 
   let success = 0;
   let failed = 0;
@@ -40,7 +38,7 @@ async function nightlyBatch({ todayDate } = {}) {
           success++;
         } catch (err) {
           failed++;
-          console.error(`[v2 cron] user=${u.id} failed:`, err && err.message);
+          log.error(`[v2 cron] user=${u.id} failed:`, err && err.message);
         }
       }),
     );
@@ -58,10 +56,9 @@ async function nightlyBatch({ todayDate } = {}) {
     _server_at: Timestamp.now(),
   }, { merge: true });
 
-  console.log(`[v2 cron] done: ${success} ok / ${failed} failed · cost $${summary.total_cost_usd}`);
 
   if (summary.total_cost_usd > config.COST.MAX_DAILY_TOTAL_USD) {
-    console.error(`[v2 cron] COST GUARD TRIPPED: $${summary.total_cost_usd} > $${config.COST.MAX_DAILY_TOTAL_USD}`);
+    log.error(`[v2 cron] COST GUARD TRIPPED: $${summary.total_cost_usd} > $${config.COST.MAX_DAILY_TOTAL_USD}`);
   }
 
   return { success, failed, summary };

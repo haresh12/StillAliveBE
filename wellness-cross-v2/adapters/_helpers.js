@@ -95,7 +95,11 @@ async function fetchLogs(deviceId, agent, endDate, days) {
     .get()
     .catch(() => null);
 
-  if (!snap || snap.empty) {
+  // snap === null  → query errored (likely missing index). Try unordered fallback.
+  // snap.empty     → definitive 0 logs for this user. Don't fire a 2nd query.
+  // Removing the unconditional fallback saves ~6 wasted Firestore round trips
+  // on cold start for fresh users (one per agent).
+  if (!snap) {
     const fallback = await agentLogsCol(deviceId, agent)
       .limit(days * 4)
       .get()
@@ -109,6 +113,7 @@ async function fetchLogs(deviceId, agent, endDate, days) {
         return new Date(dt + 'T00:00:00Z').getTime() >= startTs;
       });
   }
+  if (snap.empty) return [];
 
   return snap.docs
     .map((d) => ({ id: d.id, ...d.data() }))
@@ -243,6 +248,34 @@ function buildAdapter(cfg) {
       ? componentsForToday(todayLogs, agentData)
       : {};
 
+    // ─── Rolling smoothed scores (0-100) ───────────────────────────────
+    // These are the numbers Home + Analysis surface to the user. Unlike
+    // `today.score` (null on no-log days) they're stable across days because
+    // they average over a window. Same values used everywhere → no two
+    // sources of truth for the same coach's score.
+    function avgScored(pts) {
+      const valid = pts.filter((p) => Number.isFinite(p.value));
+      if (valid.length === 0) return null;
+      return clip(Math.round(valid.reduce((s, p) => s + p.value, 0) / valid.length), 0, 100);
+    }
+    const smoothed_7d  = avgScored(last_30d.slice(-7));
+    const smoothed_30d = avgScored(last_30d);
+    const days_scored  = last_30d.filter((p) => Number.isFinite(p.value)).length;
+
+    // Trend over last 14d: compare last 3 days avg vs prior 11 days avg
+    function trendDirection() {
+      const recent = last_14d.slice(-3).filter((p) => Number.isFinite(p.value));
+      const prior  = last_14d.slice(0, 11).filter((p) => Number.isFinite(p.value));
+      if (recent.length < 2 || prior.length < 3) return 'flat';
+      const r = recent.reduce((s, p) => s + p.value, 0) / recent.length;
+      const pr = prior.reduce((s, p) => s + p.value, 0) / prior.length;
+      const d = r - pr;
+      if (d >= 4)  return 'up';
+      if (d <= -4) return 'down';
+      return 'flat';
+    }
+    const trend_direction = trendDirection();
+
     const extra = (typeof extraFields === 'function') ? extraFields(logs, logsByDate, agentData) : {};
 
     return {
@@ -254,6 +287,12 @@ function buildAdapter(cfg) {
         score: Number.isFinite(todayScore) ? clip(Math.round(todayScore), 0, 100) : null,
         components: todayComponents,
       },
+      // Rolling scores — UI reads these for the Home coach card AND the
+      // agent's own Analysis tab. Same field, same number, everywhere.
+      smoothed_7d,
+      smoothed_30d,
+      days_scored,
+      trend_direction,
       last_14d,
       last_30d,
       last_90d: daily90,

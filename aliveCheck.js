@@ -111,7 +111,7 @@ async function ensureCodeExists(deviceId) {
 
     return code;
   } catch (error) {
-    console.error('Code generation error:', error);
+    log.error('Code generation error:', error);
     return generateUniqueCode(); // Fallback
   }
 }
@@ -796,8 +796,7 @@ Respond ONLY with valid JSON:
         { role: 'system', content: `You are scoring ${name}'s wellness but writing about it like a sharp, caring friend — not a clinical report. Be warm, be real, be specific to what they actually said. No wellness-speak. No bullet points. Write in ${getLanguageName(userLanguage)}. VARY your approach each time. Respond ONLY with valid JSON. No markdown.` },
         { role: 'user', content: prompt }
       ],
-      temperature: 0.5,
-      max_tokens: 300,
+      max_completion_tokens: 300,
     });
 
     let txt = completion.choices[0].message.content.trim().replace(/```json\n?/g, '').replace(/```\n?/g, '');
@@ -812,7 +811,7 @@ Respond ONLY with valid JSON:
     throw new Error('Invalid score value');
 
   } catch (error) {
-    console.error(`AI scoring error for ${pillar}:`, error.message);
+    log.error(`AI scoring error for ${pillar}:`, error.message);
     return { score: 55, justification: 'Score estimated due to a temporary issue.' };
   }
 }
@@ -1129,15 +1128,14 @@ Respond ONLY with valid JSON:
         { role: 'system', content: `You are ${name}'s sharp, caring best friend who just read all their answers. You text them advice the way a real friend does — specific, warm, no fluff, no coach-speak. VARY your tips each time. Respond ONLY with valid JSON. No markdown.` },
         { role: 'user', content: prompt }
       ],
-      temperature: 0.85,
-      max_tokens: 150,
+      max_completion_tokens: 150,
     });
 
     let txt = completion.choices[0].message.content.trim().replace(/```json\n?/g, '').replace(/```\n?/g, '');
     const parsed = JSON.parse(txt);
     return parsed.tip || 'Take one small step forward today.';
   } catch (error) {
-    console.error('Individual tip error:', error.message);
+    log.error('Individual tip error:', error.message);
     return 'Small actions today create big changes tomorrow.';
   }
 }
@@ -1186,14 +1184,12 @@ Write 2-3 sentences max. Be specific — mention actual answers. No bullet point
         { role: 'system', content: 'You write sharp, specific internal analyst notes about wellness check-ins. No fluff. Output only the summary paragraph.' },
         { role: 'user', content: prompt }
       ],
-      temperature: 0.4,
-      max_tokens: 200,
+      max_completion_tokens: 200,
     });
     const summary = completion.choices[0].message.content.trim();
-    console.log(`📝 Session summary generated for ${name} (${pillar} ${todayPillarScore}/100)`);
     return summary;
   } catch (error) {
-    console.error('Session summary error:', error.message);
+    log.error('Session summary error:', error.message);
     // Fallback: build a basic summary from raw data
     return `${name} completed a ${pillarMeta?.name} check-in scoring ${todayPillarScore}/100. ${scoringJustification || 'No additional context.'}`;
   }
@@ -1362,8 +1358,7 @@ Respond ONLY with valid JSON:
         { role: 'system', content: 'You write viral Gen Z quotes. Be authentic, not cringe. VARY every quote. Respond ONLY with valid JSON. No markdown.' },
         { role: 'user', content: quotePrompt }
       ],
-      temperature: 0.9,
-      max_tokens: 150,
+      max_completion_tokens: 150,
     }),
     openai.chat.completions.create({
       model: 'gpt-4o-mini',
@@ -1371,8 +1366,7 @@ Respond ONLY with valid JSON:
         { role: 'system', content: 'You are Dr. Maya, a strategic wellness coach. Be specific, not generic. VARY your tips. Respond ONLY with valid JSON. No markdown.' },
         { role: 'user', content: tipsPrompt }
       ],
-      temperature: 0.8,
-      max_tokens: 350,
+      max_completion_tokens: 350,
     }),
   ]);
 
@@ -1384,7 +1378,7 @@ Respond ONLY with valid JSON:
       const parsed = JSON.parse(txt);
       if (parsed.quote) quote = parsed.quote;
       if (parsed.message) message = parsed.message;
-    } catch (e) { console.error('Quote parse err:', e.message); }
+    } catch (e) { log.error('Quote parse err:', e.message); }
   }
 
   let strategicTips = [];
@@ -1397,7 +1391,7 @@ Respond ONLY with valid JSON:
       if (Array.isArray(parsed.tips)) strategicTips = parsed.tips.slice(0, 3);
       if (parsed.weakestPillar) weakestPillar = parsed.weakestPillar;
       if (parsed.weakestBoost) weakestBoost = parsed.weakestBoost;
-    } catch (e) { console.error('Tips parse err:', e.message); }
+    } catch (e) { log.error('Tips parse err:', e.message); }
   }
 
   if (strategicTips.length === 0) {
@@ -1547,7 +1541,6 @@ Return exactly this JSON structure:
 }`;
 
   try {
-    console.log(`🤖 Generating session ${sessionNumber} (${phase.phase}) ${pillarMeta?.name} questions for ${name} in ${lang}...`);
 
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
@@ -1558,8 +1551,7 @@ Return exactly this JSON structure:
         },
         { role: 'user', content: prompt }
       ],
-      temperature: 0.88,
-      max_tokens: 1600,
+      max_completion_tokens: 1600,
     });
 
     let txt = completion.choices[0].message.content.trim().replace(/```json\n?/g, '').replace(/```\n?/g, '');
@@ -1581,11 +1573,10 @@ Return exactly this JSON structure:
     // topicsUsed: record the themes for this session (for sessionSummaries field)
     const topicsUsed = phase.themes;
 
-    console.log(`✅ Generated 9 ${phase.phase} ${pillarMeta?.name} questions for ${name} (session ${sessionNumber}) in ${lang}`);
     return { success: true, questions: parsed.questions.slice(0, 9), sessionNumber, phase: phase.phase, topicsUsed };
 
   } catch (error) {
-    console.error('Question generation error:', error.message);
+    log.error('Question generation error:', error.message);
 
     // Fallback: generate basic questions covering the phase themes
     const fallbackQ = phase.themes.slice(0, 8).map((theme, i) => ({
@@ -1838,7 +1829,6 @@ nextReveal: Under 20 words. What the next sessions will show that they literally
 }`;
 
   try {
-    console.log(`🤖 Deep analysis for ${name} in ${lang} | ${submissions.length} sessions | ${storedSessionSummaries?.length || 0} summaries stored`);
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o',
       messages: [
@@ -1858,14 +1848,12 @@ JSON only. No markdown. Write in ${lang}.`
         },
         { role: 'user', content: prompt }
       ],
-      temperature: 0.7,
-      max_tokens: 2600,
+      max_completion_tokens: 2600,
     });
 
     let txt = completion.choices[0].message.content.trim().replace(/```json\n?/g, '').replace(/```\n?/g, '');
     const parsed = JSON.parse(txt);
 
-    console.log(`✅ Analysis done for ${name} in ${getLanguageName(userLanguage)}`);
     return {
       success: true,
       analysis: {
@@ -1880,7 +1868,7 @@ JSON only. No markdown. Write in ${lang}.`
       }
     };
   } catch (error) {
-    console.error('Analysis error:', error.message);
+    log.error('Analysis error:', error.message);
     return { success: false, error: 'Unable to generate insights. Try again later.' };
   }
 };
@@ -1955,15 +1943,14 @@ Respond ONLY with valid JSON:
         { role: 'system', content: 'Respond ONLY with valid JSON. No markdown.' },
         { role: 'user', content: prompt }
       ],
-      temperature: 0.75,
-      max_tokens: 200,
+      max_completion_tokens: 200,
     });
 
     let txt = completion.choices[0].message.content.trim().replace(/```json\n?/g, '').replace(/```\n?/g, '');
     const parsed = JSON.parse(txt);
     return parsed.summary || null;
   } catch (error) {
-    console.error('Analytics summary error:', error.message);
+    log.error('Analytics summary error:', error.message);
     return null;
   }
 }
@@ -2008,7 +1995,7 @@ const checkDailyLimit = async (req, res, next) => {
     req.today = today;
     next();
   } catch (error) {
-    console.error('Rate limit check error:', error);
+    log.error('Rate limit check error:', error);
     res.status(500).json({ success: false, error: 'Failed to check rate limit' });
   }
 };
@@ -2044,7 +2031,6 @@ router.post('/profile', requireDeviceId, async (req, res) => {
 
       const updatedDoc = await docRef.get();
       const updatedProfile = updatedDoc.data().profile;
-      console.log(`✅ Profile updated: ${updatedProfile.name}${language ? ` | Language: ${language}` : ''}`);
 
       return res.json({
         success: true,
@@ -2065,7 +2051,6 @@ router.post('/profile', requireDeviceId, async (req, res) => {
 
       // ✅ AUTO-GENERATE: Code generation happens automatically
       const code = await ensureCodeExists(deviceId);
-      console.log(`🔑 Code auto-generated for Alive Check profile: ${deviceId} → ${code}`);
 
       // ✅ CROSS-SYNC: Sync code to users collection if it exists
       try {
@@ -2081,15 +2066,13 @@ router.post('/profile', requireDeviceId, async (req, res) => {
               code,
               updatedAt: admin.firestore.FieldValue.serverTimestamp()
             });
-            console.log(`✅ Code synced to users collection: ${deviceId} → ${code}`);
           } else if (userData.code !== code) {
             // User has different code - use existing one (shouldn't happen, but safety check)
-            console.log(`⚠️ Code mismatch detected, using existing code: ${userData.code}`);
           }
         }
       } catch (syncError) {
         // Non-critical error - log but don't fail profile creation
-        console.error('⚠️ Code sync to users collection failed (non-critical):', syncError.message);
+        log.error('⚠️ Code sync to users collection failed (non-critical):', syncError.message);
       }
 
       const profile = {
@@ -2124,12 +2107,11 @@ router.post('/profile', requireDeviceId, async (req, res) => {
       // Verify the profile was actually saved
       const savedDoc = await docRef.get();
       if (!savedDoc.exists) {
-        console.error('❌ Profile save failed - document not found after write');
+        log.error('❌ Profile save failed - document not found after write');
         throw new Error('Profile save failed - please try again');
       }
 
       const savedProfile = savedDoc.data().profile;
-      console.log(`✅ Profile created: ${savedProfile.name} | Code: ${savedProfile.code} | Language: ${savedProfile.language}`);
 
       return res.json({
         success: true,
@@ -2138,7 +2120,7 @@ router.post('/profile', requireDeviceId, async (req, res) => {
       });
     }
   } catch (error) {
-    console.error('Save profile error:', error);
+    log.error('Save profile error:', error);
     res.status(500).json({ success: false, error: 'Failed to save profile' });
   }
 });
@@ -2165,7 +2147,6 @@ router.get('/profile', requireDeviceId, async (req, res) => {
       const code = await ensureCodeExists(deviceId);
       await doc.ref.update({ 'profile.code': code });
       profile.code = code;
-      console.log(`✅ Code migrated for existing user: ${deviceId} → ${code}`);
     }
 
     // ✅ NEW: Set leaderboardConsent default if missing
@@ -2180,7 +2161,7 @@ router.get('/profile', requireDeviceId, async (req, res) => {
       hasProfile: !!profile?.profileCompleted
     });
   } catch (error) {
-    console.error('Get profile error:', error);
+    log.error('Get profile error:', error);
     res.status(500).json({
       success: false,
       error: 'Failed to get profile'
@@ -2222,7 +2203,7 @@ router.get('/questions', requireDeviceId, async (req, res) => {
       topicsUsed: result.topicsUsed || [],
     });
   } catch (error) {
-    console.error('Get questions error:', error);
+    log.error('Get questions error:', error);
     res.status(500).json({ success: false, error: 'Failed to generate questions. Please try again.' });
   }
 });
@@ -2247,13 +2228,11 @@ router.post('/submit', requireDeviceId, checkDailyLimit, async (req, res) => {
     const profile = data.profile;
     const submissions = data.submissions || [];
 
-    console.log(`🤖 Processing ${profile.name}'s ${pillar} check-in in ${getLanguageName(profile.language || 'en')}...`);
 
     // STEP 1: AI scores the pillar
     const { score: todayPillarScore, justification: scoringJustification } = await aiScorePillar(
       profile, pillar, questions, answers, submissions
     );
-    console.log(`📊 AI ${pillar} score: ${todayPillarScore}/100`);
 
     // STEP 2: Calculate Alive Score
     const aliveResult = calculateAliveScore(pillar, todayPillarScore, submissions);
@@ -2272,7 +2251,6 @@ router.post('/submit', requireDeviceId, checkDailyLimit, async (req, res) => {
     // STEP 3: Vibe based on todayPillarScore
     const { vibe, emoji } = getVibeFromScore(todayPillarScore);
 
-    console.log(`🎯 Pillar: ${todayPillarScore} | Alive: ${aliveScore} (${aliveScoreComplete ? 'complete' : `${pillarsCheckedCount}/4`}) | ${vibe}`);
 
     // STEP 4: Pride moments
     const prideMoments = detectPrideMoment(pillar, todayPillarScore, aliveScore, submissions);
@@ -2378,7 +2356,6 @@ router.post('/submit', requireDeviceId, checkDailyLimit, async (req, res) => {
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
-    console.log(`✅ ${profile.name} → Pillar=${todayPillarScore} | Alive=${aliveScore} (${aliveScoreComplete ? 'complete' : 'partial'}) | ${pillar} | ${vibe}`);
 
     res.json({
       success: true,
@@ -2415,7 +2392,7 @@ router.post('/submit', requireDeviceId, checkDailyLimit, async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Submit check error:', error);
+    log.error('Submit check error:', error);
     res.status(500).json({ success: false, error: 'Failed to submit check. Please try again.' });
   }
 });
@@ -2445,7 +2422,7 @@ router.get('/history', requireDeviceId, async (req, res) => {
       profile: data.profile || null
     });
   } catch (error) {
-    console.error('Get history error:', error);
+    log.error('Get history error:', error);
     res.status(500).json({ success: false, error: 'Failed to get history' });
   }
 });
@@ -2639,7 +2616,7 @@ router.get('/analytics', requireDeviceId, async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Get analytics error:', error);
+    log.error('Get analytics error:', error);
     res.status(500).json({ success: false, error: 'Failed to get analytics' });
   }
 });
@@ -2668,7 +2645,7 @@ router.get('/ai-analysis', requireDeviceId, async (req, res) => {
       totalChecks: submissions.length,
     });
   } catch (error) {
-    console.error('Get AI analysis error:', error);
+    log.error('Get AI analysis error:', error);
     res.status(500).json({ success: false, error: 'Failed to load analysis.' });
   }
 });
@@ -2714,7 +2691,7 @@ router.post('/ai-analysis', requireDeviceId, async (req, res) => {
 
     res.json({ success: true, ...analysisResult, profile: { name: profile.name } });
   } catch (error) {
-    console.error('AI analysis error:', error);
+    log.error('AI analysis error:', error);
     res.status(500).json({ success: false, error: 'Failed to generate AI insights. Please try again.' });
   }
 });
@@ -2754,7 +2731,7 @@ router.get('/today-count', requireDeviceId, async (req, res) => {
       date: today
     });
   } catch (error) {
-    console.error('Get today count error:', error);
+    log.error('Get today count error:', error);
     res.status(500).json({ success: false, error: 'Failed to get count' });
   }
 });
@@ -2819,7 +2796,7 @@ router.get('/stats', requireDeviceId, async (req, res) => {
 
     res.json({ success: true, dayStreak, longestStreak, totalCheckIns });
   } catch (error) {
-    console.error('Stats error:', error);
+    log.error('Stats error:', error);
     res.status(500).json({ success: false, error: 'Failed to load stats' });
   }
 });
@@ -2828,10 +2805,9 @@ router.delete('/history', requireDeviceId, async (req, res) => {
   try {
     const { deviceId } = req;
     await getDb().collection('aliveChecks').doc(deviceId).delete();
-    console.log(`🗑️ All data deleted for ${deviceId}`);
     res.json({ success: true, message: 'All data deleted successfully' });
   } catch (error) {
-    console.error('Delete history error:', error);
+    log.error('Delete history error:', error);
     res.status(500).json({ success: false, error: 'Failed to delete history' });
   }
 });
@@ -2909,7 +2885,6 @@ router.get('/leaderboard', async (req, res) => {
       rank: index + 1,
     }));
 
-    console.log(`🏆 Leaderboard: ${top10.length} complete users from ${leaderboard.length} eligible`);
 
     res.json({
       success: true,
@@ -2920,7 +2895,7 @@ router.get('/leaderboard', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Leaderboard error:', error);
+    log.error('Leaderboard error:', error);
     res.status(500).json({ success: false, error: 'Failed to fetch leaderboard' });
   }
 });
@@ -3095,7 +3070,7 @@ router.post('/circles/add', requireDeviceId, async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Add to circle error:', error);
+    log.error('Add to circle error:', error);
     res.status(500).json({
       success: false,
       error: 'Failed to add friend. Please try again.'
@@ -3168,7 +3143,7 @@ router.get('/circles/list', requireDeviceId, async (req, res) => {
             status: 'active'
           };
         } catch (error) {
-          console.error(`Error fetching circle member:`, error);
+          log.error(`Error fetching circle member:`, error);
           return { ...connection, status: 'error', latestAliveScore: null, aliveScoreComplete: false };
         }
       })
@@ -3183,7 +3158,7 @@ router.get('/circles/list', requireDeviceId, async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Get circle error:', error);
+    log.error('Get circle error:', error);
     res.status(500).json({ success: false, error: 'Failed to get circle' });
   }
 });
@@ -3216,7 +3191,6 @@ router.delete('/circles/:connectionId', requireDeviceId, async (req, res) => {
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
-    console.log(`🗑️ ${data.profile.name} removed ${connectionToRemove.targetName} from circle`);
 
     res.json({
       success: true,
@@ -3224,7 +3198,7 @@ router.delete('/circles/:connectionId', requireDeviceId, async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Remove from circle error:', error);
+    log.error('Remove from circle error:', error);
     res.status(500).json({ success: false, error: 'Failed to remove from circle' });
   }
 });
