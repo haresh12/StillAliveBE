@@ -15,7 +15,7 @@ router.get('/agent-scores/:deviceId', async (req, res) => {
     const scores = await readAllAgentScores(deviceId);
     return res.json({ ok: true, scores });
   } catch (e) {
-    console.error('[v2/agent-scores]', e);
+    log.error('[v2/agent-scores]', e);
     return res.status(500).json({ error: 'agent_scores_failed', message: String(e.message || e) });
   }
 });

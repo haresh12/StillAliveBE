@@ -2556,6 +2556,15 @@ app.get('/api/subscription/status', async (req, res) => {
 // Eligible = trialUsedAt is null AND user has never had a premium subscription.
 // Once trialUsedAt is set, it NEVER unsets — one trial per user, forever.
 app.get('/api/subscription/trial-eligibility', async (req, res) => {
+  // Context-aware fail policy: when the FE calls this during paywall render
+  // (header `x-context: paywall_render`), we fail CLOSED on error — hiding
+  // the trial UI is preferable to promising one Apple won't honor (which
+  // produces bad App Store reviews). Everywhere else, fail OPEN — losing
+  // analytics data isn't worth blocking the user. Apple's RC SDK check is
+  // the primary gate either way.
+  const context = String(req.headers['x-context'] || '').toLowerCase();
+  const failClosed = context === 'paywall_render';
+
   try {
     const deviceId = req.headers['x-device-id'] || req.query.deviceId;
     if (!deviceId) {
@@ -2586,8 +2595,7 @@ app.get('/api/subscription/trial-eligibility', async (req, res) => {
     res.json({ success: true, eligible: true });
   } catch (err) {
     log.error('❌ Trial eligibility error:', err);
-    // Fail-open: if backend errors, let Apple's check decide.
-    res.json({ success: true, eligible: true, reason: 'backend_error' });
+    res.json({ success: true, eligible: !failClosed, reason: failClosed ? 'backend_error_fail_closed' : 'backend_error' });
   }
 });
 
@@ -2608,6 +2616,34 @@ app.post('/api/webhooks/revenuecat', express.json({ type: '*/*' }), async (req, 
     const event = req.body?.event;
     if (!event) {
       return res.status(400).json({ success: false, error: 'No event in body' });
+    }
+
+    // ── Idempotency ────────────────────────────────────────────────────────
+    // RC retries webhooks on 5xx and at-least-once delivery. Same event.id can
+    // arrive multiple times — dedupe via Firestore. `create()` is atomic and
+    // errors with code 6 (ALREADY_EXISTS) if the doc is already there, so two
+    // concurrent attempts can't both claim ownership. We keep the marker for
+    // 30 days (RC retries cap out long before then).
+    const eventId = event.id || event.event_id;
+    if (eventId) {
+      try {
+        await db.collection('webhook_events').doc(String(eventId)).create({
+          source: 'revenuecat',
+          type: event.type || null,
+          receivedAt: admin.firestore.FieldValue.serverTimestamp(),
+          // TTL marker — index in Firestore Console with a TTL policy on this
+          // field so the collection auto-prunes; safe to leave unset and
+          // sweep with a cron if no TTL configured.
+          expiresAt: admin.firestore.Timestamp.fromMillis(Date.now() + 30 * 24 * 60 * 60 * 1000),
+        });
+      } catch (e) {
+        if (e?.code === 6 /* ALREADY_EXISTS */ || /already exists/i.test(e?.message || '')) {
+          return res.json({ success: true, note: 'duplicate_event_ignored', event_id: eventId });
+        }
+        // Any other Firestore error — log and continue so the webhook isn't
+        // permanently blocked by a Firestore hiccup.
+        log.warn('[RC webhook] idempotency check failed (continuing):', e?.message);
+      }
     }
 
     const {
@@ -2727,13 +2763,21 @@ app.post('/api/webhooks/revenuecat', express.json({ type: '*/*' }), async (req, 
         break;
 
       case 'TRIAL_CANCELLED':
-      case 'CANCELLATION':
-        // Keep access until expiration — don't flip isPremium yet; expiry handles it
+      case 'CANCELLATION': {
+        // Default: keep access until expiration — they paid for it. Don't flip
+        // isPremium yet; EXPIRATION will handle it. EXCEPT for refunds, where
+        // Apple yanks access immediately and we MUST revoke now (RC usually
+        // sends a paired EXPIRATION but timing can drift). Treat anything
+        // refund-like as immediate revoke.
+        const reasonStr = (cancel_reason || '').toString().toUpperCase();
+        const isRefund = reasonStr.includes('REFUND') || reasonStr === 'BILLING_ERROR';
         setSub({
           willRenew: false,
           cancelReason: cancel_reason || null,
+          ...(isRefund ? { isPremium: false, isTrial: false, refundedAt: now } : {}),
         });
         break;
+      }
 
       case 'EXPIRATION':
         setSub({

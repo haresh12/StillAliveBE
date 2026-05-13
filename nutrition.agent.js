@@ -216,7 +216,11 @@ function parseUSDAFoods(foods, dataTypeRank) {
 
 async function searchUSDA(query) {
   try {
-    const apiKey = process.env.USDA_API_KEY || 'DEMO_KEY';
+    const apiKey = process.env.USDA_API_KEY;
+    if (!apiKey) {
+      log.warn('[nutrition] USDA_API_KEY not set — skipping USDA search');
+      return [];
+    }
     const q      = query.trim();
     const base   = `https://api.nal.usda.gov/fdc/v1/foods/search?api_key=${apiKey}`;
     const whole  = `&dataType=Foundation,SR%20Legacy`;
