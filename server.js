@@ -2473,7 +2473,7 @@ app.post('/api/subscription/sync', async (req, res) => {
     } = req.body;
 
     const now = admin.firestore.FieldValue.serverTimestamp();
-    const userRef = db.collection('users').doc(deviceId);
+    const userRef = db.collection('wellness_users').doc(deviceId);
 
     const subscriptionData = {
       isPremium: Boolean(isPremium),
@@ -2535,7 +2535,7 @@ app.get('/api/subscription/status', async (req, res) => {
       return res.status(400).json({ success: false, error: 'x-device-id header required' });
     }
 
-    const userDoc = await db.collection('users').doc(deviceId).get();
+    const userDoc = await db.collection('wellness_users').doc(deviceId).get();
     if (!userDoc.exists) {
       return res.status(404).json({ success: false, error: 'User not found' });
     }
@@ -2572,7 +2572,7 @@ app.get('/api/subscription/trial-eligibility', async (req, res) => {
       return res.json({ success: true, eligible: true, reason: 'no_device_id' });
     }
 
-    const userDoc = await db.collection('users').doc(deviceId).get();
+    const userDoc = await db.collection('wellness_users').doc(deviceId).get();
     if (!userDoc.exists) {
       // No user record yet — fresh install, eligible.
       return res.json({ success: true, eligible: true, reason: 'no_user_record' });
@@ -2665,12 +2665,12 @@ app.post('/api/webhooks/revenuecat', express.json({ type: '*/*' }), async (req, 
     let userRef = null;
 
     // First try: app_user_id is our deviceId (if we aliased it)
-    const directDoc = await db.collection('users').doc(app_user_id).get();
+    const directDoc = await db.collection('wellness_users').doc(app_user_id).get();
     if (directDoc.exists) {
       userRef = directDoc.ref;
     } else {
       // Second try: find by rcAppUserId field
-      const snap = await db.collection('users')
+      const snap = await db.collection('wellness_users')
         .where('subscription.rcAppUserId', '==', app_user_id)
         .limit(1)
         .get();
