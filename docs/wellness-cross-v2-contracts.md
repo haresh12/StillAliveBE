@@ -1,3 +1,15 @@
+# 🚨 RULE #1 — NEVER DEPLOY WITHOUT ASKING 3× IN BIG CAPS
+
+Before any `git push`, `fly deploy`, App Store / TestFlight submit, or anything that hits real users — **ASK 3 SEPARATE TIMES IN BIG CAPS** and wait for explicit "yes" each time:
+
+1. **"ARE YOU SURE YOU WANT TO DEPLOY TO PRODUCTION?"**
+2. **"THIS WILL AFFECT REAL USERS. CONFIRM AGAIN?"**
+3. **"FINAL CONFIRMATION — DEPLOY NOW?"**
+
+Any non-yes → STOP. See `/CLAUDE.md` for full rule.
+
+---
+
 # wellness-cross-v2 — API contracts
 
 **Source of truth for every endpoint shape. The FE team builds against these.**

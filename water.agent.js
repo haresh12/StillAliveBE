@@ -12,6 +12,7 @@
 // ═══════════════════════════════════════════════════════════════
 
 const express = require('express');
+const { AI } = require('./lib/ai/models');
 const router  = express.Router();
 const admin   = require('firebase-admin');
 const { OpenAI } = require('openai');
@@ -944,7 +945,7 @@ async function generateAnalysisInsight(setup, stats, hydrationScore, crossAgentI
     ].join('\n');
 
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4.1-mini',
+      model: AI.CHAT_STREAM,
       max_completion_tokens: 220,
       messages: [{ role: 'system', content: prompt }],
     });
@@ -2448,7 +2449,7 @@ router.get('/analysis', async (req, res) => {
     if (cached) {
       ai_reads = cached;
     } else {
-      ai_reads = await _waterAnalytics.generateAiReads(allLogs, target_ml, hydrationScore, openai);
+      ai_reads = await _waterAnalytics.generateAiReads(allLogs, target_ml, hydrationScore, openai, deviceId);
       if (ai_reads.champion || ai_reads.drag || ai_reads.pattern) {
         waterDoc(deviceId).set({
           ai_reads_cache_v2: { [aiCacheKey]: ai_reads, _generated_at: new Date().toISOString() },
@@ -2541,8 +2542,23 @@ router.get('/analysis', async (req, res) => {
       return out;
     })();
     const { computeStandardOutputs } = require('./lib/score-lifetime');
+
+    // HK blend: hydration logged in Apple Health (water bottles, third-party
+    // trackers) fills no-log days. Manual sips still win on days they exist.
+    const { blendQualityByDate } = require('./lib/healthkit/blend');
+    const { merged: blendedQualityByDate } = await blendQualityByDate({
+      coach: 'water',
+      manualQualityByDate: lifetimeQualityByDate,
+      deviceId,
+      anchorDateStr: anchor.anchorDateStr,
+      todayDateStr: win.todayDate,
+      db: admin.firestore(),
+      scoringContext: { goalMl: target_ml },
+      utcOffsetMinutes: anchor.utcOffsetMinutes || 0,
+    });
+
     const std = computeStandardOutputs({
-      qualityByDate: lifetimeQualityByDate,
+      qualityByDate: blendedQualityByDate,
       todayDate: win.todayDate,
       anchorDate: anchor.anchorDateStr,
       daysSinceAnchor: win.daysSinceAnchor,
@@ -2572,7 +2588,13 @@ router.get('/analysis', async (req, res) => {
       best_day,
       worst_day,
       ai_reads,
-      aha_moments,
+      aha_moments: await (async () => {
+        try {
+          const { buildHKAhaCards } = require('./lib/healthkit/aha-cards');
+          const hkCards = await buildHKAhaCards({ coach: 'water', deviceId, db: admin.firestore() });
+          return hkCards.length ? [...hkCards, ...(aha_moments || [])] : aha_moments;
+        } catch { return aha_moments; }
+      })(),
       observations,
       personal_formula,
       day_one_insight,
@@ -2735,7 +2757,7 @@ router.post('/chat', async (req, res) => {
       streak_milestone:'User just hit a streak milestone. Acknowledge in one sentence — no more. Then redirect to the next move.',
     };
 
-    const systemPrompt = appendLanguageInstruction([
+    let systemPrompt = appendLanguageInstruction([
       'You are the Water Coach inside Pulse — a precision wellness app.',
       'You coach behavior change using the user\'s actual numbers. You know IOM weight-based goals, beverage hydration multipliers, cortisol-window front-loading, taper timing, pace-gap math, sweat-rate recovery, and cross-agent links with sleep and mood.',
       '',
@@ -2757,8 +2779,15 @@ router.post('/chat', async (req, res) => {
       proactive_context ? `\nTHREAD: ${threadNotes[proactive_context] || `User is replying to a proactive message (type: ${proactive_context}).`}` : '',
     ].filter(Boolean).join('\n'), language);
 
+    // Silent HK enrichment — water samples, sweat-rate cues when granted.
+    try {
+      const { buildHKContext, appendHKContext } = require('./lib/healthkit/context-builder');
+      const hkBlock = await buildHKContext({ db: admin.firestore(), deviceId, coach: 'water', days: 7 });
+      systemPrompt = appendHKContext(systemPrompt, hkBlock);
+    } catch { /* best-effort */ }
+
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4.1-mini',
+      model: AI.CHAT_STREAM,
       max_completion_tokens: 175,
       messages: [
         { role: 'system', content: systemPrompt },
@@ -2792,7 +2821,7 @@ _mountChatStreamWater(router, {
   agentName: 'water',
   openai, admin, chatsCol,
   rateLimitCheck: checkChatRate,
-  model: 'gpt-4.1-mini', maxTokens: 175,
+  model: AI.CHAT_STREAM, maxTokens: 175,
   buildPrompt: async (deviceId /* , message */) => {
     const context = await getCachedContext(deviceId);
     const systemPrompt = `You are the Water Coach inside Pulse. Use exact numbers from context. Under 100 words. Sharp performance coach. Banned openings: praise/validation.\n\nUSER DATA:\n${context}`;

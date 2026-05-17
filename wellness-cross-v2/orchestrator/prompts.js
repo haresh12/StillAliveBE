@@ -69,6 +69,12 @@ Strict rules:
     "Solid sleep + steady mood — you're 6 pts above last week."
     "Your sleep dropped 12 pts vs your usual — that's the main drag today."
   - If a slot lacks evidence, return null for that slot rather than padding.
+  - If the input has a "healthkit" object, those values are FACTUAL auto-
+    imported readings (Apple Watch, MyFitnessPal write-through, etc.). You
+    may cite them directly in headlines/body — that's exactly the point of
+    having them. Phrase as plain English ("4.6h asleep last night", "HRV ran
+    18% below your 7-day baseline"). Never invent HK numbers — quote only
+    keys that actually appear under "healthkit".
 
 Style anti-patterns (banned):
   - "Great job!" / "Keep it up!" — no cheerleading

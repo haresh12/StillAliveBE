@@ -3,6 +3,7 @@ require('dotenv').config();
 // Made global so every module can reference `log.*` without an import.
 globalThis.log = require('./lib/log');
 const express = require('express');
+const { AI } = require('./lib/ai/models');
 const cors = require('cors');
 const admin = require('firebase-admin');
 const { Resend } = require('resend');
@@ -110,6 +111,8 @@ app.use('/api/personalize', require('./personalize.agent'));
 app.use('/api/community', require('./community'));
 app.use('/api/wellness',  require('./wellness.cross'));
 app.use('/api/wellness/v2', require('./wellness-cross-v2'));
+app.use('/api/v2/healthkit', require('./healthkit.agent'));
+app.use('/api/v2/starter-insights', require('./starter-insights.agent'));
 app.use('/webhooks/revenuecat', require('./lib/revenuecat-webhook'));
 app.use('/api/analytics', require('./lib/analytics-api'));
 
@@ -159,7 +162,7 @@ const generateCode = () => {
 const ensureCodeExists = async (deviceId) => {
   try {
     // Check users collection first
-    const userDoc = await db.collection('users').doc(deviceId).get();
+    const userDoc = await db.collection('wellness_users').doc(deviceId).get();
     if (userDoc.exists && userDoc.data().code) {
       return userDoc.data().code;
     }
@@ -177,7 +180,7 @@ const ensureCodeExists = async (deviceId) => {
     // Ensure uniqueness across BOTH collections
     while (attempts < 10) {
       const [usersQuery, aliveQuery] = await Promise.all([
-        db.collection('users').where('code', '==', code).limit(1).get(),
+        db.collection('wellness_users').where('code', '==', code).limit(1).get(),
         db.collection('aliveChecks').where('profile.code', '==', code).limit(1).get()
       ]);
 
@@ -203,16 +206,18 @@ const getUserByDeviceId = async (deviceId) => {
   }
 
   try {
-    const userRef = db.collection('users').doc(deviceId);
+    const userRef = db.collection('wellness_users').doc(deviceId);
     const userDoc = await userRef.get();
 
     if (userDoc.exists) {
+      log.info(`[user] hit  device=${deviceId.slice(0, 8)} collection=wellness_users isNew=false`);
       return {
         success: true,
         user: { id: deviceId, ...userDoc.data() },
         isNew: false
       };
     }
+    log.info(`[user] new  device=${deviceId.slice(0, 8)} collection=wellness_users — creating`);
 
     // ✅ NEW: Auto-generate code when creating user
     const code = await ensureCodeExists(deviceId);
@@ -537,7 +542,7 @@ const checkMissedCheckIns = async () => {
 
     // ✅ PERFORMANCE: Only fetch users with lastCheckIn
     const usersSnapshot = await db
-      .collection('users')
+      .collection('wellness_users')
       .where('lastCheckIn', '!=', null)
       .get();
 
@@ -735,7 +740,7 @@ const getWellnessDeviceId = (req, res, next) => {
 
 app.post('/api/users/me', getDeviceId, async (req, res) => {
   try {
-    const userDoc = await db.collection('users').doc(req.deviceId).get();
+    const userDoc = await db.collection('wellness_users').doc(req.deviceId).get();
 
     if (!userDoc.exists) {
       return res.status(404).json({ success: false, error: 'User not found' });
@@ -796,6 +801,7 @@ app.post('/api/wellness/signup', getWellnessDeviceId, async (req, res) => {
       termsAccepted = false,
       agentStates = null,
     } = req.body || {};
+    log.info(`[wellness-signup] device=${req.deviceId.slice(0,8)} name=${String(name).slice(0,20)} age=${ageGroup} gender=${gender} terms=${termsAccepted}`);
 
     const trimmedName = String(name).trim();
     const trimmedAgeGroup = String(ageGroup).trim();
@@ -893,14 +899,19 @@ app.post('/api/wellness/me', async (req, res) => {
   try {
     const { deviceId } = req.body || {};
     if (!deviceId || typeof deviceId !== 'string' || deviceId.trim().length < 4) {
+      log.warn('[wellness-me] rejected — bad deviceId');
       return res.status(400).json({ success: false, error: 'deviceId required' });
     }
-    const doc = await db.collection('wellness_users').doc(deviceId.trim()).get();
+    const did = deviceId.trim();
+    log.info(`[wellness-me] device=${did.slice(0,8)}`);
+    const doc = await db.collection('wellness_users').doc(did).get();
     if (!doc.exists) {
+      log.info(`[wellness-me] 404 device=${did.slice(0,8)} — no wellness_users doc`);
       return res.status(404).json({ success: false, error: 'No account found' });
     }
     const data = doc.data();
     if (!data.onboardingCompleted) {
+      log.info(`[wellness-me] 404 device=${did.slice(0,8)} — onboardingCompleted=false`);
       return res.status(404).json({ success: false, error: 'Onboarding not completed' });
     }
     // Migration safety: any pre-feature user lacks agentStates → return
@@ -1047,7 +1058,7 @@ app.post('/api/users/update-name', getDeviceId, async (req, res) => {
       return res.status(400).json({ success: false, error: 'Display name required' });
     }
 
-    const userRef = db.collection('users').doc(req.deviceId);
+    const userRef = db.collection('wellness_users').doc(req.deviceId);
 
     await userRef.update({
       displayName: displayName.trim(),
@@ -1095,7 +1106,7 @@ app.post('/api/users/checkin-frequency', getDeviceId, async (req, res) => {
       });
     }
 
-    const userRef = db.collection('users').doc(req.deviceId);
+    const userRef = db.collection('wellness_users').doc(req.deviceId);
 
     await userRef.update({
       checkInFrequency: days,
@@ -1118,7 +1129,7 @@ app.post('/api/users/checkin-frequency', getDeviceId, async (req, res) => {
 // ✅ UNIFIED: Generate code and sync to BOTH collections
 app.post('/api/users/generate-code', getDeviceId, async (req, res) => {
   try {
-    const userRef = db.collection('users').doc(req.deviceId);
+    const userRef = db.collection('wellness_users').doc(req.deviceId);
     const userDoc = await userRef.get();
 
     if (!userDoc.exists) {
@@ -1171,7 +1182,7 @@ app.post('/api/users/generate-code', getDeviceId, async (req, res) => {
 /* REMOVED: check-in and check-in status routes
 app.post('/api/users/checkin', getDeviceId, async (req, res) => {
   try {
-    const userRef = db.collection('users').doc(req.deviceId);
+    const userRef = db.collection('wellness_users').doc(req.deviceId);
     const userDoc = await userRef.get();
 
     if (!userDoc.exists) {
@@ -1242,7 +1253,7 @@ app.post('/api/users/checkin', getDeviceId, async (req, res) => {
 
 app.post('/api/users/checkin/status', getDeviceId, async (req, res) => {
   try {
-    const userDoc = await db.collection('users').doc(req.deviceId).get();
+    const userDoc = await db.collection('wellness_users').doc(req.deviceId).get();
 
     if (!userDoc.exists) {
       return res.status(404).json({ success: false, error: 'User not found' });
@@ -1297,7 +1308,7 @@ app.post('/api/squad/add-member', getDeviceId, async (req, res) => {
       return res.status(400).json({ success: false, error: 'Email required' });
     }
 
-    const userRef = db.collection('users').doc(req.deviceId);
+    const userRef = db.collection('wellness_users').doc(req.deviceId);
     const userDoc = await userRef.get();
 
     if (!userDoc.exists) {
@@ -1356,7 +1367,7 @@ app.post('/api/squad/add-member', getDeviceId, async (req, res) => {
 
 app.post('/api/squad/members', getDeviceId, async (req, res) => {
   try {
-    const userDoc = await db.collection('users').doc(req.deviceId).get();
+    const userDoc = await db.collection('wellness_users').doc(req.deviceId).get();
 
     if (!userDoc.exists) {
       return res.status(404).json({ success: false, error: 'User not found' });
@@ -1378,7 +1389,7 @@ app.post('/api/squad/members/:id/remove', getDeviceId, async (req, res) => {
   try {
     const { id } = req.params;
 
-    const userRef = db.collection('users').doc(req.deviceId);
+    const userRef = db.collection('wellness_users').doc(req.deviceId);
     const userDoc = await userRef.get();
 
     if (!userDoc.exists) {
@@ -1440,7 +1451,7 @@ app.post('/api/watching/add', async (req, res) => {
 
     // ✅ Search ONLY in users collection (Still Alive daily check-ins)
     const targetSnapshot = await db
-      .collection('users')
+      .collection('wellness_users')
       .where('code', '==', codeUpper)
       .limit(1)
       .get();
@@ -1470,7 +1481,7 @@ app.post('/api/watching/add', async (req, res) => {
     }
 
     const watchRef = db.collection('watching').doc();
-    const targetUserRef = db.collection('users').doc(targetUserId);
+    const targetUserRef = db.collection('wellness_users').doc(targetUserId);
 
     const watchData = {
       watcherId: deviceId,
@@ -1527,7 +1538,7 @@ app.get('/api/watching/list', async (req, res) => {
     for (const doc of watchingSnapshot.docs) {
       const data = doc.data();
 
-      const targetUserDoc = await db.collection('users').doc(data.targetUserId).get();
+      const targetUserDoc = await db.collection('wellness_users').doc(data.targetUserId).get();
 
       if (!targetUserDoc.exists) {
         continue;
@@ -1612,7 +1623,7 @@ app.delete('/api/watching/:id', async (req, res) => {
         throw err;
       }
 
-      const targetUserRef = db.collection('users').doc(watchData.targetUserId);
+      const targetUserRef = db.collection('wellness_users').doc(watchData.targetUserId);
       const targetSnap = await t.get(targetUserRef);
 
       t.delete(watchRef);
@@ -1671,7 +1682,7 @@ app.post('/api/account/delete', getDeviceId, async (req, res) => {
         if (!watchDoc.exists) return;
 
         const watchData = watchDoc.data();
-        const targetUserRef = db.collection('users').doc(watchData.targetUserId);
+        const targetUserRef = db.collection('wellness_users').doc(watchData.targetUserId);
         const targetSnap = await t.get(targetUserRef);
 
         t.delete(watchRef);
@@ -1689,7 +1700,7 @@ app.post('/api/account/delete', getDeviceId, async (req, res) => {
 
     await Promise.all(cleanupWatcherPromises);
 
-    await db.collection('users').doc(deviceId).delete();
+    await db.collection('wellness_users').doc(deviceId).delete();
 
     const targetSnapshot = await db
       .collection('watching')
@@ -2145,7 +2156,7 @@ app.post('/api/mirror/checkin', async (req, res) => {
     try {
       const ctx = buildMirrorContext({ moodLevel }, aliveData || {}, note);
       const completion = await mirrorOpenAI.chat.completions.create({
-        model: 'gpt-4o-mini', max_completion_tokens: 120,
+        model: AI.REASONING_FAST, max_completion_tokens: 120,
         messages: [
           { role: 'system', content: MIRROR_SYSTEM_PROMPT },
           { role: 'user', content: ctx },
@@ -2286,7 +2297,7 @@ Check-ins (oldest → newest):
 ${history}`;
 
     const completion = await mirrorOpenAI.chat.completions.create({
-      model: 'gpt-4o-mini',
+      model: AI.REASONING_FAST,
       max_completion_tokens: 480,
       messages: [
         { role: 'system', content: 'You are Mirror — the one friend who has read every single check-in and tells the truth. Return exactly 6 labeled lines: PATTERN:, QUOTE:, HIDDEN:, TRUTH:, CONCLUSION:, GOALS:. No bullets. No intro. No extra text. Each line starts with its label. GOALS: is always the last line — write 3-5 short goals separated by " | ", specific to their data. Be specific throughout — reference actual counts, days, words they wrote. The goal: make them say "how did it know that?" Sound like a person paying close attention, not an AI.' },
@@ -2870,7 +2881,7 @@ app.get('/api/admin/users', async (req, res) => {
     const filterPremium = req.query.isPremium;
     const filterTrial   = req.query.isTrial;
 
-    const snap = await db.collection('users').orderBy('createdAt', 'desc').limit(limit).get();
+    const snap = await db.collection('wellness_users').orderBy('createdAt', 'desc').limit(limit).get();
     const now  = new Date();
 
     const users = snap.docs.map(doc => {
@@ -2939,7 +2950,7 @@ app.get('/api/admin/users/:deviceId', async (req, res) => {
     return res.status(401).json({ success: false, error: 'Unauthorized' });
   }
   try {
-    const doc = await db.collection('users').doc(req.params.deviceId).get();
+    const doc = await db.collection('wellness_users').doc(req.params.deviceId).get();
     if (!doc.exists) return res.status(404).json({ success: false, error: 'User not found' });
 
     const d   = doc.data();

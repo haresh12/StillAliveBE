@@ -7,6 +7,7 @@
 // ═══════════════════════════════════════════════════════════════
 
 const express = require('express');
+const { AI } = require('./lib/ai/models');
 const router  = express.Router();
 const admin   = require('firebase-admin');
 const { OpenAI } = require('openai');
@@ -2528,6 +2529,14 @@ router.post('/chat', async (req, res) => {
     if (proactive_context) {
       systemContext += `\n\n[THREAD CONTEXT: User is replying to a proactive message about: ${proactive_context}. Continue that thread naturally.]`;
     }
+
+    // Silent HK enrichment — weight, activity, water signals when granted.
+    try {
+      const { buildHKContext, appendHKContext } = require('./lib/healthkit/context-builder');
+      const hkBlock = await buildHKContext({ db: admin.firestore(), deviceId, coach: 'nutrition', days: 7 });
+      systemContext = appendHKContext(systemContext, hkBlock);
+    } catch { /* best-effort */ }
+
     // Language directive is appended LAST so the cached English prefix
     // stays bytewise identical → prompt cache still hits.
     systemContext = appendLanguageInstruction(systemContext, language);
@@ -3271,7 +3280,7 @@ router.post('/describe/transcribe', async (req, res) => {
     const file = await OpenAI.toFile(buffer, `audio.${ext}`);
     const result = await openai.audio.transcriptions.create({
       file,
-      model:    'gpt-4o-transcribe',  // 4.1% WER, 22% better than whisper-1, same price
+      model: AI.TRANSCRIBE,  // 4.1% WER, 22% better than whisper-1, same price
       language: 'en',
       response_format: 'json',
     });
@@ -3281,7 +3290,7 @@ router.post('/describe/transcribe', async (req, res) => {
     res.json({
       transcript,
       latency_ms: Date.now() - t0,
-      model: 'gpt-4o-transcribe',
+      model: AI.TRANSCRIBE,
     });
   } catch (err) {
     log.error('[nutrition] /describe/transcribe error:', err);
@@ -3309,7 +3318,7 @@ router.post('/describe', async (req, res) => {
       const file   = await OpenAI.toFile(buffer, `audio.${ext}`);
       const result = await openai.audio.transcriptions.create({
         file,
-        model: 'gpt-4o-transcribe',
+        model: AI.TRANSCRIBE,
         language: 'en',
         response_format: 'json',
       });
@@ -4291,16 +4300,39 @@ router.get('/analysis', async (req, res) => {
     })();
 
     const { computeStandardOutputs } = require('./lib/score-lifetime');
+
+    // HK blend: a day with dietary energy in Apple Health (e.g., MyFitnessPal
+    // write-through) counts as a logged day. Manual nutrition logs still win.
+    const { blendQualityByDate } = require('./lib/healthkit/blend');
+    const { merged: blendedQualityByDate } = await blendQualityByDate({
+      coach: 'nutrition',
+      manualQualityByDate: lifetimeQualityByDate,
+      deviceId,
+      anchorDateStr: anchor.anchorDateStr,
+      todayDateStr: win.todayDate,
+      db: admin.firestore(),
+      scoringContext: { calorieTarget: calTargetLifetime },
+      utcOffsetMinutes: anchor.utcOffsetMinutes || 0,
+    });
+
     const std = computeStandardOutputs({
-      qualityByDate: lifetimeQualityByDate,
+      qualityByDate: blendedQualityByDate,
       todayDate: win.todayDate,
       anchorDate: anchor.anchorDateStr,
       daysSinceAnchor: win.daysSinceAnchor,
     });
 
+    let aha_moments = Array.isArray(payload?.aha_moments) ? payload.aha_moments : [];
+    try {
+      const { buildHKAhaCards } = require('./lib/healthkit/aha-cards');
+      const hkCards = await buildHKAhaCards({ coach: 'nutrition', deviceId, db: admin.firestore() });
+      if (hkCards.length) aha_moments = [...hkCards, ...aha_moments];
+    } catch { /* best-effort */ }
+
     res.set('Cache-Control', 'private, max-age=60');
     res.json({
       ...payload,
+      aha_moments,
       effective_start_date: win.effectiveStartDate,
       effective_days: win.effectiveDays,
       days_since_anchor: win.daysSinceAnchor,
@@ -4677,5 +4709,20 @@ router.get('/actions', async (req, res) => {
   }
 });
 
+// ─── GET /wearable-insights ─────────────────────────────────────────────
+router.get('/wearable-insights', async (req, res) => {
+  const deviceId = (req.query.deviceId || '').toString();
+  if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+  try {
+    const { buildWearableInsights } = require('./lib/healthkit/wearable-insights');
+    const days = Math.min(parseInt(req.query.days || '30', 10) || 30, 90);
+    const payload = await buildWearableInsights({
+      db: admin.firestore(), deviceId, coach: 'nutrition', days,
+    });
+    res.json(payload);
+  } catch (err) {
+    res.json({ has_data: false, cards: [] });
+  }
+});
 
 module.exports = router;

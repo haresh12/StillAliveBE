@@ -1,3 +1,15 @@
+# 🚨 RULE #1 — NEVER DEPLOY WITHOUT ASKING 3× IN BIG CAPS
+
+Before any `git push`, `fly deploy`, App Store / TestFlight submit, or anything that hits real users — **ASK 3 SEPARATE TIMES IN BIG CAPS** and wait for explicit "yes" each time:
+
+1. **"ARE YOU SURE YOU WANT TO DEPLOY TO PRODUCTION?"**
+2. **"THIS WILL AFFECT REAL USERS. CONFIRM AGAIN?"**
+3. **"FINAL CONFIRMATION — DEPLOY NOW?"**
+
+Any non-yes → STOP. See `/CLAUDE.md` for full rule.
+
+---
+
 # Wellness Score Algorithm — v2 spec
 
 **The single most important piece of math in the V2 backend. This is what users will see at the top of Home tab every day.**

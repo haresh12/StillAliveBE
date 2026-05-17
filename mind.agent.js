@@ -7,6 +7,7 @@
 // ═══════════════════════════════════════════════════════════════
 
 const express = require('express');
+const { AI } = require('./lib/ai/models');
 const router  = express.Router();
 const admin   = require('firebase-admin');
 const { OpenAI } = require('openai');
@@ -728,15 +729,37 @@ router.get('/analysis', async (req, res) => {
     })();
 
     const { computeStandardOutputs } = require('./lib/score-lifetime');
+
+    // HK blend: a mindful session in Apple Health counts the same as a manual
+    // mood log on a no-log day. Manual mood logs still win where present.
+    const { blendQualityByDate } = require('./lib/healthkit/blend');
+    const { merged: blendedQualityByDate } = await blendQualityByDate({
+      coach: 'mind',
+      manualQualityByDate: lifetimeQualityByDate,
+      deviceId,
+      anchorDateStr: anchor.anchorDateStr,
+      todayDateStr: win.todayDate,
+      db: admin.firestore(),
+      utcOffsetMinutes: anchor.utcOffsetMinutes || 0,
+    });
+
     const std = computeStandardOutputs({
-      qualityByDate: lifetimeQualityByDate,
+      qualityByDate: blendedQualityByDate,
       todayDate: win.todayDate,
       anchorDate: anchor.anchorDateStr,
       daysSinceAnchor: win.daysSinceAnchor,
     });
 
+    let aha_moments = Array.isArray(body.aha_moments) ? body.aha_moments : [];
+    try {
+      const { buildHKAhaCards } = require('./lib/healthkit/aha-cards');
+      const hkCards = await buildHKAhaCards({ coach: 'mind', deviceId, db: admin.firestore() });
+      if (hkCards.length) aha_moments = [...hkCards, ...aha_moments];
+    } catch { /* best-effort */ }
+
     res.json({
       ...body,
+      aha_moments,
       effective_start_date: win.effectiveStartDate,
       effective_days: effectiveDays,
       days_since_anchor: win.daysSinceAnchor,
@@ -766,7 +789,7 @@ router.post('/reframe', async (req, res) => {
     if (crisis) return res.json(crisisEnvelope(region));
 
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
+      model: AI.REASONING_FAST,
       response_format: { type: 'json_object' },
       max_completion_tokens: 220,
       messages: [
@@ -977,7 +1000,14 @@ router.post('/chat', async (req, res) => {
     }
 
     // Build personalised system context, then append language directive
-    const systemContext = appendLanguageInstruction(await buildContext(deviceId), language);
+    let systemContext = appendLanguageInstruction(await buildContext(deviceId), language);
+
+    // Silent HK enrichment — objective signals (HRV, sleep) when granted.
+    try {
+      const { buildHKContext, appendHKContext } = require('./lib/healthkit/context-builder');
+      const hkBlock = await buildHKContext({ db: admin.firestore(), deviceId, coach: 'mind', days: 7 });
+      systemContext = appendHKContext(systemContext, hkBlock);
+    } catch { /* best-effort */ }
 
     // Fetch chat history for conversation continuity (last 14 messages)
     const historySnap = await chatsCol(deviceId)
@@ -990,7 +1020,7 @@ router.post('/chat', async (req, res) => {
     }));
 
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4.1',
+      model: AI.REASONING_PRO,
       max_completion_tokens: 1000,
       messages: [
         { role: 'system', content: systemContext },
@@ -1023,7 +1053,7 @@ const { mountChatStream: _mountChatStreamMind } = require('./lib/chat-stream');
 _mountChatStreamMind(router, {
   agentName: 'mind',
   openai, admin, chatsCol,
-  model: 'gpt-4.1',
+  model: AI.REASONING_PRO,
   maxTokens: 650,
   buildPrompt: async (deviceId /* , message */) => {
     const systemPrompt = await buildContext(deviceId);
@@ -1218,7 +1248,7 @@ Return ONLY valid JSON — an array of ${count} objects. No markdown, no explana
 
   try {
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4.1',
+      model: AI.REASONING_PRO,
       max_completion_tokens: 700,
       messages: [{ role: 'user', content: prompt }],
     });
@@ -1959,7 +1989,7 @@ RULES:
 
   try {
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4.1',
+      model: AI.REASONING_PRO,
       max_completion_tokens: 420,
       messages: [{ role: 'user', content: prompt }],
     });
@@ -2158,7 +2188,7 @@ Write ONE short message (2-3 sentences max). Rules:
 
   try {
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4.1',
+      model: AI.REASONING_PRO,
       max_completion_tokens: 160,
       messages: [{ role: 'user', content: prompt }],
     });
@@ -2185,7 +2215,7 @@ Write ONE short message (2-3 sentences max). Rules:
 
   try {
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4.1',
+      model: AI.REASONING_PRO,
       max_completion_tokens: 130,
       messages: [{ role: 'user', content: prompt }],
     });
@@ -2233,7 +2263,7 @@ Return only the message text, no quotes, no explanation.`;
 
   try {
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4.1',
+      model: AI.REASONING_PRO,
       max_completion_tokens: 120,
       messages: [{ role: 'user', content: prompt }],
     });
@@ -2379,5 +2409,20 @@ if (shouldRunCron()) {
   }), { timezone: 'UTC' });
 }
 
+// ─── GET /wearable-insights ─────────────────────────────────────────────
+router.get('/wearable-insights', async (req, res) => {
+  const deviceId = (req.query.deviceId || '').toString();
+  if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+  try {
+    const { buildWearableInsights } = require('./lib/healthkit/wearable-insights');
+    const days = Math.min(parseInt(req.query.days || '30', 10) || 30, 90);
+    const payload = await buildWearableInsights({
+      db: admin.firestore(), deviceId, coach: 'mind', days,
+    });
+    res.json(payload);
+  } catch (err) {
+    res.json({ has_data: false, cards: [] });
+  }
+});
 
 module.exports = router;

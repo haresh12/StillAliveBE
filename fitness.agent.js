@@ -13,6 +13,7 @@
 // ================================================================
 
 const express = require("express");
+const { AI } = require('./lib/ai/models');
 const router = express.Router();
 const admin = require("firebase-admin");
 const { OpenAI } = require("openai");
@@ -1204,7 +1205,7 @@ async function generateActionBatch(
   let weeklyFocus = "";
   try {
     const aiRes = await openai.chat.completions.create({
-      model: "gpt-4.1-mini",
+      model: AI.CHAT_STREAM,
       max_completion_tokens: 900,
       response_format: { type: "json_object" },
       messages: [{ role: "system", content: prompt }],
@@ -1619,7 +1620,7 @@ async function generateWorkoutDebrief(deviceId, workoutId, workout) {
     const vol = round(workout.total_volume_kg || 0, 0);
     const userMsg = `Just finished: ${exerciseNames}. Volume: ${vol}kg.${prs.length ? ` New PRs: ${prs.join(", ")}.` : ""} Give a 1-2 sentence post-workout insight from my data. Be specific, no filler.`;
     const completion = await openai.chat.completions.create({
-      model: "gpt-4.1-mini",
+      model: AI.CHAT_STREAM,
       messages: [
         { role: "system", content: context },
         { role: "user", content: userMsg },
@@ -2383,7 +2384,7 @@ router.post("/describe", async (req, res) => {
       images: [],
       responseSchema,
       maxOutputTokens: 500,
-      model: 'gemini-2.5-flash',
+      model: AI.VISION_PRIMARY,
       label: 'fitness-describe',
     });
     if (parsed) usedModel = 'gemini-2.5-flash';
@@ -2392,7 +2393,7 @@ router.post("/describe", async (req, res) => {
     if (!parsed) {
       try {
         const completion = await openai.chat.completions.create({
-          model: "gpt-4.1-mini",
+          model: AI.CHAT_STREAM,
           max_completion_tokens: 500,
           messages: [
             { role: "system", content: systemPrompt },
@@ -2480,7 +2481,7 @@ router.post("/describe", async (req, res) => {
         ].join('\n');
 
         const cleanup = await openai.chat.completions.create({
-          model: 'gpt-4o-mini',
+          model: AI.REASONING_FAST,
           max_completion_tokens: 200,
           messages: [
             { role: 'system', content: cleanupSystem },
@@ -2497,7 +2498,7 @@ router.post("/describe", async (req, res) => {
             images: [],
             responseSchema,
             maxOutputTokens: 500,
-            model: 'gemini-2.5-flash',
+            model: AI.VISION_PRIMARY,
             label: 'fitness-describe-cleanup',
           });
           if (reParsed) {
@@ -3438,7 +3439,7 @@ async function _generateFitnessV2Insights(deviceId, range, ctx) {
       images: [],
       responseSchema,
       maxOutputTokens: 800,
-      model: 'gemini-2.5-flash',
+      model: AI.VISION_PRIMARY,
       label: 'fitness-analysis-v2',
     });
   } catch { /* fall through */ }
@@ -3446,7 +3447,7 @@ async function _generateFitnessV2Insights(deviceId, range, ctx) {
   if (!parsed) {
     try {
       const completion = await openai.chat.completions.create({
-        model: 'gpt-4.1-mini',
+        model: AI.CHAT_STREAM,
         max_completion_tokens: 800,
         messages: [
           { role: 'system', content: systemPrompt },
@@ -3869,8 +3870,22 @@ router.get("/analysis", async (req, res) => {
       return out;
     })();
     const { computeStandardOutputs } = require('./lib/score-lifetime');
+
+    // HK blend: Apple Watch workouts / steps / active calories fill no-log days.
+    // Manual workout days untouched.
+    const { blendQualityByDate } = require('./lib/healthkit/blend');
+    const { merged: dayQualityByDateBlended } = await blendQualityByDate({
+      coach: 'fitness',
+      manualQualityByDate: dayQualityByDate,
+      deviceId,
+      anchorDateStr: anchor.anchorDateStr,
+      todayDateStr: win.todayDate,
+      db: admin.firestore(),
+      utcOffsetMinutes: anchor.utcOffsetMinutes || 0,
+    });
+
     const std = computeStandardOutputs({
-      qualityByDate: dayQualityByDate,
+      qualityByDate: dayQualityByDateBlended,
       todayDate: win.todayDate,
       anchorDate: anchor.anchorDateStr,
       daysSinceAnchor: win.daysSinceAnchor,
@@ -3914,7 +3929,13 @@ router.get("/analysis", async (req, res) => {
       best_day,
       worst_day,
       ai_reads,
-      aha_moments,
+      aha_moments: await (async () => {
+        try {
+          const { buildHKAhaCards } = require('./lib/healthkit/aha-cards');
+          const hkCards = await buildHKAhaCards({ coach: 'fitness', deviceId, db: admin.firestore() });
+          return hkCards.length ? [...hkCards, ...(aha_moments || [])] : aha_moments;
+        } catch { return aha_moments; }
+      })(),
       hero_insight: { headline },
       stats: {
         days_logged, total_logs: days_logged, total_volume_kg, total_sets,
@@ -4442,7 +4463,7 @@ router.post("/chat", async (req, res) => {
 
     const crossContext = await _readChatCrossAgent(deviceId);
 
-    const systemPrompt = appendLanguageInstruction([
+    let systemPrompt = appendLanguageInstruction([
       `You are an expert fitness coach inside a premium app. You have access to this user's complete training history AND live signals from sleep, mind, nutrition, water, and fasting.`,
       `User profile: goal=${_humanGoal(setup.primary_goal)}, level=${_humanLevel(setup.training_level)}, split=${_humanSplit(splitLabel === 'unstructured' ? 'none' : splitLabel)}, equipment=${_humanEquip(setup.equipment)}, injuries=${setup.injury_notes || "none"}.`,
       `Training schedule: ${trainingDaysStr}. Gym time: ${setup.gym_time || "07:00"}. Supplements: ${supplements}.`,
@@ -4453,6 +4474,13 @@ router.post("/chat", async (req, res) => {
       `Keep replies concise (2-4 sentences max, or a numbered list when steps are needed). No generic advice. No filler.`,
     ].join("\n"), language);
 
+    // Silent HK enrichment — steps, active energy, RHR when granted.
+    try {
+      const { buildHKContext, appendHKContext } = require('./lib/healthkit/context-builder');
+      const hkBlock = await buildHKContext({ db: admin.firestore(), deviceId, coach: 'fitness', days: 7 });
+      systemPrompt = appendHKContext(systemPrompt, hkBlock);
+    } catch { /* best-effort */ }
+
     const messages = [
       { role: "system", content: systemPrompt },
       ...history.slice(-12),
@@ -4460,7 +4488,7 @@ router.post("/chat", async (req, res) => {
     ];
 
     const aiRes = await openai.chat.completions.create({
-      model: "gpt-4.1-mini",
+      model: AI.CHAT_STREAM,
       max_completion_tokens: 400,
       messages,
     });
@@ -4532,7 +4560,16 @@ _mountChatStreamFitness(router, {
       `Use MEV/MAV/MRV landmarks when discussing volume. Reference progressive overload, periodization, deload needs when relevant.`,
       `Keep replies concise (2-4 sentences max, or a numbered list when steps are needed). No generic advice. No filler.`,
     ].join("\n");
-    return { systemPrompt, history };
+
+    // Silent HK enrichment for streaming chat too.
+    let enriched = systemPrompt;
+    try {
+      const { buildHKContext, appendHKContext } = require('./lib/healthkit/context-builder');
+      const hkBlock = await buildHKContext({ db: admin.firestore(), deviceId, coach: 'fitness', days: 7 });
+      enriched = appendHKContext(systemPrompt, hkBlock);
+    } catch { /* best-effort */ }
+
+    return { systemPrompt: enriched, history };
   },
 });
 
@@ -4672,5 +4709,21 @@ if (shouldRunCron()) {
     ttlMs: 25 * 60_000,
   }), { timezone: 'UTC' });
 }
+
+// ─── GET /wearable-insights ─────────────────────────────────────────────
+router.get('/wearable-insights', async (req, res) => {
+  const deviceId = (req.query.deviceId || '').toString();
+  if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+  try {
+    const { buildWearableInsights } = require('./lib/healthkit/wearable-insights');
+    const days = Math.min(parseInt(req.query.days || '30', 10) || 30, 90);
+    const payload = await buildWearableInsights({
+      db: admin.firestore(), deviceId, coach: 'fitness', days,
+    });
+    res.json(payload);
+  } catch (err) {
+    res.json({ has_data: false, cards: [] });
+  }
+});
 
 module.exports = router;

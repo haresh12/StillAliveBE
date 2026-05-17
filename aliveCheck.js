@@ -14,6 +14,7 @@
 // ============================================
 
 const express = require('express');
+const { AI } = require('./lib/ai/models');
 const router = express.Router();
 const admin = require('firebase-admin');
 const { OpenAI } = require('openai');
@@ -80,7 +81,7 @@ async function ensureCodeExists(deviceId) {
     const db = getDb();
 
     // Check Still Alive users collection first
-    const userDoc = await db.collection('users').doc(deviceId).get();
+    const userDoc = await db.collection('wellness_users').doc(deviceId).get();
     if (userDoc.exists && userDoc.data().code) {
       return userDoc.data().code;
     }
@@ -93,7 +94,7 @@ async function ensureCodeExists(deviceId) {
     while (attempts < 10) {
       const [aliveCheckQuery, userQuery] = await Promise.all([
         db.collection('aliveChecks').where('profile.code', '==', code).limit(1).get(),
-        db.collection('users').where('code', '==', code).limit(1).get()
+        db.collection('wellness_users').where('code', '==', code).limit(1).get()
       ]);
 
       if (aliveCheckQuery.empty && userQuery.empty) {
@@ -106,7 +107,7 @@ async function ensureCodeExists(deviceId) {
 
     // Save to users collection for consistency
     if (userDoc.exists) {
-      await db.collection('users').doc(deviceId).update({ code });
+      await db.collection('wellness_users').doc(deviceId).update({ code });
     }
 
     return code;
@@ -791,7 +792,7 @@ Respond ONLY with valid JSON:
 
   try {
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
+      model: AI.REASONING_FAST,
       messages: [
         { role: 'system', content: `You are scoring ${name}'s wellness but writing about it like a sharp, caring friend — not a clinical report. Be warm, be real, be specific to what they actually said. No wellness-speak. No bullet points. Write in ${getLanguageName(userLanguage)}. VARY your approach each time. Respond ONLY with valid JSON. No markdown.` },
         { role: 'user', content: prompt }
@@ -1123,7 +1124,7 @@ Respond ONLY with valid JSON:
 
   try {
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
+      model: AI.REASONING_FAST,
       messages: [
         { role: 'system', content: `You are ${name}'s sharp, caring best friend who just read all their answers. You text them advice the way a real friend does — specific, warm, no fluff, no coach-speak. VARY your tips each time. Respond ONLY with valid JSON. No markdown.` },
         { role: 'user', content: prompt }
@@ -1179,7 +1180,7 @@ Write 2-3 sentences max. Be specific — mention actual answers. No bullet point
 
   try {
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
+      model: AI.REASONING_FAST,
       messages: [
         { role: 'system', content: 'You write sharp, specific internal analyst notes about wellness check-ins. No fluff. Output only the summary paragraph.' },
         { role: 'user', content: prompt }
@@ -1353,7 +1354,7 @@ Respond ONLY with valid JSON:
 
   const [quoteRes, tipsRes] = await Promise.allSettled([
     openai.chat.completions.create({
-      model: 'gpt-4o-mini',
+      model: AI.REASONING_FAST,
       messages: [
         { role: 'system', content: 'You write viral Gen Z quotes. Be authentic, not cringe. VARY every quote. Respond ONLY with valid JSON. No markdown.' },
         { role: 'user', content: quotePrompt }
@@ -1361,7 +1362,7 @@ Respond ONLY with valid JSON:
       max_completion_tokens: 150,
     }),
     openai.chat.completions.create({
-      model: 'gpt-4o-mini',
+      model: AI.REASONING_FAST,
       messages: [
         { role: 'system', content: 'You are Dr. Maya, a strategic wellness coach. Be specific, not generic. VARY your tips. Respond ONLY with valid JSON. No markdown.' },
         { role: 'user', content: tipsPrompt }
@@ -1543,7 +1544,7 @@ Return exactly this JSON structure:
   try {
 
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
+      model: AI.REASONING_FAST,
       messages: [
         {
           role: 'system',
@@ -1830,7 +1831,7 @@ nextReveal: Under 20 words. What the next sessions will show that they literally
 
   try {
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4o',
+      model: AI.REASONING_PRO,
       messages: [
         {
           role: 'system',
@@ -1938,7 +1939,7 @@ Respond ONLY with valid JSON:
 {"summary": "2-3 sentences in ${getLanguageName(userLanguage)}"}`;
 
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
+      model: AI.REASONING_FAST,
       messages: [
         { role: 'system', content: 'Respond ONLY with valid JSON. No markdown.' },
         { role: 'user', content: prompt }
@@ -2054,7 +2055,7 @@ router.post('/profile', requireDeviceId, async (req, res) => {
 
       // ✅ CROSS-SYNC: Sync code to users collection if it exists
       try {
-        const userRef = getDb().collection('users').doc(deviceId);
+        const userRef = getDb().collection('wellness_users').doc(deviceId);
         const userDoc = await userRef.get();
 
         if (userDoc.exists) {

@@ -13,6 +13,7 @@
 // ================================================================
 
 const express = require('express');
+const { AI } = require('./lib/ai/models');
 const router  = express.Router();
 const admin   = require('firebase-admin');
 const { OpenAI } = require('openai');
@@ -615,7 +616,7 @@ router.post('/setup', async (req, res) => {
       const context = await buildFastingContext(deviceId);
       const batchKey = `${dateStr()}_${Date.now()}`;
       const actRes  = await openai.chat.completions.create({
-        model: 'gpt-4.1-mini',
+        model: AI.CHAT_STREAM,
         max_completion_tokens: 420,
         messages: [{
           role: 'system',
@@ -1898,7 +1899,7 @@ router.get('/analysis', async (req, res) => {
     if (cachedReads?.key === aiCacheKey) {
       ai_reads = { champion: cachedReads.champion, drag: cachedReads.drag, pattern: cachedReads.pattern };
     } else {
-      ai_reads = await generateAiReads(sessions, setup, rangeMeta, fasting_score, openai);
+      ai_reads = await generateAiReads(sessions, setup, rangeMeta, fasting_score, openai, deviceId);
       if (ai_reads.champion || ai_reads.drag || ai_reads.pattern) {
         const existingEntries = data.ai_reads_cache?.entries || {};
         fastingDoc(deviceId).update({
@@ -2327,7 +2328,7 @@ async function generateActionBatch(
     .join('\n');
 
   const actRes = await openai.chat.completions.create({
-    model: 'gpt-4.1-mini',
+    model: AI.CHAT_STREAM,
     max_completion_tokens: 650,
     messages: [
       { role: 'system', content: systemPrompt },
@@ -2719,14 +2720,22 @@ router.post('/chat', async (req, res) => {
       .filter(m => m.content && m.content.trim())
       .map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content }));
 
+    // Silent HK enrichment — sleep / HRV / weight signals when granted.
+    let fullSystem = `CONTEXT:\n${context}\n\n${systemPrompt}`;
+    try {
+      const { buildHKContext, appendHKContext } = require('./lib/healthkit/context-builder');
+      const hkBlock = await buildHKContext({ db: admin.firestore(), deviceId, coach: 'fasting', days: 7 });
+      fullSystem = appendHKContext(fullSystem, hkBlock);
+    } catch { /* best-effort */ }
+
     const messages = [
-      { role: 'system', content: appendLanguageInstruction(`CONTEXT:\n${context}\n\n${systemPrompt}`, language) },
+      { role: 'system', content: appendLanguageInstruction(fullSystem, language) },
       ...history.slice(-10),
       { role: 'user', content: message },
     ];
 
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4.1',
+      model: AI.REASONING_PRO,
       max_completion_tokens: 220,
       messages,
     });
@@ -2765,13 +2774,19 @@ _mountChatStreamFasting(router, {
   agentName: 'fasting',
   openai, admin, chatsCol,
   rateLimitCheck: checkChatRate,
-  model: 'gpt-4.1', maxTokens: 220,
+  model: AI.REASONING_PRO, maxTokens: 220,
   buildPrompt: async (deviceId, message, { proactive_context } = {}) => {
     const context = await getCachedContext(deviceId);
     let systemPrompt = `CONTEXT:\n${context}\n\nYou are the Pulse Fasting Coach. Tight, precise, max 140 words. Reference exact hours/streak/water/sleep numbers. Sound human, never robotic.`;
     if (proactive_context) {
       systemPrompt += `\n\n[THREAD CONTEXT] User is following up on a coach message of type: ${proactive_context}. Acknowledge briefly then focus on what they asked.`;
     }
+    // Silent HK enrichment for streaming chat too.
+    try {
+      const { buildHKContext, appendHKContext } = require('./lib/healthkit/context-builder');
+      const hkBlock = await buildHKContext({ db: admin.firestore(), deviceId, coach: 'fasting', days: 7 });
+      systemPrompt = appendHKContext(systemPrompt, hkBlock);
+    } catch { /* best-effort */ }
     const histSnap = await chatsCol(deviceId).orderBy('created_at', 'desc').limit(12).get();
     const history = histSnap.docs
       .map(d => d.data()).reverse()

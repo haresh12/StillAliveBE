@@ -7,7 +7,7 @@
 const { callLLM } = require('../llm/llm-provider');
 const { EXECUTOR_SYSTEM, EXECUTOR_SCHEMA } = require('./prompts');
 
-function buildExecutorInput({ pack, wellness, anomalies, top_correlations, plan_slots }) {
+function buildExecutorInput({ pack, wellness, anomalies, top_correlations, plan_slots, healthkit }) {
   return JSON.stringify({
     profile: pack.profile,
     summary: pack.summary,
@@ -44,11 +44,37 @@ function buildExecutorInput({ pack, wellness, anomalies, top_correlations, plan_
       id: c.id, pair: c.pair, agents: c.agents, r: c.r, n: c.n, lag: c.lag,
       direction: c.direction, plain_english: c.plain_english, evidence: c.evidence,
     })),
+    // Apple Health auto-imported signals per coach. Only keys with data
+    // appear, so the executor never invents numbers. Omitted entirely when
+    // the user hasn't granted HK.
+    healthkit: healthkit && Object.keys(healthkit).length ? healthkit : undefined,
     plan_slots,
   });
 }
 
-async function execute({ pack, wellness, anomalies, top_correlations, plan_slots, language }) {
+async function loadHealthKitRollup(deviceId) {
+  if (!deviceId) return {};
+  try {
+    const admin = require('firebase-admin');
+    const { buildHKContext } = require('../../lib/healthkit/context-builder');
+    const coaches = ['sleep', 'mind', 'fitness', 'nutrition', 'water', 'fasting'];
+    const blocks = await Promise.all(
+      coaches.map((c) =>
+        buildHKContext({ db: admin.firestore(), deviceId, coach: c, days: 7 }).catch(() => ''),
+      ),
+    );
+    const out = {};
+    coaches.forEach((c, i) => {
+      const b = blocks[i] && blocks[i].trim();
+      if (b) out[c] = b.replace(/^\[HK\]\s*/, '');
+    });
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+async function execute({ pack, wellness, anomalies, top_correlations, plan_slots, language, deviceId }) {
   // Cold-start path — deterministic content (no LLM, faster, free).
   if (pack.summary.tier <= 1 || wellness.is_warm_start) {
     return {
@@ -57,7 +83,11 @@ async function execute({ pack, wellness, anomalies, top_correlations, plan_slots
     };
   }
 
-  const userPrompt = buildExecutorInput({ pack, wellness, anomalies, top_correlations, plan_slots });
+  // Best-effort HealthKit rollup — empty object when HK isn't granted.
+  const resolvedDeviceId = deviceId || (pack && pack.profile && pack.profile.deviceId);
+  const healthkit = await loadHealthKitRollup(resolvedDeviceId);
+
+  const userPrompt = buildExecutorInput({ pack, wellness, anomalies, top_correlations, plan_slots, healthkit });
   try {
     const { content, usage } = await callLLM({
       role: 'executor',

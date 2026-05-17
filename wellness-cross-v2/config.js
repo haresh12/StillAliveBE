@@ -3,7 +3,13 @@
  *
  * Central config: model IDs, weights, thresholds, TTLs.
  * Single source of truth — no magic numbers anywhere else in the module.
+ *
+ * Model IDs are sourced from lib/ai/models.js so we keep ONE registry for
+ * the whole codebase. Don't hard-code model strings here — change them in
+ * lib/ai/models.js and everything points at the new model on next boot.
  */
+
+const { AI } = require('../lib/ai/models');
 
 module.exports = {
   // ---- Module identity ----
@@ -101,26 +107,27 @@ module.exports = {
   },
 
   // ---- LLM models ----
+  // Names are sourced from lib/ai/models.js (the single canonical registry).
+  // Change the registry to flip everyone at once.
   LLM: {
     PLANNER: {
       provider: 'gemini',
-      model: 'gemini-2.5-flash',
-      temperature: undefined,             // never set — newer models reject
+      model: AI.VISION_PRIMARY,            // gemini-3-flash — fast plan synthesis
+      temperature: undefined,              // never set — newer models reject
       max_completion_tokens: 800,
       timeout_ms: 8000,
     },
     EXECUTOR: {
       provider: 'gemini',
-      model: 'gemini-2.5-pro',
+      model: AI.VISION_DEEP,               // gemini-3.1-pro — deep cross-coach narratives
       temperature: undefined,
       max_completion_tokens: 4000,
       timeout_ms: 15000,
     },
     VALIDATOR: {
       // OpenAI for provider diversity vs Gemini executor (independent verification).
-      // gpt-5.4-nano matches the project's fast-tier model in lib/model-router.js.
       provider: 'openai',
-      model: 'gpt-5.4-nano',
+      model: AI.VALIDATOR,                 // gpt-5.4-nano — cheapest validator
       temperature: undefined,
       max_completion_tokens: 400,
       timeout_ms: 8000,

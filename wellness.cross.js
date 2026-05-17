@@ -4,6 +4,7 @@
 // Cross-agent intelligence layer: tiered cascade + LLM jobs.
 // ════════════════════════════════════════════════════════════════════
 const express = require('express');
+const { AI } = require('./lib/ai/models');
 const router  = express.Router();
 const cron    = require('node-cron');
 const admin   = require('firebase-admin');
@@ -45,6 +46,7 @@ const {
   listReports,
 } = require('./lib/reports-engine');
 const { getOrGenerateLetter } = require('./lib/coach-letter');
+const { withHKEnrichment, HK_PROMPT_RULE } = require('./lib/healthkit/analytics-helper');
 
 // ─── In-memory cache (5-min TTL) ────────────────────────────────────
 const cache = new Map();
@@ -769,7 +771,17 @@ async function fireCrossAgentProactives() {
         if (!agentChat[targetAgent]) continue;
 
         const userName = userData.name || '';
-        const basePrompt = `You are a ${targetAgent} wellness coach in an app. Send ONE short proactive message (2-3 sentences max) to ${userName || 'the user'} about this cross-agent pattern you detected: ${spike}. Be direct and specific. Mention the exact data. End with one practical action they can take right now. No fluff, no emoji, no greeting.`;
+        // HK silent enrichment — if the user has wearables granted, the LLM
+        // sees their objective HK signals (sleep hours, HRV, steps) and can
+        // cite them verbatim instead of relying only on the manual spike.
+        const hkPayload = await withHKEnrichment({
+          deviceId,
+          coach: targetAgent,
+          payload: { spike, target_agent: targetAgent, user_name: userName || null },
+          days: 7,
+          admin,
+        });
+        const basePrompt = `You are a ${targetAgent} wellness coach in an app. Send ONE short proactive message (2-3 sentences max) to ${userName || 'the user'} about this cross-agent pattern: ${spike}. Be direct and specific. If the payload below has a \`healthkit\` field, weave one of those exact numbers into the message naturally — do not say "your watch" or "Apple Health". End with one practical action they can take right now. No fluff, no emoji, no greeting.\n\n${HK_PROMPT_RULE}\n\nPayload: ${hkPayload}`;
         // Append language directive so message arrives in the user's language.
         // Falls through to English when language='en' (no extra tokens).
         const prompt = appendLanguageInstruction(basePrompt, notifCtx.language);
@@ -777,7 +789,7 @@ async function fireCrossAgentProactives() {
         // Run chat write + user-doc update inside a transaction so we never
         // double-charge OpenAI without persisting the dedup flag.
         const completion = await _openai.chat.completions.create({
-          model:                 'gpt-4.1-mini',
+          model: AI.CHAT_STREAM,
           max_completion_tokens: 120,
           messages:              [{ role: 'user', content: prompt }],
         });

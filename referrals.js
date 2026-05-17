@@ -65,7 +65,7 @@ const getUserDisplayName = async (deviceId) => {
   try {
     const aliveDoc = await db.collection('aliveChecks').doc(deviceId).get();
     if (aliveDoc.exists && aliveDoc.data().profile?.name) return aliveDoc.data().profile.name;
-    const userDoc = await db.collection('users').doc(deviceId).get();
+    const userDoc = await db.collection('wellness_users').doc(deviceId).get();
     if (userDoc.exists && userDoc.data().displayName && userDoc.data().displayName !== 'User') return userDoc.data().displayName;
     return null;
   } catch { return null; }
@@ -76,7 +76,7 @@ const getUserCode = async (deviceId) => {
   try {
     const aliveDoc = await db.collection('aliveChecks').doc(deviceId).get();
     if (aliveDoc.exists && aliveDoc.data().profile?.code) return aliveDoc.data().profile.code;
-    const userDoc = await db.collection('users').doc(deviceId).get();
+    const userDoc = await db.collection('wellness_users').doc(deviceId).get();
     if (userDoc.exists && userDoc.data().code) return userDoc.data().code;
     return null;
   } catch { return null; }
@@ -183,7 +183,7 @@ router.post('/validate-code', async (req, res) => {
 
     const db = getDb();
     const [usersQuery, aliveQuery] = await Promise.all([
-      db.collection('users').where('code', '==', trimmedCode).limit(1).get(),
+      db.collection('wellness_users').where('code', '==', trimmedCode).limit(1).get(),
       db.collection('aliveChecks').where('profile.code', '==', trimmedCode).limit(1).get(),
     ]);
 
@@ -226,7 +226,7 @@ router.post('/track', requireDeviceId, async (req, res) => {
     if (!existing.empty) return res.status(400).json({ success: false, error: 'Referral already recorded for this device' });
 
     const [usersQuery, aliveQuery] = await Promise.all([
-      db.collection('users').where('code', '==', trimmedCode).limit(1).get(),
+      db.collection('wellness_users').where('code', '==', trimmedCode).limit(1).get(),
       db.collection('aliveChecks').where('profile.code', '==', trimmedCode).limit(1).get(),
     ]);
 

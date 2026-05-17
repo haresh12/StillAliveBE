@@ -14,6 +14,7 @@
 // ═══════════════════════════════════════════════════════════════
 
 const express = require('express');
+const { AI } = require('./lib/ai/models');
 const router  = express.Router();
 const admin   = require('firebase-admin');
 const { OpenAI } = require('openai');
@@ -911,15 +912,40 @@ router.get('/analysis', async (req, res) => {
     })();
 
     const { computeStandardOutputs } = require('./lib/score-lifetime');
+
+    // HK blend: fill gap days where Apple Health has sleep stages but no manual log.
+    // No-op for users without HK granted (zero entries → no changes).
+    const { blendQualityByDate } = require('./lib/healthkit/blend');
+    const { merged: blendedQualityByDate, hkSynthDates } = await blendQualityByDate({
+      coach: 'sleep',
+      manualQualityByDate: lifetimeQualityByDate,
+      deviceId,
+      anchorDateStr: anchor.anchorDateStr,
+      todayDateStr: win.todayDate,
+      db: admin.firestore(),
+      scoringContext: { targetHours: target },
+      utcOffsetMinutes: anchor.utcOffsetMinutes || 0,
+    });
+
     const std = computeStandardOutputs({
-      qualityByDate: lifetimeQualityByDate,
+      qualityByDate: blendedQualityByDate,
       todayDate: win.todayDate,
       anchorDate: anchor.anchorDateStr,
       daysSinceAnchor: win.daysSinceAnchor,
     });
 
+    // HK-derived AHA cards (concat into existing aha_moments so the FE renders
+    // them on the Analysis tab without any changes). Non-fatal on failure.
+    let aha_moments = Array.isArray(body.aha_moments) ? body.aha_moments : [];
+    try {
+      const { buildHKAhaCards } = require('./lib/healthkit/aha-cards');
+      const hkCards = await buildHKAhaCards({ coach: 'sleep', deviceId, db: admin.firestore() });
+      if (hkCards.length) aha_moments = [...hkCards, ...aha_moments];
+    } catch { /* best-effort */ }
+
     res.json({
       ...body,
+      aha_moments,
       effective_start_date: win.effectiveStartDate,
       effective_days: effectiveDays,
       days_since_anchor: win.daysSinceAnchor,
@@ -1110,6 +1136,14 @@ router.post('/chat', async (req, res) => {
     }
     systemContext = appendLanguageInstruction(systemContext, language);
 
+    // Silent HK enrichment — appends objective signals (sleep hours, HRV, etc)
+    // when the user has wearables granted. No source named — see context-builder.
+    try {
+      const { buildHKContext, appendHKContext } = require('./lib/healthkit/context-builder');
+      const hkBlock = await buildHKContext({ db: admin.firestore(), deviceId, coach: 'sleep', days: 7 });
+      systemContext = appendHKContext(systemContext, hkBlock);
+    } catch { /* best-effort */ }
+
     const historySnap = await chatsCol(deviceId)
       .orderBy('created_at', 'desc').limit(16).get();
     const history = historySnap.docs.reverse()
@@ -1120,7 +1154,7 @@ router.post('/chat', async (req, res) => {
       });
 
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4.1',
+      model: AI.REASONING_PRO,
       max_completion_tokens: 1000,
       messages: [
         { role: 'system', content: systemContext },
@@ -1153,7 +1187,7 @@ _mountChatStreamSleep(router, {
   agentName: 'sleep',
   openai, admin, chatsCol,
   rateLimitCheck: _checkChatRateLimit,
-  model: 'gpt-4.1', maxTokens: 1000,
+  model: AI.REASONING_PRO, maxTokens: 1000,
   buildPrompt: async (deviceId, message, { proactive_context } = {}) => {
     let systemPrompt = await getCachedContext(deviceId);
     if (proactive_context) {
@@ -1452,7 +1486,7 @@ Return ONLY valid JSON array of 3 objects — no markdown, no explanation:
 
   try {
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4.1',
+      model: AI.REASONING_PRO,
       max_completion_tokens: 800,
       messages: [{ role: 'user', content: prompt }],
     });
@@ -1544,7 +1578,7 @@ Hard rules:
 
   try {
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4.1', max_completion_tokens: 200,
+      model: AI.REASONING_PRO, max_completion_tokens: 200,
       messages: [{ role: 'user', content: prompt }],
     });
     // Store msg type for next rotation (fire-and-forget)
@@ -1581,7 +1615,7 @@ ${severity === 'urgent' ? 'Urgency: be direct — this is a real problem affecti
 
   try {
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4.1', max_completion_tokens: 200,
+      model: AI.REASONING_PRO, max_completion_tokens: 200,
       messages: [{ role: 'user', content: prompt }],
     });
     return completion.choices[0].message.content.trim();
@@ -1602,7 +1636,7 @@ Use AFFIRMATION + CHALLENGE format:
 
   try {
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4.1', max_completion_tokens: 120,
+      model: AI.REASONING_PRO, max_completion_tokens: 120,
       messages: [{ role: 'user', content: prompt }],
     });
     return completion.choices[0].message.content.trim();
@@ -1628,7 +1662,7 @@ Rules:
 
   try {
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4.1', max_completion_tokens: 80,
+      model: AI.REASONING_PRO, max_completion_tokens: 80,
       messages: [{ role: 'user', content: prompt }],
     });
     return completion.choices[0].message.content.trim();
@@ -1653,7 +1687,7 @@ Rules:
 
   try {
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4.1', max_completion_tokens: 80,
+      model: AI.REASONING_PRO, max_completion_tokens: 80,
       messages: [{ role: 'user', content: prompt }],
     });
     return completion.choices[0].message.content.trim();
@@ -2297,7 +2331,7 @@ Return ONLY valid JSON, no markdown:
 
   try {
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4.1', max_completion_tokens: 280,
+      model: AI.REASONING_PRO, max_completion_tokens: 280,
       messages: [{ role: 'user', content: prompt }],
     });
     const raw     = completion.choices[0].message.content.trim();
@@ -2536,7 +2570,7 @@ router.post('/describe/transcribe', async (req, res) => {
     if (!audio_base64) return res.status(400).json({ error: 'audio_base64 required' });
     const transcript = await sleepDescribe.transcribeAudio(openai, audio_base64, audio_mime);
     if (!transcript) return res.status(400).json({ error: 'No speech detected' });
-    res.json({ transcript, latency_ms: Date.now() - t0, model: 'gpt-4o-transcribe' });
+    res.json({ transcript, latency_ms: Date.now() - t0, model: AI.TRANSCRIBE });
   } catch (err) {
     log.error('[sleep] /describe/transcribe error:', err?.message);
     res.status(500).json({ error: err.message || 'Transcription failed' });
@@ -2577,5 +2611,23 @@ router.post('/describe', async (req, res) => {
   }
 });
 
+// ─── GET /wearable-insights ─────────────────────────────────────────────
+// Additive layer: returns HK-derived cards for the Sleep Analysis tab's
+// "Wearable Insights" section. Manual users / no-grants get
+// { has_data: false, cards: [] } and the FE section auto-hides.
+router.get('/wearable-insights', async (req, res) => {
+  const deviceId = (req.query.deviceId || '').toString();
+  if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+  try {
+    const { buildWearableInsights } = require('./lib/healthkit/wearable-insights');
+    const days = Math.min(parseInt(req.query.days || '30', 10) || 30, 90);
+    const payload = await buildWearableInsights({
+      db: admin.firestore(), deviceId, coach: 'sleep', days,
+    });
+    res.json(payload);
+  } catch (err) {
+    res.json({ has_data: false, cards: [] });
+  }
+});
 
 module.exports = router;

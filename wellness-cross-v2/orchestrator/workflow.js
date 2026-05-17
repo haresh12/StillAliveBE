@@ -44,7 +44,34 @@ const { readAhaIds, readAhaFeed, persistNewAha } = require('../persistence/aha.r
 const { buildQuarterlyStory } = require('./quarterly-aggregator');
 const { pickDidYouKnow } = require('../did-you-know/ranker');
 const { buildDayOneKit } = require('../coaches/day-one-kit');
+const { buildHKInsights } = require('../did-you-know/hk-insights');
 const config = require('../config');
+
+/**
+ * Inject HK-derived Did-You-Know facts into the home_pack silently.
+ * Hard rule: HK facts always replace the LOWEST-priority library facts so the
+ * total card count stays at TARGET_TOTAL (6). HK facts marked personal=true
+ * so the FE styles them as user data, not library content. Source label is
+ * never "Apple Health" or "watch" — see hk-insights.js for the silent copy.
+ */
+async function mergeHKDidYouKnow(home_pack, deviceId) {
+  if (!home_pack || !deviceId) return;
+  try {
+    const hk = await buildHKInsights({ deviceId });
+    if (!hk || !hk.length) return;
+    const existing = Array.isArray(home_pack.did_you_know) ? home_pack.did_you_know : [];
+    // HK facts go FIRST (most relevant to "your data right now"). We drop
+    // library (personal=false) facts from the tail to make room. Personal
+    // facts already in the list are preserved — we never bump real user
+    // patterns for HK derivations.
+    const personalExisting = existing.filter((f) => f && f.personal !== false);
+    const libraryExisting = existing.filter((f) => f && f.personal === false);
+    const hkMarked = hk.map((f) => ({ ...f, personal: true }));
+    const TOTAL = 6;
+    const merged = [...hkMarked, ...personalExisting, ...libraryExisting].slice(0, TOTAL);
+    home_pack.did_you_know = merged;
+  } catch { /* silent — DYK is best-effort enrichment */ }
+}
 
 const SCHEMA = config.HOME_SCHEMA_VERSION;
 
@@ -106,6 +133,11 @@ async function runForUserFastDay0(deviceId, { pack, snapshots, today, startedAt 
     pack, snapshots, wellness, anomalies: [], exec: null, streaks: emptyStreaks,
     top_correlations: [],
   });
+
+  // Silent HK enrichment for DYK — Day-0 users may have just granted HK in
+  // onboarding and have backfilled history. Adding their trends here makes
+  // their very first Home view feel personalized instead of generic.
+  await mergeHKDidYouKnow(home_pack, deviceId);
 
   // Persist in background so subsequent reads hit cache instantly. Don't block
   // the response — the user's first paint is what matters.
@@ -253,6 +285,10 @@ async function runForUserFast(deviceId, opts = {}) {
     pack, snapshots, wellness, anomalies: enrichedAnomalies, exec: null, streaks,
     top_correlations,
   });
+
+  // Silent HK enrichment for DYK — replaces lowest-priority library facts.
+  // Best-effort; never blocks the response.
+  await mergeHKDidYouKnow(home_pack, deviceId);
   const insights_packs = [7, 30, 90, 365].map((range) => ({
     range,
     pack: buildInsightsResponse({
@@ -326,6 +362,7 @@ async function runForUserEnrich(deviceId, ctx, opts = {}) {
     });
     const { content: execContent, usage: exec_usage } = await execute({
       pack, wellness, anomalies: enrichedAnomalies, top_correlations, plan_slots, language,
+      deviceId,
     });
 
     const claims = collectClaims(execContent, top_correlations);
@@ -456,6 +493,7 @@ async function runForUser(deviceId, opts = {}) {
     top_correlations,
     plan_slots,
     language: opts.language,
+    deviceId,
   });
 
   // 8. Validate numeric claims
