@@ -7,6 +7,17 @@
 
 const { buildAdapter, daysBetween, dateOf, agentScores } = require('./_helpers');
 
+// Local-TZ date key helper — never _localDateStr(use) which
+// returns UTC and silently maps near-midnight logs to the wrong day in
+// negative-UTC offsets (Americas). See feedback_chart_tz_clamp law.
+function _localDateStr(d) {
+  const dt = d instanceof Date ? d : (d ? new Date(d) : new Date());
+  const y = dt.getFullYear();
+  const m = String(dt.getMonth() + 1).padStart(2, '0');
+  const dd = String(dt.getDate()).padStart(2, '0');
+  return `${y}-${m}-${dd}`;
+}
+
 function maxOf(arr, key) {
   const vals = arr.map((x) => Number(x[key])).filter(Number.isFinite);
   return vals.length ? Math.max(...vals) : null;
@@ -17,7 +28,7 @@ module.exports = buildAdapter({
 
   async readSetup(deviceId, { agentData }) {
     const completedAt = agentData.setup_completed_at || agentData.created_at || null;
-    const today = new Date().toISOString().slice(0, 10);
+    const today = _localDateStr();
     const completedDate = dateOf(completedAt);
     return {
       is_complete: !!agentData.setup_complete,

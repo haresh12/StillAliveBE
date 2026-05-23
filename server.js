@@ -11,6 +11,17 @@ const cron = require('node-cron');
 const aliveCheckRoutes = require('./aliveCheck');
 const referralRoutes = require('./referrals');
 
+// Local-TZ date key helper — never _localDateStr(use) which
+// returns UTC and silently maps near-midnight logs to the wrong day in
+// negative-UTC offsets (Americas). See feedback_chart_tz_clamp law.
+function _localDateStr(d) {
+  const dt = d instanceof Date ? d : (d ? new Date(d) : new Date());
+  const y = dt.getFullYear();
+  const m = String(dt.getMonth() + 1).padStart(2, '0');
+  const dd = String(dt.getDate()).padStart(2, '0');
+  return `${y}-${m}-${dd}`;
+}
+
 // ============================================
 // STARTUP ENV VALIDATION — fail fast, clear errors
 // ============================================
@@ -71,6 +82,16 @@ const resend = new Resend(process.env.RESEND_API_KEY);
 const app = express();
 const PORT = process.env.PORT || 5001;
 
+// Disable Express's auto-ETag on JSON responses globally.
+// Why: our `/api/{coach}/analysis` endpoints returned an empty payload
+// for 0-log users (correctly), Express computed an ETag from it, and on
+// subsequent visits the client sent If-None-Match → Express replied 304
+// with empty body → FE had nothing to render → loading shimmer stuck
+// forever. Disabling app-level ETag means every analysis fetch returns
+// a fresh 200 + body, every time. The FE swrAnalysis helper still
+// caches client-side via AsyncStorage for fast paint.
+app.set('etag', false);
+
 app.use(cors());
 // Bumped from 100KB default to 30MB so multi-shot vision payloads
 // (3 base64 photos ≈ 8MB each) don't crash with PayloadTooLargeError.
@@ -108,6 +129,8 @@ app.use('/api/water',     require('./water.agent'));
 app.use('/api/fasting',   require('./fasting.agent'));
 app.use('/api/fitness',   require('./fitness.agent'));
 app.use('/api/personalize', require('./personalize.agent'));
+app.use('/api/plan',        require('./plan.agent'));
+app.use('/api/feedback',    require('./feedback.agent'));
 app.use('/api/community', require('./community'));
 app.use('/api/wellness',  require('./wellness.cross'));
 app.use('/api/wellness/v2', require('./wellness-cross-v2'));
@@ -1884,7 +1907,7 @@ app.post('/api/pulse/challenges/log-activity', getDeviceId, async (req, res) => 
     }
 
     // Store today's activity: key = YYYY-MM-DD
-    const today = new Date().toISOString().slice(0, 10);
+    const today = _localDateStr();
     const activityRef = db
       .collection('challengeActivity')
       .doc(`${deviceId}_${enrolledChallengeId}`)

@@ -695,7 +695,8 @@ router.get('/analysis', async (req, res) => {
     const win = computeAnalysisWindow(daysNum || 30, anchor.anchorMs, nowMs, anchor.utcOffsetMinutes);
     const effectiveDays = daysNum ? win.effectiveDays : null;
 
-    const payload = await mindAnalytics.loadAnalysisV2(deviceId, effectiveDays, { openai });
+    const language = resolveLanguage(req);
+    const payload = await mindAnalytics.loadAnalysisV2(deviceId, effectiveDays, { openai, language });
     const body = payload || { stats: null, signal_points: [], aha_moments: [] };
 
     // Lifetime fetch: pull checkins since anchor → quality map independent of request window.
@@ -1417,7 +1418,7 @@ async function buildContext(deviceId) {
     : '  no check-ins yet today';
 
   // ── 8. Yesterday vs today delta ───────────────────────────────
-  const yesterdayStr_date = new Date(now - msPerDay).toISOString().slice(0, 10);
+  const yesterdayStr_date = dateStr(new Date(now - msPerDay));
   const ydayCheckins = checkins.filter(c => c.date_str === yesterdayStr_date);
   let yesterdayVsToday = '';
   if (ydayCheckins.length && todayCheckins.length) {
@@ -2397,7 +2398,9 @@ async function preWarmAnalysisV2() {
     try {
       const checkSnap = await mindDoc(id).collection('mind_checkins').limit(1).get();
       if (checkSnap.empty) continue;
-      await mindAnalytics.loadAnalysisV2(id, 30, { openai });
+      const { resolveUserLanguage } = require('./lib/i18n-prompt');
+      const language = await resolveUserLanguage(db(), id);
+      await mindAnalytics.loadAnalysisV2(id, 30, { openai, language });
       warmed++;
     } catch { /* per-user non-fatal */ }
   }

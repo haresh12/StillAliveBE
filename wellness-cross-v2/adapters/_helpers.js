@@ -9,17 +9,28 @@ const { agentDoc, agentLogsCol, userDoc } = require('../persistence/_firestore')
 const { emptyAgentSnapshot } = require('./_shape');
 const agentScores = require('../../lib/agent-scores');
 
+// Local-TZ date key helper — never _localDateStr(use) which
+// returns UTC and silently maps near-midnight logs to the wrong day in
+// negative-UTC offsets (Americas). See feedback_chart_tz_clamp law.
+function _localDateStr(d) {
+  const dt = d instanceof Date ? d : (d ? new Date(d) : new Date());
+  const y = dt.getFullYear();
+  const m = String(dt.getMonth() + 1).padStart(2, '0');
+  const dd = String(dt.getDate()).padStart(2, '0');
+  return `${y}-${m}-${dd}`;
+}
+
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
 function todayDate(tzOffsetMin = 0) {
   const now = new Date(Date.now() + tzOffsetMin * 60 * 1000);
-  return now.toISOString().slice(0, 10);
+  return _localDateStr(now);
 }
 
 function dateNDaysAgo(date, n) {
   const d = new Date(date + 'T00:00:00Z');
   d.setUTCDate(d.getUTCDate() - n);
-  return d.toISOString().slice(0, 10);
+  return _localDateStr(d);
 }
 
 function dateRange(endDate, days) {
@@ -33,9 +44,9 @@ function dateRange(endDate, days) {
 function dateOf(value) {
   if (!value) return null;
   if (typeof value === 'string') return value.slice(0, 10);
-  if (value._seconds) return new Date(value._seconds * 1000).toISOString().slice(0, 10);
-  if (value.toDate) return value.toDate().toISOString().slice(0, 10);
-  if (value instanceof Date) return value.toISOString().slice(0, 10);
+  if (value._seconds) return _localDateStr(new Date(value._seconds * 1000));
+  if (value.toDate) return _localDateStr(value.toDate());
+  if (value instanceof Date) return _localDateStr(value);
   return null;
 }
 

@@ -26,6 +26,7 @@ const router = express.Router();
 
 const log = require('./lib/log');
 const { AI } = require('./lib/ai/models');
+const { appendLanguageInstruction } = require('./lib/i18n-prompt');
 
 const openai = process.env.OPENAI_API_KEY
   ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
@@ -341,7 +342,7 @@ async function maybeEnhanceWithLLM({ db, deviceId, personalize, aggs, language =
       max_completion_tokens: 360,
       response_format: { type: 'json_object' },
       messages: [
-        { role: 'system', content: LLM_SYSTEM_PROMPT },
+        { role: 'system', content: appendLanguageInstruction(LLM_SYSTEM_PROMPT, language) },
         { role: 'user', content: userPrompt },
       ],
     });

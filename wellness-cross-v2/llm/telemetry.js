@@ -10,6 +10,17 @@
 
 const config = require('../config');
 
+// Local-TZ date key helper — never _localDateStr(use) which
+// returns UTC and silently maps near-midnight logs to the wrong day in
+// negative-UTC offsets (Americas). See feedback_chart_tz_clamp law.
+function _localDateStr(d) {
+  const dt = d instanceof Date ? d : (d ? new Date(d) : new Date());
+  const y = dt.getFullYear();
+  const m = String(dt.getMonth() + 1).padStart(2, '0');
+  const dd = String(dt.getDate()).padStart(2, '0');
+  return `${y}-${m}-${dd}`;
+}
+
 const MAX_BUFFER = 5000;
 const buffer = [];
 
@@ -17,7 +28,7 @@ let _totalToday = 0;
 let _todayDate = null;
 
 function _resetIfNewDay() {
-  const today = new Date().toISOString().slice(0, 10);
+  const today = _localDateStr();
   if (today !== _todayDate) {
     _todayDate = today;
     _totalToday = 0;

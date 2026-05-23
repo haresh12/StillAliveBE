@@ -1,3 +1,14 @@
+
+// Local-TZ date key helper — never _localDateStr(use) which
+// returns UTC and silently maps near-midnight logs to the wrong day in
+// negative-UTC offsets (Americas). See feedback_chart_tz_clamp law.
+function _localDateStr(d) {
+  const dt = d instanceof Date ? d : (d ? new Date(d) : new Date());
+  const y = dt.getFullYear();
+  const m = String(dt.getMonth() + 1).padStart(2, '0');
+  const dd = String(dt.getDate()).padStart(2, '0');
+  return `${y}-${m}-${dd}`;
+}
 /**
  * wellness-cross-v2/adapters/_shape.js
  *
@@ -74,7 +85,7 @@ function emptyAgentSnapshot(agent, todayDate) {
     const d = new Date(todayDate + 'T00:00:00Z');
     d.setUTCDate(d.getUTCDate() - (13 - i));
     return {
-      date: d.toISOString().slice(0, 10),
+      date: _localDateStr(d),
       score: null,
       has_log: false,
     };
@@ -84,7 +95,7 @@ function emptyAgentSnapshot(agent, todayDate) {
     const d = new Date(todayDate + 'T00:00:00Z');
     d.setUTCDate(d.getUTCDate() - (29 - i));
     return {
-      date: d.toISOString().slice(0, 10),
+      date: _localDateStr(d),
       score: null,
       has_log: false,
     };
@@ -94,7 +105,7 @@ function emptyAgentSnapshot(agent, todayDate) {
     const d = new Date(todayDate + 'T00:00:00Z');
     d.setUTCDate(d.getUTCDate() - (89 - i));
     return {
-      date: d.toISOString().slice(0, 10),
+      date: _localDateStr(d),
       score: null,
       has_log: false,
     };

@@ -10,6 +10,17 @@
 const config = require('../config');
 const { AGENTS } = require('../adapters/_shape');
 
+// Local-TZ date key helper — never _localDateStr(use) which
+// returns UTC and silently maps near-midnight logs to the wrong day in
+// negative-UTC offsets (Americas). See feedback_chart_tz_clamp law.
+function _localDateStr(d) {
+  const dt = d instanceof Date ? d : (d ? new Date(d) : new Date());
+  const y = dt.getFullYear();
+  const m = String(dt.getMonth() + 1).padStart(2, '0');
+  const dd = String(dt.getDate()).padStart(2, '0');
+  return `${y}-${m}-${dd}`;
+}
+
 const FLOOR = config.STREAKS.GRACE_AGENT_SCORE_FLOOR;
 const STRONG_NEED = config.STREAKS.GRACE_THRESHOLD_STRONG_AGENTS;
 
@@ -135,7 +146,7 @@ function nextMonday(dateStr) {
   const day = d.getUTCDay(); // 0=Sun,1=Mon,...
   const daysUntil = (8 - day) % 7 || 7; // always next-Monday-or-later
   d.setUTCDate(d.getUTCDate() + daysUntil);
-  return d.toISOString().slice(0, 10);
+  return _localDateStr(d);
 }
 
 module.exports = { computeStreaks, nextMonday };

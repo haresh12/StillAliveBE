@@ -34,7 +34,18 @@ async function getAllSnapshots(deviceId, opts = {}) {
       } catch (err) {
         log.error(`[adapters] ${agent} failed:`, err && err.message);
         const { emptyAgentSnapshot } = require('./_shape');
-        const today = opts.todayDate || new Date().toISOString().slice(0, 10);
+
+// Local-TZ date key helper — never _localDateStr(use) which
+// returns UTC and silently maps near-midnight logs to the wrong day in
+// negative-UTC offsets (Americas). See feedback_chart_tz_clamp law.
+function _localDateStr(d) {
+  const dt = d instanceof Date ? d : (d ? new Date(d) : new Date());
+  const y = dt.getFullYear();
+  const m = String(dt.getMonth() + 1).padStart(2, '0');
+  const dd = String(dt.getDate()).padStart(2, '0');
+  return `${y}-${m}-${dd}`;
+}
+        const today = opts.todayDate || _localDateStr();
         return [agent, emptyAgentSnapshot(agent, today)];
       }
     }),

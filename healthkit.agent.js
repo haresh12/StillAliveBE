@@ -43,6 +43,7 @@ const TYPE_TO_AGENT = {
   HKQuantityTypeIdentifierActiveEnergyBurned: 'fitness',
   HKQuantityTypeIdentifierVO2Max: 'fitness',
   HKQuantityTypeIdentifierAppleExerciseTime: 'fitness',
+  HKCategoryTypeIdentifierAppleStandHour: 'fitness',
   HKWorkoutTypeIdentifier: 'fitness',
   HKQuantityTypeIdentifierBodyMass: 'nutrition',
   HKQuantityTypeIdentifierBodyFatPercentage: 'nutrition',
@@ -342,6 +343,19 @@ router.get('/status', async (req, res) => {
 //   GET /api/v2/healthkit/debug?deviceId=XXXX&full=1            (all samples)
 
 router.get('/debug', async (req, res) => {
+  // PRIVACY GATE — this endpoint dumps a user's raw HealthKit samples
+  // (timestamps, values, types) keyed only by deviceId. Anyone who knows
+  // a deviceId could pull PII in plaintext. NEVER expose in production.
+  // Allowed in dev/staging for support + QA debugging. Production access
+  // requires an explicit ADMIN_DEBUG_TOKEN header (rotated separately).
+  const isProd = process.env.NODE_ENV === 'production';
+  if (isProd) {
+    const adminToken = process.env.ADMIN_DEBUG_TOKEN || '';
+    const provided = req.get('x-admin-debug-token') || '';
+    if (!adminToken || provided !== adminToken) {
+      return res.status(404).json({ ok: false, error: 'not_found' });
+    }
+  }
   const deviceId = getDeviceId(req);
   if (!deviceId) return res.status(400).json({ ok: false, error: 'deviceId required' });
   const onlyAgent = req.query.agent || null;

@@ -19,6 +19,17 @@ const router = express.Router();
 const admin = require('firebase-admin');
 const { OpenAI } = require('openai');
 
+// Local-TZ date key helper — never _localDateStr(use) which
+// returns UTC and silently maps near-midnight logs to the wrong day in
+// negative-UTC offsets (Americas). See feedback_chart_tz_clamp law.
+function _localDateStr(d) {
+  const dt = d instanceof Date ? d : (d ? new Date(d) : new Date());
+  const y = dt.getFullYear();
+  const m = String(dt.getMonth() + 1).padStart(2, '0');
+  const dd = String(dt.getDate()).padStart(2, '0');
+  return `${y}-${m}-${dd}`;
+}
+
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const getDb = () => admin.firestore();
 
@@ -2771,7 +2782,7 @@ router.get('/stats', requireDeviceId, async (req, res) => {
     // 4. Current day streak (consecutive days ending today or yesterday — streak still alive)
     let dayStreak = 0;
     if (sortedAsc.length > 0) {
-      const todayStr = new Date().toISOString().slice(0, 10);
+      const todayStr = _localDateStr();
       const lastDate = sortedAsc[sortedAsc.length - 1];
       const diffFromToday = Math.round((new Date(todayStr) - new Date(lastDate)) / 86400000);
 

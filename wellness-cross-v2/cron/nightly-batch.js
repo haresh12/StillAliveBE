@@ -9,6 +9,17 @@ const { db, meta, metaCosts, Timestamp } = require('../persistence/_firestore');
 const { drain, summarize } = require('../llm/telemetry');
 const config = require('../config');
 
+// Local-TZ date key helper — never _localDateStr(use) which
+// returns UTC and silently maps near-midnight logs to the wrong day in
+// negative-UTC offsets (Americas). See feedback_chart_tz_clamp law.
+function _localDateStr(d) {
+  const dt = d instanceof Date ? d : (d ? new Date(d) : new Date());
+  const y = dt.getFullYear();
+  const m = String(dt.getMonth() + 1).padStart(2, '0');
+  const dd = String(dt.getDate()).padStart(2, '0');
+  return `${y}-${m}-${dd}`;
+}
+
 const PARALLELISM = 5;
 
 async function listActiveUsers() {
@@ -23,7 +34,7 @@ async function listActiveUsers() {
 }
 
 async function nightlyBatch({ todayDate } = {}) {
-  const today = todayDate || new Date().toISOString().slice(0, 10);
+  const today = todayDate || _localDateStr();
   const users = await listActiveUsers();
 
   let success = 0;

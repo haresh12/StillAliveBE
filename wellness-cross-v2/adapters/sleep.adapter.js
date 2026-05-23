@@ -5,6 +5,17 @@
 
 const { buildAdapter, daysBetween, dateOf, agentScores, clip } = require('./_helpers');
 
+// Local-TZ date key helper — never _localDateStr(use) which
+// returns UTC and silently maps near-midnight logs to the wrong day in
+// negative-UTC offsets (Americas). See feedback_chart_tz_clamp law.
+function _localDateStr(d) {
+  const dt = d instanceof Date ? d : (d ? new Date(d) : new Date());
+  const y = dt.getFullYear();
+  const m = String(dt.getMonth() + 1).padStart(2, '0');
+  const dd = String(dt.getDate()).padStart(2, '0');
+  return `${y}-${m}-${dd}`;
+}
+
 function avgOf(arr, key) {
   const vals = arr.map((x) => Number(x[key])).filter((v) => Number.isFinite(v));
   return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
@@ -15,7 +26,7 @@ module.exports = buildAdapter({
 
   async readSetup(deviceId, { userData, agentData }) {
     const completedAt = agentData.setup_completed_at || agentData.created_at || null;
-    const today = new Date().toISOString().slice(0, 10);
+    const today = _localDateStr();
     const completedDate = dateOf(completedAt);
     return {
       is_complete: !!agentData.setup_complete,
@@ -67,7 +78,7 @@ module.exports = buildAdapter({
   extraFields(logs) {
     const out = [];
     for (const l of logs) {
-      const date = l.date || (l.logged_at && l.logged_at._seconds ? new Date(l.logged_at._seconds * 1000).toISOString().slice(0, 10) : null);
+      const date = l.date || (l.logged_at && l.logged_at._seconds ? _localDateStr(new Date(l.logged_at._seconds * 1000)) : null);
       if (!date) continue;
       if (l.bedtime || l.wake_time) {
         out.push({

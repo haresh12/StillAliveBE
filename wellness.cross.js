@@ -48,6 +48,17 @@ const {
 const { getOrGenerateLetter } = require('./lib/coach-letter');
 const { withHKEnrichment, HK_PROMPT_RULE } = require('./lib/healthkit/analytics-helper');
 
+// Local-TZ date key helper — never _localDateStr(use) which
+// returns UTC and silently maps near-midnight logs to the wrong day in
+// negative-UTC offsets (Americas). See feedback_chart_tz_clamp law.
+function _localDateStr(d) {
+  const dt = d instanceof Date ? d : (d ? new Date(d) : new Date());
+  const y = dt.getFullYear();
+  const m = String(dt.getMonth() + 1).padStart(2, '0');
+  const dd = String(dt.getDate()).padStart(2, '0');
+  return `${y}-${m}-${dd}`;
+}
+
 // ─── In-memory cache (5-min TTL) ────────────────────────────────────
 const cache = new Map();
 const CACHE_TTL = 5 * 60 * 1000;
@@ -145,7 +156,7 @@ router.get('/home/:deviceId', handle(async (req, res) => {
     }
     // Delta: today vs yesterday using the same rich formula on the same 90-day matrix
     if (rich_score?.score != null) {
-      const todayStr = new Date().toISOString().slice(0, 10);
+      const todayStr = _localDateStr();
       const matrixYest = {};
       for (const agent of Object.keys(matrix)) {
         matrixYest[agent] = Object.fromEntries(
@@ -358,7 +369,7 @@ router.get('/journal/:deviceId', handle(async (req, res) => {
   const { deviceId } = req.params;
   const days = [];
   for (let i = 0; i < 7; i++) {
-    const d = new Date(Date.now() - i * 86400000).toISOString().slice(0, 10);
+    const d = _localDateStr(new Date(Date.now() - i * 86400000));
     days.push(d);
   }
   const snap = await admin.firestore()
@@ -411,7 +422,7 @@ router.get('/agent-daily-grid/:deviceId', handle(async (req, res) => {
   // Build Mon-Sun of the current calendar week
   const nowMs = Date.now();
   const nowDate = new Date(nowMs);
-  const todayStr = nowDate.toISOString().slice(0, 10);
+  const todayStr = _localDateStr(nowDate);
   // JS: 0=Sun, 1=Mon … 6=Sat. Shift so Monday = 0.
   const dowSun = nowDate.getDay(); // 0=Sun
   const dowMon = (dowSun + 6) % 7; // days since Monday (Mon=0, Tue=1, …, Sun=6)
@@ -419,7 +430,7 @@ router.get('/agent-daily-grid/:deviceId', handle(async (req, res) => {
   const DAY_LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
   for (let i = 0; i < 7; i++) {
     const ms = nowMs - dowMon * 86400000 + i * 86400000;
-    const d  = new Date(ms).toISOString().slice(0, 10);
+    const d  = _localDateStr(new Date(ms));
     weekDates.push({ date: d, label: DAY_LABELS[i], is_today: d === todayStr, is_future: d > todayStr });
   }
 
@@ -695,7 +706,7 @@ if (shouldRunCron()) {
 // ────────────────────────────────────────────────────────────────────
 async function fireCrossAgentProactives() {
   const db = admin.firestore();
-  const today = new Date().toISOString().slice(0, 10);
+  const today = _localDateStr();
   try {
     const usersSnap = await db.collection('wellness_users').limit(2000).get();
     let fired = 0;
@@ -858,7 +869,7 @@ async function recomputeTodaySignals(deviceId) {
   // Index water by date_str: { date: total_effective_ml, goal_ml }
   const waterByDate = {};
   for (const l of waterLogs) {
-    const d = l.date_str || (l.logged_at && new Date(l.logged_at).toISOString().slice(0, 10));
+    const d = l.date_str || (l.logged_at && _localDateStr(new Date(l.logged_at)));
     if (!d) continue;
     waterByDate[d] = waterByDate[d] || { effective_ml: 0, goal_ml: l.goal_ml || 0 };
     waterByDate[d].effective_ml += (l.effective_ml || l.ml || 0);
@@ -914,7 +925,7 @@ async function recomputeTodaySignals(deviceId) {
   try {
     const lastNight = sleepLogs[0];
     const lastFit   = fitLogs[0];
-    const todayStr  = new Date().toISOString().slice(0, 10);
+    const todayStr  = _localDateStr();
     let bonus_ml = 0;
     let reasons  = [];
 
@@ -970,12 +981,12 @@ async function recomputeTodaySignals(deviceId) {
       const waterSnap = await fetchAgentSnapshot(deviceId, 'water', 1).catch(() => null);
       const todayWaterLog = waterSnap?.logs?.find(l => {
         const d = l.date_str || l.date || '';
-        return d === new Date().toISOString().slice(0, 10);
+        return d === _localDateStr();
       });
       const waterGoal = waterSnap?.setup?.daily_goal_ml || 2500;
       const todayMl = waterSnap?.logs?.reduce((s, l) => {
         const d = l.date_str || l.date || '';
-        const sameDay = d === new Date().toISOString().slice(0, 10);
+        const sameDay = d === _localDateStr();
         return s + (sameDay ? (l.amount_ml || l.effective_ml || 0) : 0);
       }, 0) || 0;
       out.water_intake_pct = Math.round((todayMl / Math.max(waterGoal, 1)) * 100);

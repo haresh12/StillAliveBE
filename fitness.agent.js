@@ -25,6 +25,7 @@ const { withCron, shouldRunCron } = require("./lib/cron-helper");
 const { getUserNotifContext } = require("./lib/cron-user-context");
 const { resolveAnchor } = require("./lib/user-anchor");
 const { assertLoggableDate, sendLogGuardError } = require("./lib/log-guard");
+const _fitScoring = require("./lib/fitness-scoring");
 const crypto = require("crypto");
 const { computeFitnessScore: _computeFitnessScore } = require('./lib/agent-scores');
 
@@ -91,6 +92,57 @@ const fitnessDoc = (id) => userDoc(id).collection("agents").doc("fitness");
 const workoutsCol = (id) => fitnessDoc(id).collection("fitness_workouts");
 const actionsCol = (id) => fitnessDoc(id).collection("fitness_actions");
 const chatsCol = (id) => fitnessDoc(id).collection("fitness_chats");
+// Day-of-week workout templates (2026-05-22). One doc per day of week,
+// keyed by lowercase day name ('monday', 'tuesday', ...). Each doc holds
+// the user's "typical {day} workout" — auto-updated from the latest log
+// on that day, manually editable any time. Lets users pre-plan a weekly
+// routine ("Mondays = chest/tris") and one-tap-log it when the day comes.
+const templatesCol = (id) => fitnessDoc(id).collection("fitness_weekly_templates");
+
+const DOW_NAMES = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
+function validDow(dow) {
+  return typeof dow === 'string' && DOW_NAMES.includes(dow.toLowerCase());
+}
+
+function normalizeWorkoutExercises(input) {
+  if (!Array.isArray(input) || input.length === 0) {
+    throw Object.assign(new Error("exercises array required"), { status: 400 });
+  }
+
+  return input.map((ex, exIdx) => {
+    const name = String(ex.name || ex.exercise || '').trim();
+    if (!name) {
+      throw Object.assign(new Error(`exercise ${exIdx + 1} name required`), { status: 400 });
+    }
+    if (!Array.isArray(ex.sets) || ex.sets.length === 0) {
+      throw Object.assign(new Error(`${name}: at least one set required`), { status: 400 });
+    }
+
+    const sets = ex.sets.map((s, setIdx) => {
+      const hasReps = s && s.reps !== undefined && s.reps !== null && s.reps !== '';
+      const hasWeight = s && s.weight_kg !== undefined && s.weight_kg !== null && s.weight_kg !== '';
+      const reps = hasReps ? parseInt(s.reps, 10) : NaN;
+      const weight_kg = hasWeight ? parseFloat(s.weight_kg) : NaN;
+      if (!Number.isFinite(reps) || reps <= 0) {
+        throw Object.assign(new Error(`${name} set ${setIdx + 1}: reps required`), { status: 400 });
+      }
+      if (!Number.isFinite(weight_kg) || weight_kg < 0) {
+        throw Object.assign(new Error(`${name} set ${setIdx + 1}: weight required`), { status: 400 });
+      }
+      const rpe = s.rpe != null ? Math.max(1, Math.min(10, parseFloat(s.rpe))) : null;
+      const e1rm = weight_kg > 0
+        ? Math.round(weight_kg * (1 + 0.0333 * reps) * 10) / 10
+        : null;
+      return { reps, weight_kg, ...(rpe != null ? { rpe } : {}), ...(e1rm != null ? { e1rm } : {}) };
+    });
+
+    return {
+      name,
+      muscle_group: ex.muscle_group || detectMuscleGroup(name),
+      sets,
+    };
+  });
+}
 
 // ════════════════════════════════════════════════════════════════
 // ACTIONS v2 — shared engine. Mounts BEFORE legacy routes.
@@ -479,6 +531,72 @@ async function buildFitnessContext(deviceId) {
       ? `bench ${setup.baseline_lifts.bench_press || "?"}kg, squat ${setup.baseline_lifts.squat || "?"}kg, deadlift ${setup.baseline_lifts.deadlift || "?"}kg`
       : "not set";
 
+    // ── Live Analysis signals (2026-05-23) ────────────────────────
+    // Feed the same numbers the user sees on their Analysis tab so the
+    // coach answers with matching vocabulary. All derived from already-
+    // loaded `workouts`; no extra Firestore reads. Pure plumbing —
+    // doesn't add a visible UI element anywhere.
+    let analysisLines = '';
+    try {
+      const F = require('./lib/fitness-scoring');
+      const todayDate = dateStr();
+      // Window = last 30 calendar days for prior-delta, plus full set for
+      // longer-range signals (effort mix / PPL / muscle freq read the
+      // workouts available, which is what /analysis does too).
+      const last30Cutoff = Date.now() - 30 * 86_400_000;
+      const last30 = workouts.filter((w) => getMillis(w.logged_at) >= last30Cutoff);
+      const prior30Cutoff = Date.now() - 60 * 86_400_000;
+      const prior30 = workouts.filter((w) => {
+        const ms = getMillis(w.logged_at);
+        return ms >= prior30Cutoff && ms < last30Cutoff;
+      });
+      const banister = F.computeBanister({
+        sessions: last30,
+        priorSessions: prior30,
+        startDateStr: dateStr(new Date(Date.now() - 56 * 86_400_000)),
+        todayDateStr: todayDate,
+      });
+      const effort = F.deriveEffortMix(last30);
+      const ppl    = F.derivePushPullLegs(last30, 30);
+      const freq   = F.deriveMuscleFrequency(last30, 30);
+
+      const prior = F.derivePriorPeriod({
+        priorWorkouts: prior30,
+        currentTotalVolKg: last30.reduce((a, w) => a + (w.total_volume_kg || 0), 0),
+        currentTotalSets:  last30.reduce((a, w) => a + (w.total_sets || 0), 0),
+        currentDaysLogged: last30.length,
+        currentPRs:        last30.reduce((a, w) => a + ((w.personal_records || []).length), 0),
+      });
+
+      // Plateau per top lift — bench / squat / deadlift
+      const plateauNotes = [];
+      for (const liftName of ['Bench Press','Back Squat','Deadlift','Overhead Press']) {
+        const pts = [], dates = [];
+        for (const w of [...workouts].sort((a, b) => (a.date || '').localeCompare(b.date || ''))) {
+          const ex = (w.exercises || []).find((e) => e.name === liftName);
+          if (!ex) continue;
+          const top = Math.max(...(ex.sets || []).map((s) => s.e1rm || 0), 0);
+          if (top > 0) { pts.push(top); dates.push(w.date); }
+        }
+        if (pts.length >= 3) {
+          const p = F.derivePlateau({ points: pts, dates });
+          if (p.stalled) plateauNotes.push(`${liftName} stalled ${p.weeks_stalled}w`);
+        }
+      }
+
+      const sigLines = [
+        `Readiness ${banister.readiness}/100, band=${banister.band}.`,
+        `Effort: ${effort.working_pct}% of working sets in RPE 7-9 zone (last 30d).`,
+        `Balance: push ${ppl.push_pct}% / pull ${ppl.pull_pct}% / legs ${ppl.legs_pct}%${ppl.warn ? ' — imbalance' : ''}.`,
+        freq.length ? `Frequency: ${freq.slice(0, 3).map((m) => `${m.muscle} ${m.per_week}/wk`).join(', ')}.` : '',
+        prior ? `vs prior 30d: vol ${prior.delta_vol_pct >= 0 ? '+' : ''}${prior.delta_vol_pct ?? 0}%, sets ${prior.delta_sets_pct >= 0 ? '+' : ''}${prior.delta_sets_pct ?? 0}%, PRs ${prior.delta_prs_abs >= 0 ? '+' : ''}${prior.delta_prs_abs}.` : '',
+        plateauNotes.length ? `Plateau flags: ${plateauNotes.join('; ')}.` : '',
+      ].filter(Boolean).join('\n');
+      analysisLines = sigLines ? `Live Analysis signals (the same numbers the user sees on their Analysis tab):\n${sigLines}` : '';
+    } catch (_e) {
+      // Never block the chat over a signal-derivation failure.
+    }
+
     return [
       `Goal: ${setup.primary_goal || "general"}. Level: ${setup.training_level || "beginner"}. Split: ${split}.`,
       `Equipment: ${setup.equipment || "full_gym"}. Injuries/notes: ${setup.injury_notes || "none"}.`,
@@ -488,6 +606,7 @@ async function buildFitnessContext(deviceId) {
       `Total workouts logged: ${totalWorkouts}. Current streak: ${streak}d.`,
       `Volume landmarks this week (sets):\n${volLines || "No workouts this week."}`,
       `Recent workout log:\n${recentLog || "No workouts yet."}`,
+      analysisLines,
       cachedInsight ? `Latest coach insight: ${cachedInsight}` : "",
     ]
       .filter(Boolean)
@@ -896,6 +1015,144 @@ function computeActionCandidates(workouts, setup) {
     });
   }
 
+  // ════════════════════════════════════════════════════════════════
+  // 2026-05-23 — 4 new archetypes derived from the Analysis surfaces.
+  // Pure plumbing: same helpers the Analysis tab uses, applied to the
+  // already-loaded workouts. No extra Firestore reads.
+  // ════════════════════════════════════════════════════════════════
+  try {
+    const F = require('./lib/fitness-scoring');
+    const todayDate = dateStr();
+    const last30Cutoff = now - 30 * 86_400_000;
+    const last30 = workouts.filter((w) => getMillis(w.logged_at) >= last30Cutoff);
+    const prior30 = workouts.filter((w) => {
+      const ms = getMillis(w.logged_at);
+      return ms >= last30Cutoff - 30 * 86_400_000 && ms < last30Cutoff;
+    });
+
+    // ── (H) DELOAD — Banister overload/overreached band ─────────
+    // Source: Banister 1991 + Friel TrainingPeaks — TSB ratio drives readiness
+    const banister = F.computeBanister({
+      sessions: last30,
+      priorSessions: prior30,
+      startDateStr: dateStr(new Date(now - 56 * 86_400_000)),
+      todayDateStr: todayDate,
+    });
+    if (banister.band === 'overreached' || banister.band === 'overload') {
+      const isHeavier = banister.band === 'overreached';
+      candidates.push({
+        archetype: 'deload',
+        score: isHeavier ? 92 : 80,
+        category: 'recovery',
+        proof: {
+          metric: 'banister_readiness',
+          value: banister.readiness,
+          delta: banister.tsb,
+          threshold: 50,
+          citation: 'Banister 1991',
+        },
+        proof_text: `Readiness ${banister.readiness}/100 (${banister.band}). ATL ${banister.atl} vs CTL ${banister.ctl}. Pull back ${isHeavier ? '2–3 days' : 'one session'}.`,
+        surprise_hook: `Your readiness is ${banister.readiness}/100 — body is in ${banister.band}.`,
+        target: { sets: 0 },
+        success_type: 'log_session',
+        when_to_do: isHeavier ? 'rest_day' : 'this_week',
+        impact: 3,
+      });
+    }
+
+    // ── (I) REBALANCE — Push/Pull/Legs gap over 30d ────────────
+    // Source: King 2002 (Foundations of Functional Training)
+    const ppl = F.derivePushPullLegs(last30, 30);
+    if (ppl.warn) {
+      const segs = [
+        { id: 'push', sets: ppl.push_sets, pct: ppl.push_pct },
+        { id: 'pull', sets: ppl.pull_sets, pct: ppl.pull_pct },
+        { id: 'legs', sets: ppl.legs_sets, pct: ppl.legs_pct },
+      ].sort((a, b) => a.pct - b.pct);
+      const min = segs[0];
+      const targetMuscle = min.id === 'push' ? 'chest' : min.id === 'pull' ? 'back' : 'quads';
+      candidates.push({
+        archetype: 'rebalance',
+        score: 78 + (20 - min.pct),
+        category: 'strength',
+        proof: {
+          metric: `ppl_${min.id}_pct_30d`,
+          value: min.pct,
+          delta: 33 - min.pct,
+          threshold: 20,
+          citation: 'King 2002',
+        },
+        proof_text: `${min.id.charAt(0).toUpperCase()+min.id.slice(1)} at ${min.pct}% of last-30d volume. Aim for ~33% balance; imbalance compounds into injury risk.`,
+        surprise_hook: `Only ${min.pct}% of your work is ${min.id} — biggest gap in your training.`,
+        target: { muscle: targetMuscle, sets: 6 },
+        success_type: 'train_muscle',
+        when_to_do: 'this_week',
+        impact: 2,
+      });
+    }
+
+    // ── (J) EFFORT_UP — too few working-RPE sets ───────────────
+    // Source: Helms 2018 — productive sets land 1-4 reps from failure
+    const effort = F.deriveEffortMix(last30);
+    if (effort.total_n >= 20 && effort.working_pct < 40) {
+      candidates.push({
+        archetype: 'effort_up',
+        score: 70 + (40 - effort.working_pct),
+        category: 'intent',
+        proof: {
+          metric: 'working_set_pct_30d',
+          value: effort.working_pct,
+          delta: 40 - effort.working_pct,
+          threshold: 60,
+          citation: 'Helms 2018',
+        },
+        proof_text: `Only ${effort.working_pct}% of sets hit RPE 7-9. Sweet spot for growth is 60%+. Push closer to failure on top sets.`,
+        surprise_hook: `Most of your sets (${100 - effort.working_pct}%) are below growth-zone RPE.`,
+        target: { sets: 0 },
+        success_type: 'hit_weight',
+        when_to_do: 'next_session',
+        impact: 2,
+      });
+    }
+
+    // ── (K) PLATEAU_BREAK — per top-lift stagnation ≥3 weeks ──
+    // Source: Schoenfeld 2017 — variation defeats neural adaptation plateau
+    for (const liftName of ['Bench Press','Back Squat','Deadlift','Overhead Press']) {
+      const pts = [], dates = [];
+      for (const w of [...workouts].sort((a, b) => (a.date || '').localeCompare(b.date || ''))) {
+        const ex = (w.exercises || []).find((e) => e.name === liftName);
+        if (!ex) continue;
+        const top = Math.max(...(ex.sets || []).map((s) => s.e1rm || 0), 0);
+        if (top > 0) { pts.push(top); dates.push(w.date); }
+      }
+      if (pts.length < 4) continue;
+      const p = F.derivePlateau({ points: pts, dates });
+      if (!p.stalled) continue;
+      const lastTop = pts[pts.length - 1];
+      const nextKg = Math.round((lastTop * 1.025) * 2) / 2;
+      candidates.push({
+        archetype: 'plateau_break',
+        score: 75 + Math.min(15, p.weeks_stalled * 2),
+        category: 'strength',
+        proof: {
+          metric: `${liftName.replace(/\s+/g, '_').toLowerCase()}_plateau_weeks`,
+          value: p.weeks_stalled,
+          delta: 0,
+          threshold: 3,
+          citation: 'Schoenfeld 2017',
+        },
+        proof_text: `${liftName} top e1RM stuck at ${lastTop}kg for ${p.weeks_stalled} weeks. Try a tempo cluster (3s eccentric × 5) or push to ${nextKg}kg.`,
+        surprise_hook: `${liftName} has been flat ${p.weeks_stalled} weeks — time to vary the stimulus.`,
+        target: { exercise: liftName, weight_kg: nextKg },
+        success_type: 'hit_weight',
+        when_to_do: 'next_session',
+        impact: 3,
+      });
+    }
+  } catch (_e) {
+    // Never block action generation on a signal-derivation failure.
+  }
+
   // ── (G) MICRO actions — quick-wins / habit primers ──
   candidates.push({
     archetype: "micro",
@@ -932,7 +1189,7 @@ function applyActionFilters(candidates, recentlyHandled, lastTrainedMap) {
     if (recentMetrics.has(c.proof.metric)) return false;
     // Recovery guard — don't suggest training a muscle hit in last 48h
     // (UNLESS it's a recovery action that wants to reduce volume)
-    if (c.archetype !== "recover" && c.archetype !== "prevent" && c.target?.muscle) {
+    if (c.archetype !== "recover" && c.archetype !== "prevent" && c.archetype !== "deload" && c.archetype !== "rebalance" && c.target?.muscle) {
       const last = lastTrainedMap[c.target.muscle];
       if (last) {
         const hours = (Date.now() - new Date(last + "T12:00:00").getTime()) / 3600000;
@@ -1759,7 +2016,31 @@ async function refreshFitnessScore(deviceId) {
     return Math.max(60, Math.round(100 - (avgSets - 25) * 2));
   })();
 
-  const result = _computeFitnessScore({ consistency, volume, progression, intensity, days_logged });
+  // Scoring V2 — read recovery signal from cross-agent (sandbox-safe via
+  // today_signals only, per cross-agent law). Recovery composite is
+  // sleep-quality * 0.6 + (100 - mind anxiety scaled) * 0.4 if available,
+  // null otherwise (so V2 falls back to legacy formula cleanly).
+  let recovery = null;
+  try {
+    const xSnap = await userDoc(deviceId).collection('cross_agent').doc('today_signals').get();
+    if (xSnap.exists) {
+      const xs = xSnap.data() || {};
+      const sleepQuality = typeof xs.sleep_quality_today === 'number' ? xs.sleep_quality_today : null;       // 0-100
+      const mindAnxiety  = typeof xs.mind_anxiety_today === 'number'  ? xs.mind_anxiety_today  : null;       // 0-5
+      const mindScore    = mindAnxiety != null ? Math.max(0, 100 - (mindAnxiety / 5) * 100) : null;
+      const parts = [];
+      if (sleepQuality != null) parts.push({ v: sleepQuality, w: 0.6 });
+      if (mindScore    != null) parts.push({ v: mindScore,    w: 0.4 });
+      if (parts.length) {
+        const totalW = parts.reduce((a, p) => a + p.w, 0);
+        recovery = Math.round(parts.reduce((a, p) => a + p.v * p.w, 0) / totalW);
+      }
+    }
+  } catch (e) {
+    log.warn('[fitness] recovery fetch fail:', e?.message);
+  }
+
+  const result = _computeFitnessScore({ consistency, volume, progression, intensity, recovery, days_logged });
   if (!result) return;
 
   await fitnessDoc(deviceId).update({
@@ -1770,35 +2051,109 @@ async function refreshFitnessScore(deviceId) {
   });
 }
 
+// ════════════════════════════════════════════════════════════════
+// Weekly workout templates (2026-05-22). One doc per day of week.
+// User flow:
+//   - Open Track tab → MTWTFSS strip at top, today highlighted
+//   - Today has a template → "Use saved {day} workout" pill → opens
+//     FitnessConfirmSheet pre-filled → tweak weights/reps → log
+//   - Tap any non-today pill → editing that day's template (forward
+//     planning: "I want next Tuesday to be chest+tris")
+//   - Logging via voice/manual ALSO auto-overwrites today's template
+//     (see /log handler above — "what you did today = saved workout")
+// ════════════════════════════════════════════════════════════════
+
+// GET /templates — return ALL 7 days. Days without a template appear
+// as null entries so the FE can render the full week grid in one pass.
+router.get("/templates", async (req, res) => {
+  const { deviceId } = req.query;
+  if (!deviceId) return res.status(400).json({ error: "deviceId required" });
+  try {
+    const snap = await templatesCol(deviceId).get();
+    const byDow = {};
+    snap.forEach((doc) => {
+      const d = doc.data() || {};
+      byDow[doc.id] = {
+        day_of_week: doc.id,
+        day_of_week_num: d.day_of_week_num,
+        exercises: Array.isArray(d.exercises) ? d.exercises : [],
+        last_log_date: d.last_log_date || null,
+        updated_at: d.updated_at && d.updated_at.toDate ? d.updated_at.toDate().toISOString() : null,
+        updated_source: d.updated_source || null,
+      };
+    });
+    // Always return all 7 days — null for days without a template.
+    const templates = DOW_NAMES.map((dow) => byDow[dow] || { day_of_week: dow, exercises: [], last_log_date: null, updated_at: null });
+    res.json({ templates });
+  } catch (err) {
+    log.error('[fitness] GET /templates failed:', err && err.message);
+    res.status(500).json({ error: 'templates_read_failed' });
+  }
+});
+
+// PUT /templates/:dow — manual edit. User explicitly set/updated the
+// template (from the day-tab edit UI, not from logging). Marks source
+// as 'manual_edit' so analytics can distinguish auto- vs user-curated.
+router.put("/templates/:dow", async (req, res) => {
+  const { deviceId, exercises } = req.body;
+  const dow = (req.params.dow || '').toLowerCase();
+  if (!deviceId) return res.status(400).json({ error: "deviceId required" });
+  if (!validDow(dow)) return res.status(400).json({ error: "invalid day_of_week" });
+  if (!Array.isArray(exercises)) {
+    return res.status(400).json({ error: "exercises array required" });
+  }
+  try {
+    const cleanExercises = normalizeWorkoutExercises(exercises);
+    await templatesCol(deviceId).doc(dow).set({
+      day_of_week: dow,
+      day_of_week_num: DOW_NAMES.indexOf(dow),
+      exercises: cleanExercises,
+      updated_at: admin.firestore.FieldValue.serverTimestamp(),
+      updated_source: 'manual_edit',
+    }, { merge: true });
+    res.json({ success: true, day_of_week: dow, exercise_count: cleanExercises.length });
+  } catch (err) {
+    if (err?.status) {
+      return res.status(err.status).json({ error: err.message });
+    }
+    log.error('[fitness] PUT /templates failed:', err && err.message);
+    res.status(500).json({ error: 'template_write_failed' });
+  }
+});
+
+// DELETE /templates/:dow — user wants to clear that day's template
+// (e.g. they don't typically train on Sunday).
+router.delete("/templates/:dow", async (req, res) => {
+  const { deviceId } = req.query;
+  const dow = (req.params.dow || '').toLowerCase();
+  if (!deviceId) return res.status(400).json({ error: "deviceId required" });
+  if (!validDow(dow)) return res.status(400).json({ error: "invalid day_of_week" });
+  try {
+    await templatesCol(deviceId).doc(dow).delete();
+    res.json({ success: true });
+  } catch (err) {
+    log.error('[fitness] DELETE /templates failed:', err && err.message);
+    res.status(500).json({ error: 'template_delete_failed' });
+  }
+});
+
 // POST /log — log a workout session
 router.post("/log", async (req, res) => {
   const { deviceId, exercises, date } = req.body;
   if (!deviceId) return res.status(400).json({ error: "deviceId required" });
-  if (!Array.isArray(exercises) || exercises.length === 0) {
-    return res.status(400).json({ error: "exercises array required" });
-  }
   try {
     const anchor = await resolveAnchor(deviceId);
     let workoutDate;
     try {
+      // No `allowFuture` escape hatch — future logs are not a real-user
+      // affordance. Mock data for date ranges goes through the dev mock
+      // pipeline, not the live log endpoint.
       workoutDate = assertLoggableDate(date, anchor);
     } catch (e) { return sendLogGuardError(res, e); }
 
-    // Enrich exercises with muscle groups + e1RM
-    const enriched = exercises.map((ex) => ({
-      name: ex.name || "Unknown",
-      muscle_group: detectMuscleGroup(ex.name),
-      sets: (ex.sets || []).map((s) => {
-        const reps = parseInt(s.reps, 10) || 0;
-        const weight_kg = parseFloat(s.weight_kg) || 0;
-        const rpe = s.rpe != null ? Math.max(1, Math.min(10, parseFloat(s.rpe))) : null;
-        // Epley formula: weight * (1 + 0.0333 * reps)
-        const e1rm = weight_kg > 0 && reps > 0
-          ? Math.round(weight_kg * (1 + 0.0333 * reps) * 10) / 10
-          : null;
-        return { reps, weight_kg, ...(rpe != null ? { rpe } : {}), ...(e1rm != null ? { e1rm } : {}) };
-      }),
-    }));
+    // Validate + enrich exercises with muscle groups + e1RM. Blank fields
+    // are rejected here, not converted to zero.
+    const enriched = normalizeWorkoutExercises(exercises);
 
     // Compute total volume
     const totalVolume = enriched.reduce(
@@ -1810,14 +2165,65 @@ router.post("/log", async (req, res) => {
 
     const workoutRef = workoutsCol(deviceId).doc();
 
+    // day_of_week derived from the LOCAL workout date (YYYY-MM-DD parsed
+    // as midday-local so DST/UTC edge cases don't drift). Persisted on
+    // the workout doc so downstream queries can filter by "all Mondays"
+    // without re-parsing date strings per-doc. User requested this for
+    // upcoming day-pattern analytics ("DAY WILL BE MOST USED STUFF").
+    const _dowDate = new Date(workoutDate + 'T12:00:00');
+    const _dowNum = _dowDate.getDay(); // 0=Sun..6=Sat
+    const dayOfWeek = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'][_dowNum];
+
     // ONE write — this is the only thing blocking the response
     await workoutRef.set({
       date: workoutDate,
+      day_of_week: dayOfWeek,
+      day_of_week_num: _dowNum,
       exercises: enriched,
       total_sets: totalSets,
       total_volume_kg: round(totalVolume, 1),
       personal_records: [],          // filled in by background job
       logged_at: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    // Auto-update the day-of-week template with the exercises just logged.
+    // Rules (2026-05-22):
+    //   - SAME calendar day as last template update → APPEND new exercises
+    //     to existing (so 2 logs of [bench,squat] + [deadlift,row,curl]
+    //     yield Friday template = [bench,squat,deadlift,row,curl], all 5).
+    //   - DIFFERENT day (fresh week) → REPLACE (last Friday's template
+    //     gives way to this Friday's first log).
+    // Uses a Firestore transaction so two concurrent logs can't clobber
+    // each other's appends. Doesn't block the response (setImmediate).
+    setImmediate(() => {
+      const tplExercises = enriched.map((ex) => ({
+        name: ex.name,
+        muscle_group: ex.muscle_group,
+        sets: (ex.sets || []).map((s) => ({
+          reps: s.reps || 0,
+          weight_kg: s.weight_kg || 0,
+        })),
+      }));
+      const tplRef = templatesCol(deviceId).doc(dayOfWeek);
+      db().runTransaction(async (tx) => {
+        const snap = await tx.get(tplRef);
+        const existing = snap.exists ? snap.data() : null;
+        const isSameDay = existing && existing.last_log_date === workoutDate;
+        const finalExercises = isSameDay
+          ? [...(Array.isArray(existing.exercises) ? existing.exercises : []), ...tplExercises]
+          : tplExercises;
+        tx.set(tplRef, {
+          day_of_week: dayOfWeek,
+          day_of_week_num: _dowNum,
+          exercises: finalExercises,
+          last_log_date: workoutDate,        // local-TZ YYYY-MM-DD
+          updated_at: admin.firestore.FieldValue.serverTimestamp(),
+          updated_source: 'log',
+          last_workout_id: workoutRef.id,
+        }, { merge: true });
+      }).catch((err) => {
+        log.warn(`[fitness] template auto-update failed for ${deviceId}/${dayOfWeek}: ${err && err.message}`);
+      });
     });
 
     // Respond immediately — client gets confirmation in ~300ms
@@ -1955,6 +2361,9 @@ router.post("/log", async (req, res) => {
       }
     });
   } catch (e) {
+    if (e?.status) {
+      return res.status(e.status).json({ error: e.message });
+    }
     log.error("[fitness] log:", e);
     return res.status(500).json({ error: "server error" });
   }
@@ -2110,8 +2519,16 @@ router.post("/session/log", async (req, res) => {
     }
     const muscle = detectMuscleGroup(exercise_name);
     const enrichedSets = sets.map(s => {
-      const reps = parseInt(s.reps, 10) || 0;
-      const weight_kg = parseFloat(s.weight_kg) || 0;
+      const hasReps = s && s.reps !== undefined && s.reps !== null && s.reps !== '';
+      const hasWeight = s && s.weight_kg !== undefined && s.weight_kg !== null && s.weight_kg !== '';
+      const reps = hasReps ? parseInt(s.reps, 10) : NaN;
+      const weight_kg = hasWeight ? parseFloat(s.weight_kg) : NaN;
+      if (!Number.isFinite(reps) || reps <= 0) {
+        throw Object.assign(new Error('reps required'), { status: 400 });
+      }
+      if (!Number.isFinite(weight_kg) || weight_kg < 0) {
+        throw Object.assign(new Error('weight required'), { status: 400 });
+      }
       const rpe = s.rpe != null ? Math.max(1, Math.min(10, parseFloat(s.rpe))) : null;
       const rir = s.rir != null ? Math.max(0, Math.min(10, parseInt(s.rir, 10))) : null;
       const e1rm = weight_kg > 0 && reps > 0
@@ -2134,6 +2551,7 @@ router.post("/session/log", async (req, res) => {
     });
     res.json({ ok: true, sets_logged: enrichedSets.length });
   } catch (e) {
+    if (e?.status) return res.status(e.status).json({ error: e.message });
     log.error("[fitness] /session/log:", e);
     res.status(500).json({ error: e.message });
   }
@@ -2238,11 +2656,15 @@ router.post("/describe", async (req, res) => {
           const exercises = (src.exercises || []).map(ex => ({
             exercise:     String(ex.name || '').slice(0, 60),
             muscle_group: ex.muscle_group || null,
-            sets: (ex.sets || []).map(s => ({
-              reps:      Math.max(0, parseInt(s.reps, 10) || 0),
-              weight_kg: Math.max(0, parseFloat(s.weight_kg) || 0),
-              ...(Number.isFinite(parseInt(s.rir, 10)) ? { rir: parseInt(s.rir, 10) } : {}),
-            })),
+            sets: (ex.sets || []).map(s => {
+              const hasWeight = s.weight_kg !== undefined && s.weight_kg !== null && s.weight_kg !== '';
+              const parsedWeight = hasWeight ? parseFloat(s.weight_kg) : NaN;
+              return {
+                reps:      Math.max(0, parseInt(s.reps, 10) || 0),
+                weight_kg: Number.isFinite(parsedWeight) ? Math.max(0, parsedWeight) : null,
+                ...(Number.isFinite(parseInt(s.rir, 10)) ? { rir: parseInt(s.rir, 10) } : {}),
+              };
+            }),
             missing: [],
           })).filter(ex => ex.exercise && ex.sets.length > 0);
           if (exercises.length > 0) {
@@ -2255,6 +2677,7 @@ router.post("/describe", async (req, res) => {
               replay_source_date: src.date,
               latency_ms: Date.now() - 0,  // negligible — no LLM call
               model: 'replay',
+              fast_path: true, // Replay regex matched — FE telemetry uses this for parse-latency analytics
             });
           }
         }
@@ -2263,6 +2686,44 @@ router.post("/describe", async (req, res) => {
       } catch (e) {
         log.warn('[fitness] replay lookup fail:', e?.message);
       }
+    }
+
+    // ── Pre-bias the parser with the user's last 3 sessions ────────────
+    // Per AI audit (2026-05-21) — when the model knows what exercises the
+    // user typically does + their typical weights, it disambiguates noisy
+    // ASR way better. E.g. transcript says "bench 4 by 10 at 8 5" — model
+    // knows user typically benches 85kg, so resolves "8 5" → "85kg" instead
+    // of "8.5kg" or "8 reps at 5kg". Also catches cross-language noise
+    // (Hindi/Spanish phonemes from gym ambient) by anchoring expected
+    // vocabulary. Capped at ~80 chars per session to keep token cost low.
+    let historyBias = '';
+    try {
+      const histSnap = await workoutsCol(deviceId)
+        .orderBy('logged_at', 'desc').limit(3).get().catch(() => ({ docs: [] }));
+      if (histSnap.docs.length) {
+        const lines = histSnap.docs.map(d => {
+          const w = d.data() || {};
+          const exs = (w.exercises || []).slice(0, 4).map(ex => {
+            const top = (ex.sets || [])[0] || {};
+            const wt = top.weight_kg || 0;
+            return `${ex.name || 'unknown'} ${(ex.sets || []).length}×${top.reps || 0}@${wt}kg`;
+          });
+          return `${w.date || '?'}: ${exs.join(', ')}`;
+        });
+        if (lines.length) {
+          historyBias = [
+            '',
+            'USER\'S LAST 3 SESSIONS (use to disambiguate noisy transcripts):',
+            ...lines.map(l => '  - ' + l),
+            'If the user mentions an exercise from this list, prefer the exact name',
+            'they\'ve used before. If a number in the transcript is ambiguous, prefer',
+            'a value within ±20% of their last working weight on that exercise.',
+            '',
+          ].join('\n');
+        }
+      }
+    } catch (e) {
+      log.warn('[fitness] history-bias fail:', e?.message);
     }
 
     const systemPrompt = [
@@ -2308,7 +2769,7 @@ router.post("/describe", async (req, res) => {
       '    {',
       '      "exercise": canonical name (e.g. "Back Squat", "Bench Press"),',
       '      "muscle_group": one of the muscle group ids listed above,',
-      '      "sets": [{ "reps": int, "weight_kg": number, "rir": int|null, "notes": string|null }],',
+      '      "sets": [{ "reps": int, "weight_kg": number|null, "rir": int|null, "notes": string|null }],',
       '      "missing": []  // see PER-FIELD CONFIDENCE below',
       '    },',
       '    ...',
@@ -2326,10 +2787,10 @@ router.post("/describe", async (req, res) => {
       '',
       'Examples:',
       '- User says "I did bench press" → exercise: "Bench Press", muscle_group:',
-      '  "chest", sets: [{reps:0, weight_kg:0}], missing: ["sets_count","reps","weight"]',
-      '- User says "bench, 4 sets" → sets: [4 placeholder sets with reps:0, weight_kg:0],',
+      '  "chest", sets: [{reps:0, weight_kg:null}], missing: ["sets_count","reps","weight"]',
+      '- User says "bench, 4 sets" → sets: [4 placeholder sets with reps:0, weight_kg:null],',
       '  missing: ["reps","weight"]',
-      '- User says "bench, 4 sets of 8" → sets: [4 sets with reps:8, weight_kg:0],',
+      '- User says "bench, 4 sets of 8" → sets: [4 sets with reps:8, weight_kg:null],',
       '  missing: ["weight"]',
       '- User says "bench 4 sets of 8 at 80" → sets fully filled, missing: []',
       '- Bodyweight exercises (pull-ups, dips, push-ups, planks): weight_kg=0 is',
@@ -2354,7 +2815,7 @@ router.post("/describe", async (req, res) => {
                   type: 'object',
                   properties: {
                     reps:      { type: 'integer' },
-                    weight_kg: { type: 'number' },
+                    weight_kg: { type: 'number', nullable: true },
                     rir:       { type: 'integer', nullable: true },
                     notes:     { type: 'string', nullable: true },
                   },
@@ -2377,37 +2838,78 @@ router.post("/describe", async (req, res) => {
     let parsed = null;
     let usedModel = 'unknown';
 
-    // Gemini Flash primary
-    parsed = await callGeminiVision({
-      systemPrompt,
-      userText: `User said: "${text}"`,
-      images: [],
-      responseSchema,
-      maxOutputTokens: 500,
-      model: AI.VISION_PRIMARY,
-      label: 'fitness-describe',
-    });
-    if (parsed) usedModel = 'gemini-2.5-flash';
+    // Inject the history-bias block (last 3 sessions) AFTER the static
+    // systemPrompt so it acts as a contextual prefix to the user transcript.
+    // Empty string when the user has no prior workouts — zero overhead.
+    const biasedSystemPrompt = historyBias ? `${systemPrompt}\n${historyBias}` : systemPrompt;
 
-    // No images here, so vision-router degrades. Try OpenAI direct as fallback.
+    // PARSE STRATEGY — 2026-05-21 rewrite for reliability (user reported
+    // 2/4 parse failures with "AI response unparseable").
+    //
+    // Layer 1: OpenAI with `response_format: json_object` PRIMARY. Per the
+    //          AI audit, the prior Gemini-Flash primary was the failure
+    //          point because vision-router degrades on text-only input
+    //          and the model occasionally returned unparseable JSON. The
+    //          OpenAI chat path with json_object mode is rock-solid for
+    //          structured extraction at this token budget.
+    // Layer 2: Gemini Flash fallback (vision-router) if OpenAI errors.
+    // Layer 3: 502 ONLY if both fail. We log the raw output so we can
+    //          inspect drift in production.
+
+    // Layer 1 — OpenAI primary (json_object mode)
+    // 2026-05-22 bug fix: max_completion_tokens bumped 700 → 2000. With
+    // a 4-exercise workout described naturally ("I did bench, four sets
+    // of eight at 80 kilos, then incline DB, three sets of ten..."),
+    // the structured JSON output (exercises[] × sets[] × {reps, weight,
+    // rir, notes}) routinely exceeded 700 tokens, returning truncated
+    // JSON that crashed JSON.parse with "Unexpected end of JSON input"
+    // and cascaded to BOTH layers failed → 502. 2000 leaves plenty of
+    // headroom for 6+ exercises while still being cheap (~$0.0002/call).
+    try {
+      const completion = await openai.chat.completions.create({
+        model: AI.CHAT_STREAM,
+        max_completion_tokens: 2000,
+        messages: [
+          { role: "system", content: biasedSystemPrompt },
+          { role: "user", content: `User said: "${text}"` },
+        ],
+        response_format: { type: "json_object" },
+      });
+      const raw = completion.choices?.[0]?.message?.content?.trim() || "{}";
+      parsed = JSON.parse(raw);
+      usedModel = AI.CHAT_STREAM;
+    } catch (e) {
+      log.warn("[fitness] /describe layer-1 fail, falling back to Gemini:", e?.message);
+    }
+
+    // Layer 2 — Gemini Flash fallback (only if Layer 1 didn't produce a parse)
+    // 2026-05-22 bug fix: pass `allowTextOnly: true` so the call doesn't
+    // early-return null. Voice transcripts have no image — previously
+    // callGeminiVision rejected empty-images requests silently, making
+    // this "fallback" a no-op. With the flag set, Gemini parses the
+    // text just like OpenAI did.
     if (!parsed) {
       try {
-        const completion = await openai.chat.completions.create({
-          model: AI.CHAT_STREAM,
-          max_completion_tokens: 500,
-          messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: `User said: "${text}"` },
-          ],
-          response_format: { type: "json_object" },
+        parsed = await callGeminiVision({
+          systemPrompt: biasedSystemPrompt,
+          userText: `User said: "${text}"`,
+          images: [],
+          responseSchema,
+          maxOutputTokens: 2000,
+          model: AI.VISION_PRIMARY,
+          label: 'fitness-describe-fallback',
+          allowTextOnly: true,
         });
-        const raw = completion.choices?.[0]?.message?.content?.trim() || "{}";
-        parsed = JSON.parse(raw);
-        usedModel = "gpt-4.1-mini";
+        if (parsed) usedModel = AI.VISION_PRIMARY;
       } catch (e) {
-        log.error("[fitness] /describe parse fail:", e?.message);
-        return res.status(502).json({ error: "AI response unparseable" });
+        log.error("[fitness] /describe layer-2 fail:", e?.message);
       }
+    }
+
+    // Layer 3 — both layers failed → 502
+    if (!parsed) {
+      log.error("[fitness] /describe BOTH layers failed for transcript:", text.slice(0, 120));
+      return res.status(502).json({ error: "AI response unparseable" });
     }
 
     // ── Sanitize ── normalize legacy shape (single `exercise` + `sets`) into
@@ -2416,13 +2918,17 @@ router.post("/describe", async (req, res) => {
       'chest', 'back', 'legs', 'shoulders', 'arms', 'core', 'cardio', 'full_body',
     ]);
     const sanitizeSets = (raw) => (Array.isArray(raw) ? raw.slice(0, 20) : [])
-      .map(s => ({
-        reps:      Math.max(0, Math.min(100, parseInt(s.reps, 10) || 0)),
-        weight_kg: Math.max(0, Math.min(500, parseFloat(s.weight_kg) || 0)),
-        ...(Number.isFinite(parseInt(s.rir, 10)) ? { rir: Math.max(0, Math.min(10, parseInt(s.rir, 10))) } : {}),
-        ...(s.notes ? { notes: String(s.notes).slice(0, 100) } : {}),
-      }));
-    // Note: NO filter here. Placeholder sets (reps=0, weight=0) are kept
+      .map(s => {
+        const hasWeight = s.weight_kg !== undefined && s.weight_kg !== null && s.weight_kg !== '';
+        const parsedWeight = hasWeight ? parseFloat(s.weight_kg) : NaN;
+        return {
+          reps:      Math.max(0, Math.min(100, parseInt(s.reps, 10) || 0)),
+          weight_kg: Number.isFinite(parsedWeight) ? Math.max(0, Math.min(500, parsedWeight)) : null,
+          ...(Number.isFinite(parseInt(s.rir, 10)) ? { rir: Math.max(0, Math.min(10, parseInt(s.rir, 10))) } : {}),
+          ...(s.notes ? { notes: String(s.notes).slice(0, 100) } : {}),
+        };
+      });
+    // Note: NO filter here. Placeholder sets (reps=0, weight=null) are kept
     // when the exercise has "reps"/"weight"/"sets_count" in `missing` so
     // the FE can render "tap to fill" pickers. canSave on FE blocks the
     // save button until reps > 0 on every set.
@@ -2509,7 +3015,9 @@ router.post("/describe", async (req, res) => {
             if (built.length > 0) {
               exercises = built;
               confidence = Math.max(0, Math.min(100, parseInt(reParsed.confidence, 10) || confidence));
-              usedModel = `${usedModel}+cleanup-gpt-4o-mini`;
+              // Source cleanup model name from AI registry instead of
+              // hardcoded 'gpt-4o-mini' — model registry law compliance.
+              usedModel = `${usedModel}+cleanup-${AI.VISION_PRIMARY}`;
             }
           }
         }
@@ -2534,6 +3042,10 @@ router.post("/describe", async (req, res) => {
         : undefined,
       latency_ms:       Date.now() - t0,
       model:            usedModel,
+      // Main parse path used the LLM (not regex). FE telemetry records
+      // this as used_fast_path:false so we can tune the regex coverage
+      // later. Replay path returns fast_path:true at line ~2257.
+      fast_path:        false,
     });
   } catch (e) {
     log.error("[fitness] /describe:", e);
@@ -3388,15 +3900,16 @@ async function _generateFitnessV2Insights(deviceId, range, ctx) {
     '- Tone: brutal-honest performance coach. No praise filler. No emojis.',
   ].join('\n');
 
+  const fmtKg = (kg) => `${Math.round(Number(kg) || 0).toLocaleString('en-US')} kg`;
   const userPrompt = [
     `RANGE: last ${ctx.rangeDays} days.`,
     `SCORE: ${ctx.score}/100 (${ctx.grade}).`,
-    `STATS: ${ctx.days_logged} sessions, ${(ctx.total_volume_kg / 1000).toFixed(1)}T volume, avg ${ctx.avg_sets} sets/session, avg RPE ${ctx.avg_rpe}, avg quality ${ctx.avg_quality}/100, streak ${ctx.streak} days, volatility ${ctx.volatility_pct}%.`,
+    `STATS: ${ctx.days_logged} sessions, ${fmtKg(ctx.total_volume_kg)} volume, avg ${ctx.avg_sets} sets/session, avg RPE ${ctx.avg_rpe}, streak ${ctx.streak} days, volatility ${ctx.volatility_pct}%.`,
     `MUSCLE COVERAGE: ${muscleSnapshot}`,
     `STRENGTH DELTAS: ${strengthDelta || 'insufficient data'}`,
     `PRS THIS PERIOD: ${(ctx.prs_period || []).length}`,
-    `BEST DAY: ${ctx.best_day ? `${ctx.best_day.label} — ${ctx.best_day.total_volume_kg}kg / ${ctx.best_day.session_quality}/100` : 'none'}.`,
-    `WORST DAY: ${ctx.worst_day ? `${ctx.worst_day.label} — ${ctx.worst_day.total_volume_kg}kg / ${ctx.worst_day.session_quality}/100` : 'none'}.`,
+    `BEST DAY: ${ctx.best_day ? `${ctx.best_day.label} — ${fmtKg(ctx.best_day.total_volume_kg)}` : 'none'}.`,
+    `WORST DAY: ${ctx.worst_day ? `${ctx.worst_day.label} — ${fmtKg(ctx.worst_day.total_volume_kg)}` : 'none'}.`,
     `${skipNote}`,
     crossCtx ? `CROSS-AGENT: ${crossCtx}` : '',
   ].filter(Boolean).join('\n');
@@ -3548,14 +4061,17 @@ function _fallbackAhaMoments(ctx) {
 }
 
 function _fallbackHeadline(ctx) {
-  const tons = (ctx.total_volume_kg / 1000).toFixed(1);
+  // Volume rendered as "5,400 kg" (comma-grouped) instead of "5.4T" — explicit
+  // unit, no ambiguity. Matches FE fmtVolume() rendering.
+  const volKg = Math.round(ctx.total_volume_kg || 0);
+  const volStr = volKg.toLocaleString('en-US') + ' kg';
   const prs = ctx.prs_period?.length || 0;
   const dragMuscle = (ctx.muscle_volume || []).find(m => m.status === 'below_mev');
   const champMuscle = (ctx.muscle_volume || []).find(m => m.status === 'in_mav' || m.status === 'mav_to_mrv');
   const parts = [];
   if (prs > 0) parts.push(`${prs} PR${prs > 1 ? 's' : ''}`);
   parts.push(`${ctx.days_logged} sessions`);
-  parts.push(`${tons}T volume`);
+  parts.push(`${volStr} volume`);
   let tail = '';
   if (champMuscle) tail = `${champMuscle.muscle.charAt(0).toUpperCase() + champMuscle.muscle.slice(1)} firing.`;
   if (dragMuscle) tail += ` ${dragMuscle.muscle.charAt(0).toUpperCase() + dragMuscle.muscle.slice(1)} is the bottleneck.`;
@@ -3593,7 +4109,10 @@ router.get("/analysis", async (req, res) => {
     }
 
     const setup = fSnap.data();
-    const allWorkouts = wSnap.docs.map((d) => d.data());
+    const allWorkoutsRaw = wSnap.docs.map((d) => d.data());
+    // Future-dated logs (allowed in dev via `dev_allow_future`) must NOT
+    // inflate "what happened so far". Single source of truth in lib/fitness-scoring.
+    const allWorkouts = _fitScoring.dropFutureWorkouts(allWorkoutsRaw, win.todayDate);
     // Lifetime set = all workouts since anchor (used only for score_lifetime).
     const anchorMsLocal = anchor.anchorMs || 0;
     const lifetimeWorkouts = anchorMsLocal > 0
@@ -3603,6 +4122,15 @@ router.get("/analysis", async (req, res) => {
     const workouts = allWorkouts.filter((w) => getMillis(w.logged_at) >= cutoffMs);
 
     if (workouts.length === 0) {
+      // Day-0 response — still emit all keys the FE expects so guards never
+      // trip on undefined. Contribution map is still anchor-aware (just
+      // empty levels). Form returns null band — UI hides the section.
+      const _emptyContrib = _fitScoring.deriveContributionMap({
+        dayQualityByDate: {},
+        anchorDate: anchor.anchorDateStr,
+        todayDate: win.todayDate,
+        spanDays: 365,
+      });
       return res.json({
         setup_completed: true,
         range,
@@ -3612,9 +4140,10 @@ router.get("/analysis", async (req, res) => {
         anchor_date: anchor.anchorDateStr,
         is_clamped: win.isClamped,
         score_today: null,
+        score_7d_smoothed: null,
         score_lifetime: null,
         missed_days: 0,
-        fitness_score: { score: null, label: "Begin", components: { volume: 0, intensity: 0, consistency: 0, recovery: 0 } },
+        fitness_score: { score: null, label: "Begin", components: { volume: 0, intensity: 0, consistency: 0 } },
         score_grade:    { letter: "—" },
         signal_points:  [],
         daily_logs:     {},
@@ -3640,14 +4169,54 @@ router.get("/analysis", async (req, res) => {
         stats: {
           days_logged: 0, total_logs: 0, total_volume_kg: 0, total_sets: 0,
           avg_volume_kg: 0, avg_sets: 0, avg_quality: 0, avg_rpe: 0,
+          avg_duration_min: null, set_density: null,
           vol_hit_days: 0, sets_hit_days: 0,
         },
         vol_target: 4500,
         sets_target: 14,
+        // ── NEW Day-0 surfaces (parallel keys, safe defaults) ──
+        form: null,
+        prior: null,
+        effort_mix: { easy_pct: 0, working_pct: 0, max_pct: 0, working_n: 0, total_n: 0 },
+        push_pull_legs: { push_sets: 0, pull_sets: 0, legs_sets: 0, push_pct: 0, pull_pct: 0, legs_pct: 0, warn: false },
+        muscle_frequency: [],
+        exercise_variety: { unique: 0, stagnant: false },
+        hour_grid: Array.from({ length: 7 }, () => new Array(24).fill(0)),
+        contribution_map: _emptyContrib.cells,
+        contribution_summary: _emptyContrib.summary,
       });
     }
 
     // ── Aggregate signals ─────────────────────────────────────
+    // top_weight_kg = heaviest single set across all exercises in the session.
+    // Powers the 4th chart series (Top) — the metric lifters actually track
+    // to feel progress. Bodyweight sessions surface as 0 → chart skips them
+    // for that series, but volume/sets/rpe still render.
+    const _sessionTopKg = (w) => {
+      let top = 0;
+      for (const ex of (w.exercises || [])) {
+        for (const s of (ex.sets || [])) {
+          const kg = +s.weight_kg || 0;
+          if (kg > top) top = kg;
+        }
+      }
+      return top;
+    };
+
+    // Per-session quality derived from real signals (volume/RPE/sets/PR) —
+    // the legacy `session_quality` field (session-timer flow, deprecated)
+    // is ignored entirely. Helper lives in lib/fitness-scoring so tests
+    // can exercise the math without booting Firestore.
+    const VOL_TARGET_LIVE  = setup.weekly_volume_target_kg || 4500;
+    const SETS_TARGET_LIVE = setup.weekly_sets_target || 14;
+    const _qOpts = { weeklyVolTarget: VOL_TARGET_LIVE, weeklySetsTarget: SETS_TARGET_LIVE };
+
+    // Pre-compute per-workout quality once, attach to each workout for reuse.
+    workouts.forEach((w) => { w._derived_quality = _fitScoring.deriveSessionQuality(w, _qOpts); });
+    lifetimeWorkouts.forEach((w) => {
+      if (!('_derived_quality' in w)) w._derived_quality = _fitScoring.deriveSessionQuality(w, _qOpts);
+    });
+
     const signal_points = workouts
       .slice()
       .sort((a, b) => (a.date || "").localeCompare(b.date || ""))
@@ -3656,7 +4225,8 @@ router.get("/analysis", async (req, res) => {
         label:          new Date(w.date + "T12:00:00").toLocaleDateString("en", { month: "short", day: "numeric" }),
         volume_kg:      w.total_volume_kg || 0,
         sets:           w.total_sets || 0,
-        session_quality:w.session_quality || 60,
+        top_weight_kg:  _sessionTopKg(w),
+        session_quality:w._derived_quality,
         rpe_avg:        w.rpe_avg || 7,
       }));
 
@@ -3665,37 +4235,41 @@ router.get("/analysis", async (req, res) => {
     const days_logged     = workouts.length;
     const avg_volume_kg   = Math.round(total_volume_kg / Math.max(days_logged, 1));
     const avg_sets        = Math.round(total_sets / Math.max(days_logged, 1));
-    const avg_quality     = Math.round(workouts.reduce((a, w) => a + (w.session_quality || 60), 0) / Math.max(days_logged, 1));
+    const avg_quality     = Math.round(workouts.reduce((a, w) => a + w._derived_quality, 0) / Math.max(days_logged, 1));
     const avg_rpe         = +(workouts.reduce((a, w) => a + (w.rpe_avg || 7), 0) / Math.max(days_logged, 1)).toFixed(1);
 
-    // Daily logs map (last 35 days for calendar)
+    // Daily logs map (calendar). Quality bucket comes from the derived score:
+    // ≥75 good · ≥55 ok · <55 poor — matches user perception (a heavy PR day
+    // with RPE 8 reads "good"; a 3-set warm-up reads "ok"; a half-hearted
+    // session lands "poor").
     const daily_logs = {};
     workouts.forEach((w) => {
       if (!w.date) return;
-      const q = (w.session_quality || 60) >= 75 ? "good" : (w.session_quality || 60) >= 55 ? "ok" : "poor";
+      const dq = w._derived_quality;
+      const q  = dq >= 75 ? "good" : dq >= 55 ? "ok" : "poor";
       daily_logs[w.date] = {
         has_log:         true,
         quality:         q,
         total_volume_kg: w.total_volume_kg || 0,
         total_sets:      w.total_sets || 0,
-        session_quality: w.session_quality || 60,
+        session_quality: dq,
       };
     });
 
-    const sortedByQ = workouts.slice().sort((a, b) => (b.session_quality || 0) - (a.session_quality || 0));
+    const sortedByQ = workouts.slice().sort((a, b) => b._derived_quality - a._derived_quality);
     const best_day = sortedByQ[0] ? {
       date: sortedByQ[0].date,
       label: new Date(sortedByQ[0].date + "T12:00:00").toLocaleDateString("en", { weekday: "long", month: "short", day: "numeric" }),
       total_volume_kg: sortedByQ[0].total_volume_kg || 0,
       total_sets: sortedByQ[0].total_sets || 0,
-      session_quality: sortedByQ[0].session_quality || 0,
+      session_quality: sortedByQ[0]._derived_quality,
     } : null;
     const worst_day = sortedByQ.length >= 3 && sortedByQ[sortedByQ.length - 1] ? {
       date: sortedByQ[sortedByQ.length - 1].date,
       label: new Date(sortedByQ[sortedByQ.length - 1].date + "T12:00:00").toLocaleDateString("en", { weekday: "long", month: "short", day: "numeric" }),
       total_volume_kg: sortedByQ[sortedByQ.length - 1].total_volume_kg || 0,
       total_sets: sortedByQ[sortedByQ.length - 1].total_sets || 0,
-      session_quality: sortedByQ[sortedByQ.length - 1].session_quality || 0,
+      session_quality: sortedByQ[sortedByQ.length - 1]._derived_quality,
     } : null;
 
     // Volatility
@@ -3783,16 +4357,21 @@ router.get("/analysis", async (req, res) => {
       });
 
     // ─── Peak hour & evening % from session timestamps ───────────
+    // Honor the user's local TZ offset so peak_hour and the new hour_grid
+    // (which DOES apply the offset) agree. Server-local Date.getHours()
+    // drifted vs hour_grid on Fly's UTC instance and confused users.
     let peak_hour = null;
     let peak_hour_session_count = 0;
     let evening_session_pct = 0;
     if (workouts.length > 0) {
+      const offMs = (anchor.utcOffsetMinutes || 0) * 60_000;
       const hourCounts = {};
       let eveningCount = 0;
       workouts.forEach((w) => {
         const ms = getMillis(w.logged_at);
         if (!ms) return;
-        const h = new Date(ms).getHours();
+        const local = new Date(ms + offMs);
+        const h = local.getUTCHours();
         hourCounts[h] = (hourCounts[h] || 0) + 1;
         if (h >= 19) eveningCount++;
       });
@@ -3816,15 +4395,40 @@ router.get("/analysis", async (req, res) => {
       const d = new Date(cur); d.setDate(d.getDate() - 1); cur = dateStr(d);
     }
 
-    // Score: weighted blend
+    // ── Score: weighted blend × maturity ramp ──────────────────────────
+    // 2026-05-22 fix: prior formula had NO maturity dampening, returning
+    // 80/100 on Day 1 from a single session with perfect inputs. User law:
+    // "score must start low and improve over days/months." Two changes:
+    //  1. Compare WEEKLY actuals vs WEEKLY target (not avg-per-session
+    //     vs weekly target — that bug made a single big session = 100%).
+    //  2. Multiply the raw blend by a maturity ramp that starts at 0.40
+    //     (Day 1) and climbs to 1.00 over 30 days. Validated against
+    //     Whoop/Strava cold-start philosophy — confidence grows with data.
     const VOL_TARGET = setup.weekly_volume_target_kg || 4500;
     const SETS_TARGET = setup.weekly_sets_target || 14;
-    const volPctOfTarget = Math.min(100, Math.round((avg_volume_kg / VOL_TARGET) * 100));
-    const intensityScore = Math.min(100, Math.round(((avg_rpe - 5) / 4) * 100));
-    const consistencyScore = Math.min(100, Math.round((days_logged / Math.max(rangeDays / 2.3, 1)) * 100));
-    const recoveryScore = avg_quality;
-    const score = Math.round(volPctOfTarget * 0.30 + intensityScore * 0.25 + consistencyScore * 0.25 + recoveryScore * 0.20);
-    const grade = score >= 90 ? "A" : score >= 80 ? "B+" : score >= 70 ? "B" : score >= 60 ? "C+" : score >= 50 ? "C" : "D";
+    // Weekly actual vs weekly target. Use the last 7 days of workouts.
+    const sevenDaysAgo = new Date(); sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 6);
+    const sevenDaysAgoStr = dateStr(sevenDaysAgo);
+    const weeklyVolKg = workouts
+      .filter(w => w.date >= sevenDaysAgoStr)
+      .reduce((s, w) => s + (w.total_volume_kg || 0), 0);
+    const sessionsThisWeek = new Set(
+      workouts.filter(w => w.date >= sevenDaysAgoStr).map(w => w.date),
+    ).size;
+    // Blended raw score (vol 0.38 / intensity 0.31 / consistency 0.31).
+    // All three components floored at 0 — RPE < 5 used to make intensity
+    // negative and silently drag the blend down. Lives in lib/fitness-scoring.
+    const _blend = _fitScoring.computeBlendedScore({
+      weeklyVolKg, volTarget: VOL_TARGET,
+      avgRpe: avg_rpe, sessionsThisWeek,
+    });
+    const { raw: rawScore, volPctOfTarget, intensityScore, consistencyScore } = _blend;
+    // Maturity ramp keyed on calendar days (anchor → today), not session
+    // count: cramming 30 sessions in 3 days can't fake-mature. Falls back
+    // to days_logged for legacy users with no anchor. Helper in lib/fitness-scoring.
+    const rampDays = win.daysSinceAnchor > 0 ? win.daysSinceAnchor : days_logged;
+    const score = Math.round(rawScore * _fitScoring.maturityRamp(rampDays));
+    const grade = score >= 90 ? "A" : score >= 80 ? "B+" : score >= 70 ? "B" : score >= 60 ? "C+" : score >= 50 ? "C" : score >= 40 ? "D+" : score >= 25 ? "D" : "Begin";
 
     // ── Compute the rich V4 fields ──
     const muscle_volume  = computeMuscleVolume(workouts, rangeDays);
@@ -3853,15 +4457,18 @@ router.get("/analysis", async (req, res) => {
     const headline    = llmOutput?.hero_headline || _fallbackHeadline(insightContext);
 
     // Standard outputs: score_today / score_7d_smoothed / score_lifetime / missed_days
-    // Per-day quality = mean of session_quality across that day's workouts.
-    // Computed over LIFETIME workouts (anchor → today) so score_lifetime is
-    // independent of the requested range.
+    // Per-day quality = mean of DERIVED session quality across that day's
+    // workouts. Computed over LIFETIME workouts (anchor → today) so
+    // score_lifetime is independent of the requested range. Uses
+    // _deriveSessionQuality (volume + RPE + sets + PR), never the legacy
+    // session_quality field — that field came from the deprecated session-
+    // timer flow and defaulted to 60, which silently flattened every score.
     const dayQualityByDate = (() => {
       const acc = {};
       for (const w of lifetimeWorkouts) {
         if (!w.date) continue;
         if (!acc[w.date]) acc[w.date] = [];
-        acc[w.date].push(w.session_quality || 60);
+        acc[w.date].push(w._derived_quality);
       }
       const out = {};
       for (const [k, arr] of Object.entries(acc)) {
@@ -3895,6 +4502,111 @@ router.get("/analysis", async (req, res) => {
     const missed_days = std.missed_days;
     const score_7d_smoothed = std.score_7d_smoothed;
 
+    // ── Banister CTL/ATL/TSB ───────────────────────────────────────────
+    // Impulse-response model used by Strava/Garmin/TrainingPeaks, adapted
+    // for lifting (τ=28d fitness / τ=7d fatigue). Walks EVERY calendar day
+    // [pre-warm start → today] so EMAs decay on rest days — without that,
+    // sparse-training windows always read "overreached" because CTL never
+    // got the chance to catch up to ATL.
+    //
+    // Pre-warm window = up to 56 days before the current window's cutoff.
+    // 56d ≈ 2× CTL τ which is enough to converge from a cold start.
+    const banisterPreWarmMs = cutoffMs - 56 * 86_400_000;
+    const banisterPreWarmStartDate = (() => {
+      const { dateStr: _dateStr } = require('./lib/range-helpers');
+      return _dateStr(new Date(Math.max(banisterPreWarmMs, anchorMsLocal || 0)), anchor.utcOffsetMinutes || 0);
+    })();
+    const banisterPrior = allWorkouts.filter((w) => {
+      const ms = getMillis(w.logged_at);
+      return ms < cutoffMs && ms >= Math.max(banisterPreWarmMs, anchorMsLocal || 0);
+    });
+    const banister = _fitScoring.computeBanister({
+      sessions: workouts,
+      priorSessions: banisterPrior,
+      startDateStr: banisterPreWarmStartDate,
+      todayDateStr: win.todayDate,
+    });
+    const ctl = banister.ctl;
+    const atl = banister.atl;
+    const tsb = banister.tsb;
+    const formBand = banister.band;
+
+    // ── NEW (2026-05-23): the 10 high-value surfaces ──────────────
+    // Each surface is derived from the workouts already loaded. No extra
+    // Firestore reads. Anchor-aware where it matters (prior window,
+    // contribution map). Single place to debug if anything goes wrong.
+
+    // 1. prior period (equal-length window immediately before this one)
+    //    NB: there's an unrelated `priorWorkouts` upstream used for PR
+    //    detection (Date.now() based, no anchor clamp). This `priorWindowWorkouts`
+    //    is anchor-aware and used for the user-facing delta.
+    const priorCutoffMs = cutoffMs - rangeDays * 86_400_000;
+    const priorAnchorMs = Math.max(priorCutoffMs, anchorMsLocal || 0);
+    const priorWindowWorkouts = allWorkouts.filter((w) => {
+      const ms = getMillis(w.logged_at);
+      return ms >= priorAnchorMs && ms < cutoffMs;
+    });
+    const prior = _fitScoring.derivePriorPeriod({
+      priorWorkouts:   priorWindowWorkouts,
+      currentTotalVolKg: total_volume_kg,
+      currentTotalSets:  total_sets,
+      currentDaysLogged: days_logged,
+      currentPRs:        prs_period.length,
+    });
+
+    // 2. effort mix (RPE band distribution over working sets)
+    const effort_mix = _fitScoring.deriveEffortMix(workouts);
+
+    // 3. push / pull / legs balance
+    const push_pull_legs = _fitScoring.derivePushPullLegs(workouts, rangeDays);
+
+    // 4. muscle frequency (sessions/wk per muscle)
+    const muscle_frequency = _fitScoring.deriveMuscleFrequency(workouts, rangeDays);
+
+    // 5. exercise variety
+    const exercise_variety = _fitScoring.deriveExerciseVariety(workouts, rangeDays);
+
+    // 6. hour grid (7×24 DOW × hour count)
+    const hour_grid = _fitScoring.deriveHourGrid(workouts, anchor.utcOffsetMinutes || 0);
+
+    // 7. contribution map — 365 cells spanning anchor → anchor+364
+    //    (the user's first year since signup). Built from blended quality
+    //    (HK fills no-log days). Future cells (beyond today) are tagged so
+    //    the UI dims them. Grid is independent of the range chip.
+    const contrib = _fitScoring.deriveContributionMap({
+      dayQualityByDate: dayQualityByDateBlended,
+      anchorDate: anchor.anchorDateStr,
+      todayDate: win.todayDate,
+      spanDays: 365,
+    });
+
+    // 8. plateau detection per strength-trend row.
+    //    `strength_trend` already has { exercise, points, delta_pct }.
+    //    Enrich with weeks_stalled + stalled. Date series rebuilt here
+    //    from workouts so plateau math is anchored to real calendar dates
+    //    (not point-index assumptions).
+    const _datesByLift = {};
+    for (const w of workouts) {
+      for (const ex of (w.exercises || [])) {
+        if (!ex?.name) continue;
+        if (!_datesByLift[ex.name]) _datesByLift[ex.name] = [];
+        _datesByLift[ex.name].push(w.date);
+      }
+    }
+    Object.keys(_datesByLift).forEach((k) => _datesByLift[k].sort());
+    const strength_trend_v2 = (strength_trend || []).map((l) => {
+      const p = _fitScoring.derivePlateau({
+        points: l.points,
+        dates:  (_datesByLift[l.exercise] || []).slice(-l.points.length),
+      });
+      return { ...l, weeks_stalled: p.weeks_stalled, stalled: p.stalled };
+    });
+
+    // 9. duration / density (session-timer-derived; null for direct-log)
+    const _dd = _fitScoring.deriveDurationDensity(workouts);
+    const avg_duration_min = _dd.avg_duration_min;
+    const set_density = _dd.set_density;
+
     res.json({
       setup_completed: true,
       range,
@@ -3907,10 +4619,23 @@ router.get("/analysis", async (req, res) => {
       score_7d_smoothed,
       score_lifetime,
       missed_days,
+      // ── Banister Form data (always populated, 2026-05-22) ──
+      // band = adaptation context word; ctl/atl/tsb for charts that want
+      // the raw signals. readiness 0-100 + explain are user-facing copy.
+      form: {
+        band: formBand,
+        ctl, atl, tsb,
+        readiness: banister.readiness,
+        explain:   banister.explain,
+      },
+      // ── Existing fitness_score: KEEP fully populated for back-compat.
+      // FE Analysis tab checks `show.score` first to decide whether to
+      // render the score or the "Calibrating" hero; downstream consumers
+      // (rare) still get the raw number. ──
       fitness_score: {
         score,
         label: score >= 80 ? "Strong block" : score >= 70 ? "On track" : score >= 60 ? "Building" : "Begin",
-        components: { volume: volPctOfTarget, intensity: intensityScore, consistency: consistencyScore, recovery: recoveryScore },
+        components: { volume: volPctOfTarget, intensity: intensityScore, consistency: consistencyScore },
       },
       score_grade: { letter: grade },
       signal_points,
@@ -3920,7 +4645,7 @@ router.get("/analysis", async (req, res) => {
       muscle_volume,
       skip_pattern,
       prs_period,
-      strength_trend,
+      strength_trend: strength_trend_v2,
       peak_hour,
       peak_hour_session_count,
       evening_session_pct,
@@ -3928,6 +4653,15 @@ router.get("/analysis", async (req, res) => {
       volatility_pct,
       best_day,
       worst_day,
+      // ── NEW (2026-05-23) surfaces ──────────────────────────────
+      prior,
+      effort_mix,
+      push_pull_legs,
+      muscle_frequency,
+      exercise_variety,
+      hour_grid,
+      contribution_map:     contrib.cells,
+      contribution_summary: contrib.summary,
       ai_reads,
       aha_moments: await (async () => {
         try {
@@ -3940,6 +4674,8 @@ router.get("/analysis", async (req, res) => {
       stats: {
         days_logged, total_logs: days_logged, total_volume_kg, total_sets,
         avg_volume_kg, avg_sets, avg_quality, avg_rpe,
+        avg_duration_min,                              // NEW (null if no timer data)
+        set_density,                                   // NEW (null if no timer data)
         vol_hit_days:  workouts.filter((w) => (w.total_volume_kg || 0) >= VOL_TARGET).length,
         sets_hit_days: workouts.filter((w) => (w.total_sets || 0) >= SETS_TARGET).length,
       },
@@ -4073,10 +4809,91 @@ router.get("/actions", async (req, res) => {
       follow_through_pct: decided ? Math.round((completed_total / decided) * 100) : 0,
     };
 
-    return res.json({ cadence, prescription, actions, history, stats });
+    // ── 2026-05-23: surface weekly theme + last outcome card ─────
+    // `weekly_focus`: BE writes `last_weekly_focus` per batch; one-line theme
+    // tying the active actions together. Was captured, never shown.
+    // `outcome_card`: most recently graded action whose outcome the user
+    // hasn't seen yet (engine flips `outcome_surfaced=true` on next batch).
+    const weekly_focus = fitnessData?.last_weekly_focus
+      ? String(fitnessData.last_weekly_focus).slice(0, 80)
+      : null;
+    const _outcomeAction = allActions.find(
+      (a) => a.outcome_grade && !a.outcome_surfaced && a.title,
+    );
+    const outcome_card = _outcomeAction
+      ? {
+          id:        _outcomeAction.id,
+          title:     _outcomeAction.title,
+          grade:     _outcomeAction.outcome_grade,
+          reason:    _outcomeAction.outcome_reason || null,
+          delivered: _outcomeAction.outcome_value ?? null,
+          promised:  _outcomeAction.success_criterion_text || null,
+        }
+      : null;
+
+    return res.json({ cadence, prescription, actions, history, stats, weekly_focus, outcome_card });
   } catch (err) {
     log.error('[fitness] /actions error:', err);
     return res.status(500).json({ error: 'server error' });
+  }
+});
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /action/:id/complete — mark a single recommended action as done
+// POST /action/:id/skip      — user opted out of a recommended action
+//
+// FE optimistic-with-rollback pattern (FitnessActionsTabV4.applyOptimisticAction)
+// depends on these returning 200 quickly. Pre-existing FE code expected these
+// routes; until 2026-05-21 they were missing and FE silently rolled back every
+// tap — actions would re-appear on refresh and users thought the feature was
+// broken. Idempotent on repeat taps (status already set → 200, no-op).
+// ─────────────────────────────────────────────────────────────────────────────
+router.post("/action/:id/complete", async (req, res) => {
+  const { deviceId } = req.body || {};
+  if (!deviceId)       return res.status(400).json({ error: "deviceId required" });
+  if (!req.params.id)  return res.status(400).json({ error: "action id required" });
+  try {
+    const ref = actionsCol(deviceId).doc(req.params.id);
+    const snap = await ref.get();
+    if (!snap.exists) return res.status(404).json({ error: "action not found" });
+    const cur = snap.data() || {};
+    // Idempotent — if already completed/cancelled, return success without overwrite.
+    if (cur.status === "completed") {
+      return res.json({ ok: true, idempotent: true });
+    }
+    await ref.update({
+      status: "completed",
+      hit_rate: typeof cur.target_count === "number" ? cur.target_count : (cur.hit_rate || 1),
+      completed_at: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    return res.json({ ok: true });
+  } catch (e) {
+    log.error("[fitness] /action/complete:", e);
+    return res.status(500).json({ error: e.message || "server error" });
+  }
+});
+
+router.post("/action/:id/skip", async (req, res) => {
+  const { deviceId } = req.body || {};
+  if (!deviceId)       return res.status(400).json({ error: "deviceId required" });
+  if (!req.params.id)  return res.status(400).json({ error: "action id required" });
+  try {
+    const ref = actionsCol(deviceId).doc(req.params.id);
+    const snap = await ref.get();
+    if (!snap.exists) return res.status(404).json({ error: "action not found" });
+    const cur = snap.data() || {};
+    if (cur.status === "cancelled" || cur.status === "skipped") {
+      return res.json({ ok: true, idempotent: true });
+    }
+    await ref.update({
+      status: "cancelled",
+      cancelled_at: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    return res.json({ ok: true });
+  } catch (e) {
+    log.error("[fitness] /action/skip:", e);
+    return res.status(500).json({ error: e.message || "server error" });
   }
 });
 
@@ -4179,7 +4996,7 @@ router.get("/muscle-trends", async (req, res) => {
       // ISO-week-ish bucket: Monday start
       const monday = new Date(dt);
       monday.setDate(dt.getDate() - ((dt.getDay() + 6) % 7));
-      const key = monday.toISOString().slice(0, 10);
+      const key = dateStr(monday);
       if (!weekMap[key]) weekMap[key] = { weekStart: key, sets: 0, volume: 0 };
       weekMap[key].sets += ms.total_sets;
       weekMap[key].volume += ms.total_volume_kg;
@@ -4344,12 +5161,18 @@ router.get('/chat-state', async (req, res) => {
     const { deviceId } = req.query;
     if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
 
-    const [snap, fSnap] = await Promise.all([
+    // Pull last workout for header strip + 60d for smart-prompt signals.
+    // chat-state is now ALSO the source for data-aware quick prompts in
+    // the Chat composer — must include the few signals the FE picks from
+    // (band, plateau lifts, ppl gap). All derived from the same workouts
+    // window, no extra cost.
+    const [snap, fSnap, recentSnap] = await Promise.all([
       workoutsCol(deviceId).orderBy('logged_at', 'desc').limit(1).get(),
       fitnessDoc(deviceId).get(),
+      workoutsCol(deviceId).orderBy('logged_at', 'desc').limit(60).get(),
     ]);
 
-    if (snap.empty) return res.json({ last_workout: null, streak: 0 });
+    if (snap.empty) return res.json({ last_workout: null, streak: 0, prompt_signals: null });
 
     const w = snap.docs[0].data();
     const at = getMillis(w.logged_at);
@@ -4391,6 +5214,52 @@ router.get('/chat-state', async (req, res) => {
       isLeg ? 'Lower' :
       'Workout';
 
+    // ── Smart-prompt signals (2026-05-23) ──
+    // Just enough for the FE to pick 1-2 data-aware prompts. Cheap to
+    // derive from already-loaded 60d window. Never exposed as a UI dump.
+    let prompt_signals = null;
+    try {
+      const F = require('./lib/fitness-scoring');
+      const todayDate = dateStr();
+      const recentWorkouts = recentSnap.docs.map((d) => d.data());
+      const last30Cutoff = Date.now() - 30 * 86_400_000;
+      const last30 = recentWorkouts.filter((w) => getMillis(w.logged_at) >= last30Cutoff);
+      const prior30 = recentWorkouts.filter((w) => {
+        const ms = getMillis(w.logged_at);
+        return ms >= last30Cutoff - 30 * 86_400_000 && ms < last30Cutoff;
+      });
+      const banister = F.computeBanister({
+        sessions: last30, priorSessions: prior30,
+        startDateStr: dateStr(new Date(Date.now() - 56 * 86_400_000)),
+        todayDateStr: todayDate,
+      });
+      const ppl = F.derivePushPullLegs(last30, 30);
+      // Plateau on the user's most-trained heavy lift
+      let plateauLift = null;
+      for (const liftName of ['Bench Press','Back Squat','Deadlift','Overhead Press']) {
+        const pts = [], dates = [];
+        for (const ww of [...recentWorkouts].sort((a, b) => (a.date || '').localeCompare(b.date || ''))) {
+          const ex = (ww.exercises || []).find((e) => e.name === liftName);
+          if (!ex) continue;
+          const top = Math.max(...(ex.sets || []).map((s) => s.e1rm || 0), 0);
+          if (top > 0) { pts.push(top); dates.push(ww.date); }
+        }
+        if (pts.length >= 4) {
+          const p = F.derivePlateau({ points: pts, dates });
+          if (p.stalled) { plateauLift = liftName; break; }
+        }
+      }
+      prompt_signals = {
+        readiness: banister.readiness,
+        band: banister.band,
+        plateau_lift: plateauLift,
+        ppl_warn: ppl.warn,
+        ppl_min: ppl.warn
+          ? [['push', ppl.push_pct], ['pull', ppl.pull_pct], ['legs', ppl.legs_pct]].sort((a, b) => a[1] - b[1])[0][0]
+          : null,
+      };
+    } catch (_e) { /* prompts gracefully fall back to defaults */ }
+
     return res.json({
       last_workout: {
         ago_minutes:     ago,
@@ -4404,6 +5273,7 @@ router.get('/chat-state', async (req, res) => {
         top_lift:        topLift,
       },
       streak: fSnap.data()?.streak || 0,
+      prompt_signals,
     });
   } catch (err) {
     log.error('[fitness] /chat-state error:', err);

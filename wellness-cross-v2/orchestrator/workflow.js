@@ -47,6 +47,17 @@ const { buildDayOneKit } = require('../coaches/day-one-kit');
 const { buildHKInsights } = require('../did-you-know/hk-insights');
 const config = require('../config');
 
+// Local-TZ date key helper — never _localDateStr(use) which
+// returns UTC and silently maps near-midnight logs to the wrong day in
+// negative-UTC offsets (Americas). See feedback_chart_tz_clamp law.
+function _localDateStr(d) {
+  const dt = d instanceof Date ? d : (d ? new Date(d) : new Date());
+  const y = dt.getFullYear();
+  const m = String(dt.getMonth() + 1).padStart(2, '0');
+  const dd = String(dt.getDate()).padStart(2, '0');
+  return `${y}-${m}-${dd}`;
+}
+
 /**
  * Inject HK-derived Did-You-Know facts into the home_pack silently.
  * Hard rule: HK facts always replace the LOWEST-priority library facts so the
@@ -76,7 +87,7 @@ async function mergeHKDidYouKnow(home_pack, deviceId) {
 const SCHEMA = config.HOME_SCHEMA_VERSION;
 
 function todayDate() {
-  return new Date().toISOString().slice(0, 10);
+  return _localDateStr();
 }
 
 async function loadRecentDailyHistory(deviceId, days) {
@@ -216,30 +227,41 @@ async function runForUserFast(deviceId, opts = {}) {
   const { matrix } = buildDailyMatrix(snapshots);
 
   // Lifetime composite — mean of per-agent lifetime means, weighted by the
-  // same component weights as today's wellness score. Fed to Home so the
-  // headline matches per-agent Analysis lifetime cards.
+  // base agent weights so the headline matches per-agent Analysis cards.
+  //
+  // Day-1 invariant (2026-05-22): score_lifetime must NEVER drop below
+  // score_today. Previously this returned tiny numbers (e.g. 1) when the
+  // matrix had partial coverage + the wrong key indexing (components is an
+  // array but was accessed by agent name string → fell back to weight=1
+  // for every agent, then divided by N including agents with no logs).
+  // User-visible bug: setup gave 12, log dropped headline to 1.
+  //
+  // New formula:
+  //   1. Build per-agent lifetime means (anchor → today, scored days only).
+  //   2. Weighted average using BASE_WEIGHTS (sleep .25, fitness .20, ...)
+  //      re-normalized over only the agents with data.
+  //   3. clamp >= wellness.score (today). Logging can only LIFT the headline.
   wellness.score_lifetime = (() => {
     try {
-      const perAgentLifetime = {};
+      const BASE = require('../config').SCORE.BASE_WEIGHTS;
       const agents = Object.keys(snapshots);
+      let weightedSum = 0, weightTotal = 0;
       for (const agent of agents) {
         const arr = matrix
           .map((r) => (r.scores && Number.isFinite(r.scores[agent]) ? r.scores[agent] : null))
           .filter((s) => Number.isFinite(s));
-        perAgentLifetime[agent] = arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null;
-      }
-      const components = wellness.components || {};
-      let weightedSum = 0, weightTotal = 0;
-      for (const [agent, val] of Object.entries(perAgentLifetime)) {
-        if (val == null) continue;
-        const w = (components[agent] && Number.isFinite(components[agent].weight)) ? components[agent].weight : 1;
-        weightedSum += val * w;
+        if (!arr.length) continue;
+        const mean = arr.reduce((a, b) => a + b, 0) / arr.length;
+        const w = Number.isFinite(BASE[agent]) ? BASE[agent] : 1;
+        weightedSum += mean * w;
         weightTotal += w;
       }
-      return weightTotal > 0 ? Math.round(weightedSum / weightTotal) : null;
-    } catch { return null; }
+      const lifetime = weightTotal > 0 ? Math.round(weightedSum / weightTotal) : null;
+      // Floor: never below today's headline (logging must not lower lifetime).
+      if (lifetime == null) return Number.isFinite(wellness.score) ? wellness.score : null;
+      return Number.isFinite(wellness.score) ? Math.max(lifetime, wellness.score) : lifetime;
+    } catch { return Number.isFinite(wellness.score) ? wellness.score : null; }
   })();
-
 
   const allCorrelations = computeCorrelations(matrix);
   for (const c of allCorrelations) c.plain_english = translate(c);
@@ -445,26 +467,28 @@ async function runForUser(deviceId, opts = {}) {
   const { matrix } = buildDailyMatrix(snapshots);
 
   // Lifetime composite — same blend the Home headline reads.
+  // Lifetime composite — see fast-path comment above. Day-1 invariant:
+  // score_lifetime >= wellness.score. BASE_WEIGHTS-weighted across agents
+  // with data; logging only lifts the headline, never drops it.
   wellness.score_lifetime = (() => {
     try {
-      const perAgentLifetime = {};
+      const BASE = require('../config').SCORE.BASE_WEIGHTS;
       const agents = Object.keys(snapshots);
+      let weightedSum = 0, weightTotal = 0;
       for (const agent of agents) {
         const arr = matrix
           .map((r) => (r.scores && Number.isFinite(r.scores[agent]) ? r.scores[agent] : null))
           .filter((s) => Number.isFinite(s));
-        perAgentLifetime[agent] = arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null;
-      }
-      const components = wellness.components || {};
-      let weightedSum = 0, weightTotal = 0;
-      for (const [agent, val] of Object.entries(perAgentLifetime)) {
-        if (val == null) continue;
-        const w = (components[agent] && Number.isFinite(components[agent].weight)) ? components[agent].weight : 1;
-        weightedSum += val * w;
+        if (!arr.length) continue;
+        const mean = arr.reduce((a, b) => a + b, 0) / arr.length;
+        const w = Number.isFinite(BASE[agent]) ? BASE[agent] : 1;
+        weightedSum += mean * w;
         weightTotal += w;
       }
-      return weightTotal > 0 ? Math.round(weightedSum / weightTotal) : null;
-    } catch { return null; }
+      const lifetime = weightTotal > 0 ? Math.round(weightedSum / weightTotal) : null;
+      if (lifetime == null) return Number.isFinite(wellness.score) ? wellness.score : null;
+      return Number.isFinite(wellness.score) ? Math.max(lifetime, wellness.score) : lifetime;
+    } catch { return Number.isFinite(wellness.score) ? wellness.score : null; }
   })();
 
   const allCorrelations = computeCorrelations(matrix);
@@ -724,7 +748,16 @@ function buildHomeResponse({ pack, snapshots, wellness, anomalies, exec, streaks
       anchor_date: pack.profile.anchor_date || null,
       days_since_anchor: pack.profile.days_since_anchor || null,
     },
-    wellness: { ...wellness, why_line: (exec && exec.why_line) || wellness.why_line || null },
+    // Wellness object — also enforce the score_lifetime >= score invariant
+    // here as a last line of defense for any caller that bypasses the
+    // home-pack.repo write path. Logging can only LIFT the headline.
+    wellness: (() => {
+      const w = { ...wellness, why_line: (exec && exec.why_line) || wellness.why_line || null };
+      if (Number.isFinite(w.score) && (!Number.isFinite(w.score_lifetime) || w.score_lifetime < w.score)) {
+        w.score_lifetime = w.score;
+      }
+      return w;
+    })(),
     sparklines,
     coach_states: coachStates,
     anomaly: exec && exec.home_anomaly ? exec.home_anomaly : (anomalies && anomalies[0] ? {
@@ -1125,7 +1158,7 @@ function buildDay0FallbackPack(deviceId, errMsg) {
     points: Array.from({ length: 14 }, (_, i) => {
       const d = new Date(today + 'T00:00:00Z');
       d.setUTCDate(d.getUTCDate() - (13 - i));
-      return { date: d.toISOString().slice(0, 10), value: null, has_data: false };
+      return { date: _localDateStr(d), value: null, has_data: false };
     }),
     delta_vs_baseline: 0,
     direction: 'flat',

@@ -75,7 +75,6 @@ const { computeFastingCandidates, fastingGraders } = require('./lib/candidates/f
 const { assertNoCrossAgent } = require('./lib/sandbox');
 const { computeFastingScore: _computeFastingScore } = require('./lib/agent-scores');
 const { resolveLanguage, appendLanguageInstruction } = require('./lib/i18n-prompt');
-const { fetchAgentSnapshot } = require('./lib/cross-agent-context');
 const { withCron, shouldRunCron } = require('./lib/cron-helper');
 const { getUserNotifContext } = require('./lib/cron-user-context');
 const { resolveAnchor } = require('./lib/user-anchor');
@@ -89,19 +88,32 @@ const _v2Hooks = mountActionRoutes(router, {
   graders: fastingGraders,
   openai, admin, db,
   config: { LOGS_ORDER_FIELD: 'started_at' }, // fasting sessions use started_at, not logged_at
+  // Cross-agent law (feedback_cross_agent_data_rule, repeated 10+ times):
+  // individual agents read ONLY their own data + the single allowed exception
+  // `cross_agent/today_signals`. The previous code called fetchAgentSnapshot
+  // directly into sleep + mind collections from inside the fasting agent —
+  // SANDBOX VIOLATION. Fixed 2026-05-21 to read the pre-computed today_signals
+  // doc that wellness.cross.js maintains. Same intelligence (short sleep,
+  // high anxiety), zero sandbox boundary crossing.
   crossAgentEnricher: async (deviceId) => {
-    const [sleepSnap, mindSnap] = await Promise.all([
-      fetchAgentSnapshot(deviceId, 'sleep', 1).catch(() => null),
-      fetchAgentSnapshot(deviceId, 'mind', 1).catch(() => null),
-    ]);
-    const parts = [];
-    if (sleepSnap?.logs?.length) {
-      const hrs = sleepSnap.logs[0].actual_hours || 7;
-      if (hrs < 6) parts.push(`Short sleep last night (${hrs}h) → hunger hormones elevated; extended fast may be harder today.`);
+    let xs = {};
+    try {
+      const xSnap = await userDoc(deviceId).collection('cross_agent').doc('today_signals').get();
+      if (xSnap.exists) xs = xSnap.data() || {};
+    } catch (e) {
+      log.warn('[fasting] today_signals fetch fail:', e?.message);
     }
-    if (mindSnap?.logs?.length) {
-      const stress = mindSnap.logs[0].anxiety_level || 0;
-      if (stress >= 4) parts.push(`High stress detected (anxiety ${stress}/5) → emotional hunger risk; plan distraction strategies.`);
+    const parts = [];
+    // today_signals.sleep_hours_last_night maintained by wellness.cross.js (see
+    // its writeTodaySignals call). Falls through to null on missing data.
+    const hrs = typeof xs.sleep_hours_last_night === 'number' ? xs.sleep_hours_last_night : null;
+    if (hrs != null && hrs < 6) {
+      parts.push(`Short sleep last night (${hrs}h) → hunger hormones elevated; extended fast may be harder today.`);
+    }
+    // today_signals.mind_anxiety_today is 0-5 scale per the standard signal map.
+    const stress = typeof xs.mind_anxiety_today === 'number' ? xs.mind_anxiety_today : null;
+    if (stress != null && stress >= 4) {
+      parts.push(`High stress detected (anxiety ${stress}/5) → emotional hunger risk; plan distraction strategies.`);
     }
     return parts.join(' ');
   },
@@ -1005,7 +1017,7 @@ router.post('/session/start', async (req, res) => {
 
 async function refreshFastingScore(deviceId) {
   try {
-    const cutoff7d = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
+    const cutoff7d = dateStr(new Date(Date.now() - 7 * 86400000));
 
     const [sessSnap, fastSnap] = await Promise.all([
       sessionsCol(deviceId).orderBy('started_at', 'desc').limit(60).get(),
@@ -1755,6 +1767,7 @@ router.get('/analysis', async (req, res) => {
   try {
     const { deviceId, range = '30' } = req.query;
     if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+    const language = resolveLanguage(req);
 
     const fSnap = await fastingDoc(deviceId).get();
     if (!fSnap.exists) return res.json({ setup_completed: false });
@@ -1857,7 +1870,7 @@ router.get('/analysis', async (req, res) => {
       .sort((a, b) => b.count - a.count);
 
     // Fasting score
-    const _cutoff7d = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
+    const _cutoff7d = dateStr(new Date(Date.now() - 7 * 86400000));
     const _sess7d   = allSessions.filter(s => (s.date || '') >= _cutoff7d);
     const _comp7d   = _sess7d.filter(s => s.completed);
     const _cr7d     = _sess7d.length > 0 ? _comp7d.length / _sess7d.length : completion;
@@ -1891,7 +1904,7 @@ router.get('/analysis', async (req, res) => {
       ? (allSessions[0].date || toIso(allSessions[0].started_at) || 'latest')
       : 'none';
     const aiCacheKey = ['v2reads', rangeMeta.key, rangeMeta.startKey, rangeMeta.endKey,
-      targetHours, streak, Math.round(completion * 100), avgH, latestMarker].join('|');
+      targetHours, streak, Math.round(completion * 100), avgH, latestMarker, language].join('|');
     const aiCacheId = crypto.createHash('sha1').update(aiCacheKey).digest('hex');
 
     let ai_reads = { champion: null, drag: null, pattern: null };
@@ -1899,7 +1912,7 @@ router.get('/analysis', async (req, res) => {
     if (cachedReads?.key === aiCacheKey) {
       ai_reads = { champion: cachedReads.champion, drag: cachedReads.drag, pattern: cachedReads.pattern };
     } else {
-      ai_reads = await generateAiReads(sessions, setup, rangeMeta, fasting_score, openai, deviceId);
+      ai_reads = await generateAiReads(sessions, setup, rangeMeta, fasting_score, openai, deviceId, language);
       if (ai_reads.champion || ai_reads.drag || ai_reads.pattern) {
         const existingEntries = data.ai_reads_cache?.entries || {};
         fastingDoc(deviceId).update({
@@ -3083,5 +3096,25 @@ if (shouldRunCron()) {
   }), { timezone: 'UTC' });
 }
 
+// ─── GET /wearable-insights ─────────────────────────────────────────────
+// Surfaces blood-glucose readings (Dexcom/Libre via Health) + dietary-
+// energy timing windows that signal fasting adherence — the highest-
+// value HK signals for Fasting users that were previously dark.
+// Returns { has_data: false, cards: [] } when the user has neither —
+// FE component auto-hides on that response.
+router.get('/wearable-insights', async (req, res) => {
+  const deviceId = (req.query.deviceId || '').toString();
+  if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+  try {
+    const { buildWearableInsights } = require('./lib/healthkit/wearable-insights');
+    const days = Math.min(parseInt(req.query.days || '30', 10) || 30, 90);
+    const payload = await buildWearableInsights({
+      db: admin.firestore(), deviceId, coach: 'fasting', days,
+    });
+    res.json(payload);
+  } catch (err) {
+    res.json({ has_data: false, cards: [] });
+  }
+});
 
 module.exports = router;

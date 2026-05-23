@@ -2333,6 +2333,7 @@ router.get('/analysis', async (req, res) => {
   try {
     const { deviceId, range = '30' } = req.query;
     if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+    const language = resolveLanguage(req);
 
     const wSnap = await waterDoc(deviceId).get();
     if (!wSnap.exists || !wSnap.data()?.setup_completed) {
@@ -2443,13 +2444,13 @@ router.get('/analysis', async (req, res) => {
     const aha_moments = _waterAnalytics.computeAhaMoments(allLogs, hydrationScore, target_ml);
 
     const totalLogs = allLogs.length;
-    const aiCacheKey = ['water_v2', range, totalLogs, score, streak, target_ml].join('|');
+    const aiCacheKey = ['water_v2', range, totalLogs, score, streak, target_ml, language].join('|');
     let ai_reads = { champion: null, drag: null, pattern: null };
     const cached = data.ai_reads_cache_v2?.[aiCacheKey];
     if (cached) {
       ai_reads = cached;
     } else {
-      ai_reads = await _waterAnalytics.generateAiReads(allLogs, target_ml, hydrationScore, openai, deviceId);
+      ai_reads = await _waterAnalytics.generateAiReads(allLogs, target_ml, hydrationScore, openai, deviceId, language);
       if (ai_reads.champion || ai_reads.drag || ai_reads.pattern) {
         waterDoc(deviceId).set({
           ai_reads_cache_v2: { [aiCacheKey]: ai_reads, _generated_at: new Date().toISOString() },
@@ -3115,5 +3116,24 @@ if (shouldRunCron()) {
   }), { timezone: 'UTC' });
 }
 
+// ─── GET /wearable-insights ─────────────────────────────────────────────
+// Surfaces water samples logged via HealthKit (Apple Watch reminders,
+// smart bottles, third-party hydration apps that write to Health).
+// Returns { has_data: false, cards: [] } when the user has no HK water —
+// the FE component auto-hides on that response, preserving silent-magic.
+router.get('/wearable-insights', async (req, res) => {
+  const deviceId = (req.query.deviceId || '').toString();
+  if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+  try {
+    const { buildWearableInsights } = require('./lib/healthkit/wearable-insights');
+    const days = Math.min(parseInt(req.query.days || '30', 10) || 30, 90);
+    const payload = await buildWearableInsights({
+      db: admin.firestore(), deviceId, coach: 'water', days,
+    });
+    res.json(payload);
+  } catch (err) {
+    res.json({ has_data: false, cards: [] });
+  }
+});
 
 module.exports = router;

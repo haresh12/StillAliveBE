@@ -878,7 +878,8 @@ router.get('/analysis', async (req, res) => {
     const win = computeAnalysisWindow(days || 30, anchor.anchorMs, nowMs, anchor.utcOffsetMinutes);
     const effectiveDays = days ? win.effectiveDays : null;
 
-    const payload = await sleepAnalytics.loadAnalysisV2(deviceId, effectiveDays, { openai, targetHours: target });
+    const language = resolveLanguage(req);
+    const payload = await sleepAnalytics.loadAnalysisV2(deviceId, effectiveDays, { openai, targetHours: target, language });
     const body = payload || { stats: null, signal_points: [], aha_moments: [] };
 
     // Lifetime fetch: pull sleep logs since anchor → quality map independent of request window.
@@ -2495,7 +2496,9 @@ async function preWarmSleepAnalysisV2() {
     try {
       const checkSnap = await sleepDoc(id).collection('sleep_logs').limit(1).get();
       if (checkSnap.empty) continue;
-      await sleepAnalytics.loadAnalysisV2(id, 30, { openai });
+      const { resolveUserLanguage } = require('./lib/i18n-prompt');
+      const language = await resolveUserLanguage(db(), id);
+      await sleepAnalytics.loadAnalysisV2(id, 30, { openai, language });
       warmed++;
     } catch { /* per-user non-fatal */ }
   }
@@ -2597,7 +2600,8 @@ router.post('/describe', async (req, res) => {
     if (!transcript) {
       return res.status(400).json({ error: 'Could not understand audio. Please try again.' });
     }
-    const parsed = await sleepDescribe.parseSleepText(openai, transcript);
+    const language = resolveLanguage(req);
+    const parsed = await sleepDescribe.parseSleepText(openai, transcript, language);
     res.json({
       transcript,
       ...parsed,

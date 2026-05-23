@@ -1014,7 +1014,7 @@ async function refreshNutritionScore(deviceId) {
     const [logsSnap, nutSnap] = await Promise.all([
       logsCol(deviceId).where('date_str', '>=', (() => {
         const d = new Date(); d.setDate(d.getDate() - 8);
-        return d.toISOString().slice(0, 10);
+        return dateStr(d);
       })()).get(),
       nutDoc(deviceId).get(),
     ]);
@@ -4252,6 +4252,7 @@ router.get('/analysis', async (req, res) => {
   try {
     const { deviceId, range = '7' } = req.query;
     if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+    const language = resolveLanguage(req);
     if (!['7', '30', '90', '365'].includes(range)) {
       return res.status(400).json({ error: 'range must be one of: 7, 30, 90, 365' });
     }
@@ -4264,7 +4265,7 @@ router.get('/analysis', async (req, res) => {
 
     const payload = await _nutritionAnalytics.buildAnalysisPayload(
       deviceId, range, openai, MODELS,
-      { clampStartDate: win.effectiveStartDate, effectiveDays: win.effectiveDays },
+      { clampStartDate: win.effectiveStartDate, effectiveDays: win.effectiveDays, language },
     );
 
     // Lifetime fetch: pull all food logs since anchor for a per-day quality map.
@@ -4372,7 +4373,8 @@ router.post('/analysis/ask', async (req, res) => {
     const { deviceId, question } = req.body;
     if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
     if (!question || question.trim().length < 3) return res.status(400).json({ error: 'question required (min 3 chars)' });
-    const result = await _nutritionAnalytics.answerAsk(openai, MODELS, deviceId, question.trim());
+    const language = resolveLanguage(req);
+    const result = await _nutritionAnalytics.answerAsk(openai, MODELS, deviceId, question.trim(), language);
     res.json({ ...result, latency_ms: Date.now() - t0 });
   } catch (err) {
     log.error('[analysis-v2/ask] error:', err);
@@ -4450,10 +4452,12 @@ const _nutritionPreWarmTick = async () => {
       if (m) deviceIds.add(m[1]);
     });
     users = deviceIds.size;
+    const { resolveUserLanguage } = require('./lib/i18n-prompt');
     for (const deviceId of deviceIds) {
       try {
-        await _nutritionAnalytics.buildAnalysisPayload(deviceId, '7',  openai, MODELS);
-        await _nutritionAnalytics.buildAnalysisPayload(deviceId, '30', openai, MODELS);
+        const language = await resolveUserLanguage(admin.firestore(), deviceId);
+        await _nutritionAnalytics.buildAnalysisPayload(deviceId, '7',  openai, MODELS, { language });
+        await _nutritionAnalytics.buildAnalysisPayload(deviceId, '30', openai, MODELS, { language });
         ok += 1;
       } catch (e) {
         failed += 1;
@@ -4510,7 +4514,9 @@ const _nutritionActionRxTick = async () => {
         }
 
         // Build the AI input (same shape as Analysis tab)
-        const payload = await _nutritionAnalytics.buildAnalysisPayload(deviceId, '7', openai, MODELS);
+        const { resolveUserLanguage } = require('./lib/i18n-prompt');
+        const language = await resolveUserLanguage(admin.firestore(), deviceId);
+        const payload = await _nutritionAnalytics.buildAnalysisPayload(deviceId, '7', openai, MODELS, { language });
         if (!payload?.stats || payload.stats.days_logged < 3) {
           skipped += 1;
           continue;
@@ -4534,7 +4540,7 @@ const _nutritionActionRxTick = async () => {
           worst_day:        payload.worst_day,
         };
 
-        const rx = await _nutritionAnalytics.generateActionPrescription(openai, MODELS, summary);
+        const rx = await _nutritionAnalytics.generateActionPrescription(openai, MODELS, summary, language);
         if (!rx) { failed += 1; continue; }
 
         // Write the prescription header doc + each action doc

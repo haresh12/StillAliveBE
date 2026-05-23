@@ -23,6 +23,7 @@ const admin   = require('firebase-admin');
 
 const {
   derive,
+  withDefaults,
   computeWellnessScoreBaseline,
   generateInsights,
   minToHHMM,
@@ -46,6 +47,19 @@ function validatePayload(body) {
   if (shared.wake_time_min < 0 || shared.wake_time_min >= 1440) return 'wake_time_min out of range';
   if (shared.bed_time_min  < 0 || shared.bed_time_min  >= 1440) return 'bed_time_min out of range';
   return null;
+}
+
+// Which user-asked fields are still empty after the coach flow? FE uses this
+// (returned in /save response) to know which JIT prompts to show at first log.
+// Keep in sync with FE jitPrompts.js.
+function computePendingFields(payload) {
+  const pending = [];
+  const c = new Set(payload.active_coaches || []);
+  if (c.has('sleep')     && !(payload.sleep?.disruptors || []).length)     pending.push('sleep_disruptors');
+  if (c.has('mind')      && !(payload.mind?.triggers || []).length)        pending.push('mind_triggers');
+  if (c.has('nutrition') && !(payload.nutrition?.allergies || []).length)  pending.push('nutr_allergies');
+  if (c.has('fitness')   && (!payload.fitness?.equipment || payload.fitness.equipment === 'any')) pending.push('fit_equipment');
+  return pending;
 }
 
 // ─── Build per-agent legacy setup payloads (dual-write) ────────
@@ -185,12 +199,22 @@ router.post('/save', async (req, res) => {
     };
     const locale = userData.locale || { country: '', language: 'en' };
 
-    const payload = {
+    // Apply tolerant defaults so the new coach-themed flow can ship partial
+    // payloads (deferred Qs land here as empty, get filled silently). The
+    // returned `pending_fields` tells the FE which JIT prompts to surface
+    // at first-log moments.
+    const rawPayload = {
       deviceId, active_coaches,
       shared, sleep, mind, nutrition, fitness, water, fasting,
       profile, locale,
     };
+    const payload = withDefaults(rawPayload);
+    payload.deviceId = deviceId;
+    payload.active_coaches = active_coaches;
+    payload.profile = profile;
+    payload.locale = locale;
 
+    const pendingFields = computePendingFields(rawPayload);
     const derived = derive(payload);
     const wellnessScore = computeWellnessScoreBaseline(payload);
     const insights = generateInsights(payload, derived);
@@ -203,10 +227,19 @@ router.post('/save', async (req, res) => {
     batch.set(personalizeDoc(deviceId), {
       schema_version: 1,
       active_coaches,
-      shared,
-      user_input: { sleep, mind, nutrition, fitness, water, fasting },
+      shared: payload.shared,
+      user_input: {
+        sleep: payload.sleep,
+        mind: payload.mind,
+        nutrition: payload.nutrition,
+        fitness: payload.fitness,
+        water: payload.water,
+        fasting: payload.fasting,
+      },
       derived,
       wellness_score_baseline: wellnessScore,
+      pending_fields: pendingFields,
+      is_partial: pendingFields.length > 0,
       created_at: admin.firestore.FieldValue.serverTimestamp(),
       updated_at: admin.firestore.FieldValue.serverTimestamp(),
     }, { merge: true });
@@ -237,6 +270,8 @@ router.post('/save', async (req, res) => {
       wellness_score:  wellnessScore,
       wellness_label:  'Starting baseline',
       insights,
+      pending_fields:  pendingFields,
+      is_partial:      pendingFields.length > 0,
       derived: {
         chronotype:           derived.sleep.chronotype,
         water_target_ml:      derived.water.daily_goal_ml,
@@ -274,6 +309,63 @@ router.get('/status/:deviceId', async (req, res) => {
   } catch (e) {
     log.error('[personalize/status]', e);
     return res.status(500).json({ error: 'status_failed' });
+  }
+});
+
+// ─── POST /api/personalize/jit-save ────────────────────────────
+// First-log just-in-time elicitation. When a user lands on Nutrition camera
+// for the first time we ask "Anything you avoid?" — that answer hits here
+// (and ONLY that field). Same for fitness equipment on first workout log,
+// sleep disruptors on first sleep log, mind triggers on first mood log.
+//
+// Payload: { deviceId, field, value }
+//   field ∈ { 'sleep_disruptors' | 'mind_triggers' | 'nutr_allergies' | 'fit_equipment' }
+//
+// Writes:
+//   • personalize_v1: user_input.{coach}.{key}  (+ removes from pending_fields)
+//   • agents/{coach}: matching legacy field
+// Idempotent — replaying is safe.
+const JIT_FIELDS = {
+  sleep_disruptors: { coach: 'sleep',     userKey: 'disruptors',     agentKey: 'disruptors',     legacyDoc: 'sleep' },
+  mind_triggers:    { coach: 'mind',      userKey: 'triggers',       agentKey: 'triggers',       legacyDoc: 'mind' },
+  nutr_allergies:   { coach: 'nutrition', userKey: 'allergies',      agentKey: 'allergies',      legacyDoc: 'nutrition' },
+  fit_equipment:    { coach: 'fitness',   userKey: 'equipment',      agentKey: 'equipment',      legacyDoc: 'fitness' },
+};
+
+router.post('/jit-save', async (req, res) => {
+  try {
+    const { deviceId, field, value } = req.body || {};
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+    if (!JIT_FIELDS[field]) return res.status(400).json({ error: `invalid field. one of: ${Object.keys(JIT_FIELDS).join(', ')}` });
+    if (value == null) return res.status(400).json({ error: 'value required' });
+
+    const meta = JIT_FIELDS[field];
+    const snap = await personalizeDoc(deviceId).get();
+    if (!snap.exists) return res.status(404).json({ error: 'personalize_v1 not found' });
+    const data = snap.data() || {};
+    const currentPending = Array.isArray(data.pending_fields) ? data.pending_fields : [];
+    const newPending = currentPending.filter((f) => f !== field);
+
+    const batch = db().batch();
+    // Update personalize_v1
+    batch.set(personalizeDoc(deviceId), {
+      [`user_input.${meta.coach}.${meta.userKey}`]: value,
+      pending_fields: newPending,
+      is_partial: newPending.length > 0,
+      updated_at: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    // Update legacy agent doc
+    batch.set(agentDoc(deviceId, meta.legacyDoc), {
+      [meta.agentKey]: value,
+      jit_filled_at: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    await batch.commit();
+    return res.json({ ok: true, pending_fields: newPending, is_partial: newPending.length > 0 });
+  } catch (e) {
+    log.error('[personalize/jit-save]', e);
+    return res.status(500).json({ error: 'jit_save_failed', message: String(e && e.message ? e.message : e) });
   }
 });
 
