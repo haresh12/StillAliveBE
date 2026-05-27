@@ -4,11 +4,10 @@
  * Per-log fields: ml, effective_ml, beverage_type, date, logged_at.
  */
 
-const { buildAdapter, daysBetween, dateOf, agentScores } = require('./_helpers');
+const { buildAdapter, daysBetween, dateOf } = require('./_helpers');
+const waterScoring = require('../../lib/water-scoring');
 
-// Local-TZ date key helper — never _localDateStr(use) which
-// returns UTC and silently maps near-midnight logs to the wrong day in
-// negative-UTC offsets (Americas). See feedback_chart_tz_clamp law.
+// Local-TZ date key helper — see feedback_chart_tz_clamp law (no UTC keys).
 function _localDateStr(d) {
   const dt = d instanceof Date ? d : (d ? new Date(d) : new Date());
   const y = dt.getFullYear();
@@ -38,18 +37,42 @@ module.exports = buildAdapter({
     };
   },
 
-  scoreDailyLogs(logs, agentData) {
+  // Score ONE day's logs. Routes through lib/water-scoring.js — same lib
+  // used by water.agent.js::refreshWaterScore and ::computeHydrationScore so
+  // Home + Analysis + Cross-V2 cannot drift (see project_water_scoring_drift_bug).
+  //
+  // Gate computations adapted to a single-day window:
+  //   • hydration_adequacy — % of that day's goal met (capped at 100)
+  //   • consistency        — 100 if day hits 80% goal else 0 (binary at single-day)
+  //   • chronobiology      — REAL morning/late-taper from this day's logs
+  //   • beverage_quality   — REAL water_friendly/effective ratio from this day's logs
+  //
+  // V3: `daysSinceAnchor` is now resolved by buildAdapter and threaded
+  // through — slow canonical maturity ramp applied calendar-keyed, so Home +
+  // Analysis return identical numbers for the same day.
+  scoreDailyLogs(logs, agentData, daysSinceAnchor = 0) {
+    if (!Array.isArray(logs) || logs.length === 0) return null;
     const goal = Number(agentData.daily_goal_ml || 2500);
-    // Use effective_ml when present (caffeine/alcohol-adjusted by water agent), else raw ml.
-    const ml = sumOf(logs, 'effective_ml') || sumOf(logs, 'ml');
-    const hydration_adequacy = goal > 0 ? Math.min(1, ml / goal) : 0;
-    const out = agentScores.computeWaterScore({
-      hydration_adequacy,
-      consistency: Math.min(1, logs.length / 4),
-      chronobiology: 0.5,
-      beverage_quality: 0.7,
-      avg_7d_ml: ml,
-      days_logged: logs.length,
+
+    // Resolve the day's key from the first log (all logs in this batch share a date).
+    const firstDate = logs[0]?.date || (logs[0]?.logged_at ? _localDateStr(new Date(logs[0].logged_at?._seconds ? logs[0].logged_at._seconds * 1000 : logs[0].logged_at)) : _localDateStr());
+    const recentKeys = [firstDate];
+    const goalByDate = { [firstDate]: goal };
+
+    // Normalize log shape — adapter receives whatever doc shape Firestore returns.
+    const normalized = logs.map((l) => ({
+      ml: l.ml || l.amount_ml || 0,
+      effective_ml: l.effective_ml,
+      beverage_type: l.beverage_type || l.drink_type || 'water',
+      date: l.date || firstDate,
+      logged_at: l.logged_at,
+    }));
+
+    const out = waterScoring.computeWaterScore({
+      logs: normalized,
+      goalByDate,
+      recentKeys,
+      daysSinceAnchor,
     });
     return out && Number.isFinite(out.score) ? out.score : null;
   },

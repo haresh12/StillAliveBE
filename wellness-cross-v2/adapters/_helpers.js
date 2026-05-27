@@ -8,6 +8,7 @@
 const { agentDoc, agentLogsCol, userDoc } = require('../persistence/_firestore');
 const { emptyAgentSnapshot } = require('./_shape');
 const agentScores = require('../../lib/agent-scores');
+const { resolveAnchor } = require('../../lib/user-anchor');
 
 // Local-TZ date key helper — never _localDateStr(use) which
 // returns UTC and silently maps near-midnight logs to the wrong day in
@@ -153,9 +154,19 @@ function groupLogsByDate(logs) {
 
 /**
  * Build a daily-points array (length=days) for the given range,
- * given a per-day log map and a scoring function `scoreFn(logsForDay) -> 0..100|null`.
+ * given a per-day log map and a scoring function `scoreFn(logsForDay, daysSinceAnchor) -> 0..100|null`.
+ *
+ * V3: scoreFn now receives `daysSinceAnchor` (computed per-date against the
+ * user's registration anchor) so per-agent libs can apply the slow calendar-
+ * keyed maturity ramp instead of falling back to log-count maturity. Without
+ * this thread-through, Home (adapter) and Analysis (agent route) could
+ * disagree on the same score by 5-10 pts on Day-1 users.
+ *
+ * When `anchorDateStr` is null (legacy users with unresolved anchor),
+ * daysSinceAnchor defaults to 0 — maturity is at its strictest, which is
+ * the safe default per the contract's "score never inflates" law.
  */
-function buildDailyPoints(endDate, days, logsByDate, scoreFn) {
+function buildDailyPoints(endDate, days, logsByDate, scoreFn, anchorDateStr = null) {
   const dates = dateRange(endDate, days);
   return dates.map((date) => {
     const logsForDay = logsByDate.get(date) || [];
@@ -163,7 +174,8 @@ function buildDailyPoints(endDate, days, logsByDate, scoreFn) {
     let score = null;
     if (has_log) {
       try {
-        const s = scoreFn(logsForDay);
+        const dsa = anchorDateStr ? Math.max(0, daysBetween(anchorDateStr, date)) : 0;
+        const s = scoreFn(logsForDay, dsa);
         if (Number.isFinite(s)) score = clip(Math.round(s), 0, 100);
       } catch (e) {
         score = null;
@@ -241,9 +253,16 @@ function buildAdapter(cfg) {
     const logs = await fetchLogs(deviceId, agent, today, 90);
     const logsByDate = groupLogsByDate(logs);
 
-    const last_30d = buildDailyPoints(today, 30, logsByDate, (l) => scoreDailyLogs(l, agentData));
+    // V3: resolve the user's anchor ONCE here, pass per-day `daysSinceAnchor`
+    // into the scoring fn so per-agent libs can apply the slow canonical
+    // maturity ramp (calendar-keyed) instead of log-count fallback.
+    // See SCORING_CONTRACT_V3.md §2.
+    const anchor = await resolveAnchor(deviceId).catch(() => null);
+    const anchorDateStr = anchor?.isResolved ? anchor.anchorDateStr : null;
+
+    const last_30d = buildDailyPoints(today, 30, logsByDate, (l, dsa) => scoreDailyLogs(l, agentData, dsa), anchorDateStr);
     const last_14d = last_30d.slice(-14);
-    const daily90 = buildDailyPoints(today, 90, logsByDate, (l) => scoreDailyLogs(l, agentData));
+    const daily90 = buildDailyPoints(today, 90, logsByDate, (l, dsa) => scoreDailyLogs(l, agentData, dsa), anchorDateStr);
 
     // Insights v2.3 — per-date raw log count for the 90d window. Used by
     // /api/wellness/v2/insights to compute pack.log_counts windowed to range.
@@ -254,7 +273,8 @@ function buildAdapter(cfg) {
     }
 
     const todayLogs = logsByDate.get(today) || [];
-    const todayScore = todayLogs.length > 0 ? scoreDailyLogs(todayLogs, agentData) : null;
+    const todayDsa  = anchorDateStr ? Math.max(0, daysBetween(anchorDateStr, today)) : 0;
+    const todayScore = todayLogs.length > 0 ? scoreDailyLogs(todayLogs, agentData, todayDsa) : null;
     const todayComponents = (componentsForToday && todayLogs.length > 0)
       ? componentsForToday(todayLogs, agentData)
       : {};
@@ -264,14 +284,42 @@ function buildAdapter(cfg) {
     // `today.score` (null on no-log days) they're stable across days because
     // they average over a window. Same values used everywhere → no two
     // sources of truth for the same coach's score.
+    //
+    // V3 §6: MISSED-DAY DECAY GRADIENT. The plain mean lets a single old log
+    // produce phantom-good `smoothed_7d` after the user lapses for a week.
+    // Rule: after 3 consecutive unlogged days at the end of the window, decay
+    // toward DAY1_SEED (25) at 5 pts/day past the grace period. Never below
+    // the seed (avoid black-hole "0" for returning users — bands stay honest).
+    const DAY1_SEED   = 25;
+    const DECAY_GRACE = 3;     // first 3 unlogged days are free
+    const DECAY_PER_D = 5;     // 5 pts/day past grace
+    function consecutiveUnloggedAtEnd(pts) {
+      let n = 0;
+      for (let i = pts.length - 1; i >= 0; i--) {
+        if (Number.isFinite(pts[i].value)) break;
+        n++;
+      }
+      return n;
+    }
     function avgScored(pts) {
       const valid = pts.filter((p) => Number.isFinite(p.value));
       if (valid.length === 0) return null;
       return clip(Math.round(valid.reduce((s, p) => s + p.value, 0) / valid.length), 0, 100);
     }
-    const smoothed_7d  = avgScored(last_30d.slice(-7));
-    const smoothed_30d = avgScored(last_30d);
+    function smoothedWithDecay(pts) {
+      const base = avgScored(pts);
+      if (base == null) return null;
+      const unlogged = consecutiveUnloggedAtEnd(pts);
+      if (unlogged <= DECAY_GRACE) return base;
+      const decayDays = unlogged - DECAY_GRACE;
+      const decayed = base - decayDays * DECAY_PER_D;
+      return clip(Math.round(Math.max(decayed, DAY1_SEED)), 0, 100);
+    }
+    const smoothed_7d  = smoothedWithDecay(last_30d.slice(-7));
+    const smoothed_30d = smoothedWithDecay(last_30d);
     const days_scored  = last_30d.filter((p) => Number.isFinite(p.value)).length;
+    const _unloggedTail = consecutiveUnloggedAtEnd(last_30d.slice(-7));
+    const decay_applied = _unloggedTail > DECAY_GRACE;
 
     // Trend over last 14d: compare last 3 days avg vs prior 11 days avg
     function trendDirection() {
@@ -303,6 +351,10 @@ function buildAdapter(cfg) {
       smoothed_7d,
       smoothed_30d,
       days_scored,
+      // V3: surfaces whether the missed-day decay gradient is currently
+      // dampening the smoothed score. FE can show a "you've been away —
+      // log to lift the score" ribbon when true.
+      decay_applied,
       trend_direction,
       last_14d,
       last_30d,

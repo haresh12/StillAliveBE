@@ -23,10 +23,13 @@ function clip(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 /**
  * @param {Object<string, number>} normalized - per-coach normalized score (0..100), null if unknown
  * @param {Object<string, AgentSnapshot>} snapshots - to detect fasting_active
+ * @param {Object<string, number>} [baseWeights] - V3: optional per-user base
+ *   (e.g. result of applyUserWeightTilt). Defaults to config BASE.
  * @returns {Object<string, number>} adjusted weights (raw — caller normalizes to sum=1)
  */
-function computeAdjustedWeights(normalized, snapshots) {
-  const out = { ...BASE };
+function computeAdjustedWeights(normalized, snapshots, baseWeights = null) {
+  const base = baseWeights || BASE;
+  const out = { ...base };
   const mult = { sleep: 1, mind: 1, nutrition: 1, fitness: 1, water: 1, fasting: 1 };
 
   const sleep = normalized.sleep;

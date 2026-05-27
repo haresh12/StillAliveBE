@@ -14,6 +14,7 @@ const { computeWarmStart } = require('./warm-start');
 const { computeAdjustedWeights } = require('./cross-coach-interactions');
 const { applyTimeOfDay } = require('./time-of-day-weights');
 const { applyRecoveryBoost } = require('./recovery-boost');
+const { applyUserWeightTilt } = require('./user-weight-tilt');
 
 const BASE = config.SCORE.BASE_WEIGHTS;
 const TODAY_W = config.SCORE.DAILY_TODAY_WEIGHT;
@@ -107,7 +108,13 @@ function computeWellness({ snapshots, baselines, profile, recentDailyHistory = [
 
   // Step 6: effective weights with partial-credit re-normalization +
   //         cross-coach interactions + time-of-day bucketing.
-  const interactionAdjusted = computeAdjustedWeights(normalized, snapshots);
+  //
+  // V3 §3: user can tilt up-to-±15% per agent via profile.user_score_weights
+  // (e.g. { sleep: +0.10, fasting: -0.05 }). Tilts applied to BASE before
+  // the interaction/time-of-day adjusters run, so personalization shapes
+  // the score throughout the rest of the pipeline.
+  const tiltedBase = applyUserWeightTilt(BASE, profile.user_score_weights);
+  const interactionAdjusted = computeAdjustedWeights(normalized, snapshots, tiltedBase);
   const nowHour = (() => {
     const h = profile.local_hour;
     return Number.isFinite(h) ? h : new Date().getHours();
@@ -268,6 +275,44 @@ function computeWellness({ snapshots, baselines, profile, recentDailyHistory = [
   const last7 = recentDailyHistory.slice(-7);
   const avg7 = last7.length ? last7.reduce((a, b) => a + b, 0) / last7.length : displayed_score;
 
+  // V3 §7: Explainer pack — surfaces WHY the score is what it is.
+  // FE renders this in the main-dial score-explainer sheet.
+  const hkAgents = [];
+  for (const agent of AGENTS) {
+    const snap = snapshots[agent];
+    if (snap && snap.today && snap.today.hk_used === true) hkAgents.push(agent);
+  }
+  const hkStatus = hkAgents.length === 0
+    ? 'denied'
+    : hkAgents.length === 4 ? 'granted' : 'partial';
+
+  const warmStartBlendPct = Math.round(warm_start_blend * 100);
+
+  // Per-contributor reason text (FE may localize via the `reason_key` field;
+  // English text serves as both default and i18n fallback).
+  const enrichedContributions = components.map((c) => {
+    let reason = null;
+    let reason_key = null;
+    if (c.score == null) {
+      reason = 'Coach not yet set up'; reason_key = 'wellness.contrib.not_setup';
+    } else if (is_warm_start) {
+      reason = 'First log — building baseline'; reason_key = 'wellness.contrib.first_log';
+    } else if (c.contribution_pts > 2) {
+      reason = 'Pulling score up'; reason_key = 'wellness.contrib.pulling_up';
+    } else if (c.contribution_pts < -2) {
+      reason = 'Pulling score down'; reason_key = 'wellness.contrib.pulling_down';
+    } else {
+      reason = 'On baseline'; reason_key = 'wellness.contrib.on_baseline';
+    }
+    return { ...c, reason, reason_key };
+  });
+
+  const transitionExplainer = is_warm_start
+    ? `Your score is forming. By Day ${WARM_WIN}, it'll be 100% from your real logs.`
+    : warmStartBlendPct < 100
+      ? `${100 - warmStartBlendPct}% of your score is now from your real logs (Day ${total_days_logged} of ${WARM_WIN}).`
+      : null;
+
   return {
     score: displayed_score,
     delta_vs_yesterday: displayed_score - Math.round(yesterday),
@@ -289,6 +334,18 @@ function computeWellness({ snapshots, baselines, profile, recentDailyHistory = [
     recovery_boost_applied: recoveryApplied,
     recovery_boost_pts: recoveryBoostPts,
     schema_version: config.SCORE_SCHEMA_VERSION,
+    // V3 explainer pack (SCORING_CONTRACT_V3.md §7)
+    explainer: {
+      band: statusFor(displayed_score),
+      is_warm_start,
+      warm_start_blend_pct: warmStartBlendPct,
+      transition_explainer: transitionExplainer,
+      contributions: enrichedContributions,
+      hk_status: hkStatus,        // 'granted' | 'denied' | 'partial'
+      hk_enhanced_agents: hkAgents,
+      user_tilt_applied: !!(profile.user_score_weights && Object.keys(profile.user_score_weights).length > 0),
+      weights_in_use: tiltedBase,
+    },
   };
 }
 

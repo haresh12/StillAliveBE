@@ -73,9 +73,24 @@ for (const lang of SUPPORTED) {
   assert(`${lang}: 0 missing keys (${missing.length})`, missing.length === 0);
   if (missing.length > 0) console.log('   first 3:', missing.slice(0, 3).join(', '));
 
-  // 2. No extra keys (catches accidental drift)
+  // 2. No extra keys (catches accidental drift).
+  // EXCEPTION: i18next plural-suffix variants. Languages with more CLDR
+  // categories than English (e.g. Russian needs _one/_few/_many/_other vs
+  // English _one/_other) legitimately have "extra" keys at base+suffix.
+  // We only flag an extra if the BASE key (stripped of plural suffix)
+  // doesn't exist in en either — that's true drift.
+  const PLURAL_SUFFIX = /_(?:zero|one|two|few|many|other)$/;
   const tgtKeys = Object.keys(target);
-  const extra = tgtKeys.filter((k) => !(k in en));
+  const extra = tgtKeys.filter((k) => {
+    if (k in en) return false;
+    const base = k.replace(PLURAL_SUFFIX, '');
+    // If stripping the suffix matches anything in en (base key or any
+    // suffix variant), it's a legit CLDR plural form, not drift.
+    if (base !== k && enKeys.some((ek) => ek === base || ek.replace(PLURAL_SUFFIX, '') === base)) {
+      return false;
+    }
+    return true;
+  });
   assert(`${lang}: 0 extra keys (${extra.length})`, extra.length === 0);
   if (extra.length > 0) console.log('   first 3:', extra.slice(0, 3).join(', '));
 

@@ -39,7 +39,7 @@ const { fetchAgentSnapshot } = require('./lib/cross-agent-context');
 const _openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const { withCron, shouldRunCron } = require('./lib/cron-helper');
 const { getUserNotifContext } = require('./lib/cron-user-context');
-const { appendLanguageInstruction, resolveUserLanguage } = require('./lib/i18n-prompt');
+const { appendLanguageInstruction, resolveLanguage, resolveUserLanguage } = require('./lib/i18n-prompt');
 const {
   getOrGenerateWeeklyReport,
   getOrGenerateMonthlyReport,
@@ -188,7 +188,7 @@ router.get('/home/:deviceId', handle(async (req, res) => {
   const top = candidates.slice(0, 4);
 
   const assistant_messages = top.length
-    ? await humanizeMessages(deviceId, top).catch(() => top.map(c => ({ ...c, text: c.raw_text })))
+    ? await humanizeMessages(deviceId, top, resolveLanguage(req)).catch(() => top.map(c => ({ ...c, text: c.raw_text })))
     : [];
 
   try { await Promise.all(assistant_messages.map(m => recordShown(deviceId, m))); } catch {}
@@ -202,7 +202,7 @@ router.get('/home/:deviceId', handle(async (req, res) => {
     try {
       const harvest = buildHarvest(ctx);
       const scoreImpact = buildScoreImpact(ctx, harvest);
-      day3_letter = await getOrGenerateLetter(deviceId, ctx, harvest, scoreImpact);
+      day3_letter = await getOrGenerateLetter(deviceId, ctx, harvest, scoreImpact, resolveLanguage(req));
     } catch (e) {
       log.warn('[home] coach letter failed:', e.message);
     }
@@ -335,7 +335,7 @@ router.get('/insights/:deviceId', handle(async (req, res) => {
 
   // Trend data from the existing engine (charts only for trend lines + maturity)
   let charts = null;
-  try { charts = await buildInsightsPayload(deviceId); } catch {}
+  try { charts = await buildInsightsPayload(deviceId, resolveLanguage(req)); } catch {}
 
   const payload = {
     tier,
@@ -543,9 +543,9 @@ router.post('/reports/weekly/:deviceId', handle(async (req, res) => {
   const scoreImpact = buildScoreImpact(ctx, harvest);
 
   let score = null;
-  try { score = await buildInsightsPayload(deviceId); } catch {}
+  try { score = await buildInsightsPayload(deviceId, resolveLanguage(req)); } catch {}
 
-  const report = await getOrGenerateWeeklyReport(deviceId, ctx, harvest, findings, scoreImpact, score);
+  const report = await getOrGenerateWeeklyReport(deviceId, ctx, harvest, findings, scoreImpact, score, resolveLanguage(req));
   if (!report) return res.status(500).json({ error: 'Failed to generate weekly report' });
   res.json(report);
 }));
@@ -561,10 +561,10 @@ router.post('/reports/monthly/:deviceId', handle(async (req, res) => {
   const scoreImpact = buildScoreImpact(ctx, harvest);
 
   let score = null;
-  try { score = await buildInsightsPayload(deviceId); } catch {}
+  try { score = await buildInsightsPayload(deviceId, resolveLanguage(req)); } catch {}
 
   const trend30d = score?.trend30d ?? [];
-  const report = await getOrGenerateMonthlyReport(deviceId, ctx, harvest, findings, scoreImpact, score, trend30d);
+  const report = await getOrGenerateMonthlyReport(deviceId, ctx, harvest, findings, scoreImpact, score, trend30d, resolveLanguage(req));
   if (!report) return res.status(500).json({ error: 'Failed to generate monthly report' });
   res.json(report);
 }));

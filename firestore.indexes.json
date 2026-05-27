@@ -1,0 +1,19 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "food_logs",
+      "queryScope": "COLLECTION_GROUP",
+      "fields": [
+        { "fieldPath": "logged_at", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "food_logs",
+      "queryScope": "COLLECTION_GROUP",
+      "fields": [
+        { "fieldPath": "logged_at", "order": "DESCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}
