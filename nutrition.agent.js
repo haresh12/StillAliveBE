@@ -61,6 +61,12 @@ const { computeNutritionScore: _computeNutritionScore } = require('./lib/agent-s
 // Only the central Insights agent is allowed to combine all 6 agents' data.
 const _nutritionAnalytics = require('./lib/nutrition-analytics');
 const _nutritionCohort    = require('./lib/nutrition-cohort');
+// Nutrition 10/10 — 2026-05-26
+const { buildSameDayMealSuggestion } = require('./lib/nutrition-same-day');
+const { buildVisionSystemPrompt, buildVisionUserMessage } = require('./lib/nutrition-vision-prompt');
+const _correctionStore = require('./lib/nutrition-correction-store');
+const { computeAdaptiveTDEE, suggestedTargetFromTDEE } = require('./lib/nutrition-tdee');
+const { applyNutritionCorrections } = require('./lib/nutrition-voice-corrections');
 assertNoCrossAgent('nutrition', computeNutritionCandidates);
 const _v2Hooks = mountActionRoutes(router, {
   agentName: 'nutrition',
@@ -748,13 +754,126 @@ async function buildNutritionContext(deviceId) {
   // 7-day pattern
   const last7Days = {};
   recentLogs.forEach(l => {
-    if (!last7Days[l.date_str]) last7Days[l.date_str] = { cals: 0, prot: 0, days: 1 };
+    if (!last7Days[l.date_str]) last7Days[l.date_str] = { cals: 0, prot: 0, carb: 0, fat: 0, fiber: 0, evening_kcal: 0, hourly: {}, foods: [] };
     last7Days[l.date_str].cals += l.calories || 0;
     last7Days[l.date_str].prot += l.protein  || 0;
+    last7Days[l.date_str].carb += l.carbs    || 0;
+    last7Days[l.date_str].fat  += l.fat      || 0;
+    last7Days[l.date_str].fiber += Number(l.fiber_g || l.macros?.fiber_g || 0);
+    const at = toIsoString(l.logged_at);
+    const hr = at ? new Date(at).getHours() : 12;
+    if (hr >= 19) last7Days[l.date_str].evening_kcal += l.calories || 0;
+    last7Days[l.date_str].hourly[hr] = (last7Days[l.date_str].hourly[hr] || 0) + (l.calories || 0);
+    last7Days[l.date_str].foods.push({ name: (l.food_name || '').trim(), kcal: l.calories || 0, prot: l.protein || 0 });
   });
   const daysLogged = Object.keys(last7Days).filter(d => d >= dateStr(new Date(Date.now() - 7 * 86400000)));
   const avgCals7d  = daysLogged.length ? Math.round(daysLogged.reduce((s, d) => s + last7Days[d].cals, 0) / daysLogged.length) : null;
+  const avgProt7d  = daysLogged.length ? Math.round(daysLogged.reduce((s, d) => s + last7Days[d].prot, 0) / daysLogged.length) : null;
+  const avgFiber7d = daysLogged.length ? Math.round(daysLogged.reduce((s, d) => s + last7Days[d].fiber, 0) / daysLogged.length) : null;
   const protHitDays = daysLogged.filter(d => last7Days[d].prot >= protTarget * 0.9).length;
+  const calHitDays  = daysLogged.filter(d => {
+    const r = last7Days[d].cals / calTarget;
+    return r >= 0.9 && r <= 1.1;
+  }).length;
+
+  // ── Live Analysis signals (2026-05-26) ────────────────────────
+  // Feed the SAME numbers the user sees on NutritionAnalysisTabV4 so
+  // the coach answers with matching vocabulary — no contradictions.
+  // Mirrors fitness.agent.js buildFitnessContext "Live Analysis signals"
+  // block. All derived from already-loaded recentLogs; zero extra reads.
+  let analysisLines = '';
+  try {
+    if (daysLogged.length >= 3) {
+      // Volatility — stdev / mean × 100
+      const kcals7 = daysLogged.map(d => last7Days[d].cals);
+      const mean   = kcals7.reduce((a, b) => a + b, 0) / kcals7.length;
+      const variance = kcals7.reduce((s, v) => s + (v - mean) ** 2, 0) / kcals7.length;
+      const stdev = Math.sqrt(variance);
+      const volatility_pct = mean > 0 ? Math.round((stdev / mean) * 100) : 0;
+
+      // Evening kcal %
+      const total7Kcal   = daysLogged.reduce((s, d) => s + last7Days[d].cals, 0);
+      const evening7Kcal = daysLogged.reduce((s, d) => s + last7Days[d].evening_kcal, 0);
+      const evening_pct  = total7Kcal > 0 ? Math.round((evening7Kcal / total7Kcal) * 100) : 0;
+
+      // Peak hour across week
+      const hourTotals = {};
+      daysLogged.forEach(d => {
+        Object.entries(last7Days[d].hourly).forEach(([h, kcal]) => {
+          hourTotals[h] = (hourTotals[h] || 0) + kcal;
+        });
+      });
+      const peakEntry = Object.entries(hourTotals).sort((a, b) => b[1] - a[1])[0];
+      const peak_hour = peakEntry ? Number(peakEntry[0]) : null;
+
+      // Top food + worst food
+      const foodCounts = {};
+      daysLogged.forEach(d => {
+        last7Days[d].foods.forEach(f => {
+          if (!f.name) return;
+          const k = f.name.toLowerCase();
+          if (!foodCounts[k]) foodCounts[k] = { name: f.name, count: 0, kcal_sum: 0, prot_sum: 0 };
+          foodCounts[k].count += 1;
+          foodCounts[k].kcal_sum += f.kcal;
+          foodCounts[k].prot_sum += f.prot;
+        });
+      });
+      const foodEntries = Object.values(foodCounts).filter(f => f.count >= 2);
+      const topFood = foodEntries.sort((a, b) => b.count - a.count)[0];
+      const worstFood = foodEntries
+        .filter(f => f.kcal_sum / f.count >= 200 && f.prot_sum / f.count < 10)
+        .sort((a, b) => b.kcal_sum - a.kcal_sum)[0];
+
+      // Best + worst day (composite of protein hit + calorie band)
+      const dayScores = daysLogged.map(d => {
+        const day = last7Days[d];
+        const calRatio = day.cals / calTarget;
+        const protRatio = day.prot / protTarget;
+        const calOK = (calRatio >= 0.9 && calRatio <= 1.1) ? 1 : (calRatio >= 0.6 && calRatio <= 1.3) ? 0.5 : 0;
+        const score = (protRatio * 0.6 + calOK * 0.4);
+        return { date: d, score, kcal: day.cals, prot: day.prot };
+      });
+      const bestDay  = dayScores.slice().sort((a, b) => b.score - a.score)[0];
+      const worstDay = dayScores.slice().sort((a, b) => a.score - b.score)[0];
+      const fmtDay = d => d ? new Date(d.date + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'short' }) : null;
+
+      // Macro balance — % of total kcal from each macro
+      const totalP7  = daysLogged.reduce((s, d) => s + last7Days[d].prot, 0);
+      const totalC7  = daysLogged.reduce((s, d) => s + last7Days[d].carb, 0);
+      const totalF7  = daysLogged.reduce((s, d) => s + last7Days[d].fat,  0);
+      const totalMK  = totalP7 * 4 + totalC7 * 4 + totalF7 * 9;
+      const pPct = totalMK > 0 ? Math.round((totalP7 * 4 / totalMK) * 100) : null;
+      const cPct = totalMK > 0 ? Math.round((totalC7 * 4 / totalMK) * 100) : null;
+      const fPct = totalMK > 0 ? Math.round((totalF7 * 9 / totalMK) * 100) : null;
+
+      // Lifetime + cached score (current_score is set by the nightly
+      // refreshNutritionScore cron — exposes the same number user sees).
+      const lifetimeStreak = setup.streak || 0;
+      const cachedScore    = setup.current_score || null;
+      const scoreLabel     = setup.score_label || null;
+
+      const sigLines = [
+        cachedScore != null ? `Nutrition score (Analysis tab): ${cachedScore}/100${scoreLabel ? ` (${scoreLabel})` : ''}.` : '',
+        `Protein adherence (7d): ${protHitDays}/${daysLogged.length} days hit (${Math.round((protHitDays / Math.max(daysLogged.length, 1)) * 100)}%).`,
+        `Calorie adherence (7d): ${calHitDays}/${daysLogged.length} days within ±10% (${Math.round((calHitDays / Math.max(daysLogged.length, 1)) * 100)}%).`,
+        avgFiber7d != null ? `Fiber avg (7d): ${avgFiber7d}g/day (target ~25g).` : '',
+        pPct != null ? `Macro balance: ${pPct}% protein / ${cPct}% carb / ${fPct}% fat of weekly kcal.` : '',
+        `Volatility: ${volatility_pct}% kcal day-to-day swing — ${volatility_pct < 15 ? 'steady' : volatility_pct < 25 ? 'moderate' : 'spiky'}.`,
+        `Evening kcal: ${evening_pct}% after 7pm.`,
+        peak_hour != null ? `Peak meal hour: ${peak_hour}:00.` : '',
+        bestDay  ? `Best day (7d): ${fmtDay(bestDay)} — ${Math.round(bestDay.kcal)} kcal / ${Math.round(bestDay.prot)}g protein.` : '',
+        worstDay ? `Worst day (7d): ${fmtDay(worstDay)} — ${Math.round(worstDay.kcal)} kcal / ${Math.round(worstDay.prot)}g protein.` : '',
+        topFood  ? `Top food: ${topFood.name} (${topFood.count}× in 7d, ~${Math.round(topFood.prot_sum / topFood.count)}g protein each).` : '',
+        worstFood ? `Drag food: ${worstFood.name} (${worstFood.count}×, avg ${Math.round(worstFood.kcal_sum / worstFood.count)} kcal / low protein).` : '',
+        lifetimeStreak > 0 ? `Current streak: ${lifetimeStreak} consecutive days logged.` : '',
+      ].filter(Boolean).join('\n');
+      analysisLines = sigLines
+        ? `\n━━━ LIVE ANALYSIS SIGNALS (same numbers the user sees on their Insights tab) ━━━\n${sigLines}`
+        : '';
+    }
+  } catch (_e) {
+    // Never block the chat over signal derivation failure.
+  }
 
   return `You are the Nutrition Coach in Pulse — a deeply personal AI nutrition coach. You are not ChatGPT. You have been privately observing ${name}'s eating patterns and you know their data in detail.
 
@@ -786,7 +905,9 @@ Protein: ${protTarget}g | Carbs: ${carbTarget}g | Fat: ${fatTarget}g
 ━━━ LAST 7 DAYS PATTERN ━━━
 Days logged: ${daysLogged.length}/7
 Average calories: ${avgCals7d ? `${avgCals7d} kcal/day` : 'not enough data'}
+Average protein: ${avgProt7d != null ? `${avgProt7d}g/day (target ${protTarget}g)` : 'not enough data'}
 Protein goal hit: ${protHitDays}/${daysLogged.length} days
+${analysisLines}
 
 ━━━ HARD SCOPE BOUNDARY ━━━
 You ONLY see nutrition data. You do NOT have access to sleep, workouts, mood, water, or fasting. If the user asks how nutrition links to those things, say: "For sleep × food, workouts × food, or mood × food links, ask the Insights tab — that's the agent that combines everything."
@@ -795,6 +916,9 @@ You ONLY see nutrition data. You do NOT have access to sleep, workouts, mood, wa
 1. NEVER use: bad, cheat, guilty, indulge, allowed, naughty, treat, slip, fail
 2. Never imply they've failed. Going over target = "adjust tomorrow" not "you blew it"
 3. Reference exact numbers from their log. A stranger could never say what you say.
+   When the user asks "why am I missing protein" / "should I cut evening calories" / etc,
+   anchor your answer in the LIVE ANALYSIS SIGNALS above — same vocabulary user sees
+   on their Insights tab. No contradictions between tabs.
 4. Stay strictly in the nutrition lane — never speculate about sleep / workouts / mood. Redirect to Insights tab.
 5. Protein is the most important macro — prioritize it in suggestions
 6. Keep responses tight: 2-4 sentences + 1 actionable suggestion unless they want a full plan
@@ -979,10 +1103,172 @@ router.get('/chat-prompts', async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════
+// GET /chat-state — Coach tab header + data-aware quick-prompt signals
+// Mirrors fitness/chat-state shape (2026-05-26). Bundles the
+// last log + 7-day adherence signals that the FE's
+// buildNutritionQuickPrompts uses to pick data-aware chips.
+// ═══════════════════════════════════════════════════════════════
+router.get('/chat-state', async (req, res) => {
+  try {
+    const { deviceId } = req.query;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+
+    const todayStr = dateStr();
+    const cutoff7  = dateStr(new Date(Date.now() - 7 * 86400000));
+
+    const [lastSnap, weekSnap, nutSnap] = await Promise.all([
+      logsCol(deviceId).orderBy('logged_at', 'desc').limit(1).get(),
+      logsCol(deviceId).where('date_str', '>=', cutoff7).get(),
+      nutDoc(deviceId).get(),
+    ]);
+
+    const nutData    = nutSnap.exists ? nutSnap.data() : {};
+    const calTarget  = nutData.calorie_target || 2000;
+    const protTarget = nutData.protein_target || 140;
+
+    // ── Last log → header strip ─────────────────────────────────
+    let last_log = null;
+    if (!lastSnap.empty) {
+      const l = lastSnap.docs[0].data();
+      const at = toIsoString(l.logged_at);
+      const ago = Math.max(0, Math.round((Date.now() - new Date(at).getTime()) / 60000));
+      last_log = {
+        food_name: l.food_name || 'Meal',
+        emoji:     l.emoji || '🍽️',
+        meal_type: l.meal_type || 'snack',
+        calories:  Math.round(l.calories || 0),
+        protein:   Math.round((l.protein || 0) * 10) / 10,
+        ago_minutes: ago,
+        logged_at: at,
+      };
+    }
+
+    // ── 7-day prompt signals ────────────────────────────────────
+    const byDate = {};
+    weekSnap.docs.forEach(d => {
+      const data = d.data();
+      const ds = data.date_str;
+      if (!ds) return;
+      if (!byDate[ds]) byDate[ds] = { kcal: 0, prot: 0, fiber: 0, evening_kcal: 0, hourly: {}, foods: {} };
+      const cal = Number(data.calories || 0);
+      byDate[ds].kcal += cal;
+      byDate[ds].prot += Number(data.protein || 0);
+      const fi = Number(data.fiber_g || data.macros?.fiber_g || 0);
+      byDate[ds].fiber += fi;
+      const at = toIsoString(data.logged_at);
+      const hr = at ? new Date(at).getHours() : 12;
+      if (hr >= 19) byDate[ds].evening_kcal += cal;
+      byDate[ds].hourly[hr] = (byDate[ds].hourly[hr] || 0) + cal;
+      const name = (data.food_name || '').toLowerCase().trim();
+      if (name) byDate[ds].foods[name] = (byDate[ds].foods[name] || 0) + 1;
+    });
+
+    const days = Object.keys(byDate);
+    const dayCount = days.length;
+    let prompt_signals = null;
+
+    if (dayCount >= 3) {
+      const protHitDays = days.filter(d => byDate[d].prot >= protTarget * 0.9).length;
+      const calHitDays  = days.filter(d => {
+        const r = byDate[d].kcal / calTarget;
+        return r >= 0.9 && r <= 1.1;
+      }).length;
+      const protein_pct_7d = Math.round((protHitDays / dayCount) * 100);
+      const cal_pct_7d     = Math.round((calHitDays / dayCount) * 100);
+
+      const totalKcal7    = days.reduce((s, d) => s + byDate[d].kcal, 0);
+      const evening_kcal7 = days.reduce((s, d) => s + byDate[d].evening_kcal, 0);
+      const evening_pct   = totalKcal7 > 0 ? Math.round((evening_kcal7 / totalKcal7) * 100) : 0;
+      const fiber_avg     = days.reduce((s, d) => s + byDate[d].fiber, 0) / dayCount;
+
+      // Peak hour across week
+      const hourTotals = {};
+      days.forEach(d => {
+        Object.entries(byDate[d].hourly).forEach(([h, kcal]) => {
+          hourTotals[h] = (hourTotals[h] || 0) + kcal;
+        });
+      });
+      const peak_hour_entry = Object.entries(hourTotals).sort((a, b) => b[1] - a[1])[0];
+      const peak_hour       = peak_hour_entry ? Number(peak_hour_entry[0]) : null;
+
+      // Top food "rut" detection — most-frequent food + count
+      const foodCounts = {};
+      days.forEach(d => {
+        Object.entries(byDate[d].foods).forEach(([n, c]) => {
+          foodCounts[n] = (foodCounts[n] || 0) + c;
+        });
+      });
+      const topFoodEntry = Object.entries(foodCounts).sort((a, b) => b[1] - a[1])[0];
+      const totalFoods   = Object.values(foodCounts).reduce((s, c) => s + c, 0);
+      const top_food     = (topFoodEntry && topFoodEntry[1] >= 4)
+        ? { name: topFoodEntry[0], count: topFoodEntry[1] }
+        : null;
+
+      prompt_signals = {
+        protein_pct_7d,
+        cal_pct_7d,
+        evening_pct,
+        peak_hour,
+        low_fiber: fiber_avg > 0 && fiber_avg < 18,
+        top_food,
+        days_logged_7d: dayCount,
+      };
+    }
+
+    res.json({
+      last_log,
+      streak: nutData.streak || 0,
+      prompt_signals,
+    });
+  } catch (err) {
+    log.error('[nutrition] /chat-state error:', err);
+    res.status(500).json({ error: 'state failed' });
+  }
+});
+
 // ─── Food Quality scoring (0-100, deterministic from macros + name) ──────
 // Higher = nutrient-dense, lower = ultra-processed. No AI call needed.
+//
+// 2026-05-26 — fixed the beverage gap. Previously ALL <5 kcal items got a
+// flat 50 ("neutral") which silently penalized healthy choices (plain
+// tea, black coffee, water, sparkling water) — same score as an unknown
+// food. The user logs a plain tea and the screen shows "0/140g protein,
+// 0%, 0%, 0%" with a neutral 50 score. That's broken UX for the most
+// common healthy beverage choices.
+//
+// Now: classify into THREE early-exit categories:
+//   • Hydration positives (plain tea/coffee/water/sparkling) → 85
+//   • Diet / artificially-sweetened drinks                   → 45
+//   • Sugary drinks (already caught by junk regex below)     → 25
+// Everything else falls through to the macro-blend below.
 function _computeFoodQuality({ calories = 0, protein = 0, carbs = 0, fat = 0, food_name = '' }) {
-  if (calories < 5) return 50;
+  const name = (food_name || '').toLowerCase();
+
+  // Hydration-positive low-cal beverages — actively good choices.
+  // Plain unsweetened forms only (sweetened variants get caught below).
+  // Backed by: tea polyphenols (Yang 2002), coffee + metabolic health
+  // (van Dam 2020), water/sparkling water as soda substitution
+  // (Chen 2019, AHA).
+  const goodBeveragePatterns = /\b(black tea|green tea|herbal tea|chamomile|peppermint|matcha|black coffee|plain coffee|espresso|americano|water|sparkling water|seltzer|club soda|mineral water|sea-?lt-?zer|kombucha)\b/;
+  const diluentNotPositive   = /\b(latte|cappuccino|mocha|frap|frappuccino|with milk|sweetened|caramel|hazelnut|vanilla|honey|sugar|syrup)\b/;
+
+  if (calories < 10) {
+    // <10 kcal AND name matches a positive beverage AND no sweetener words
+    if (goodBeveragePatterns.test(name) && !diluentNotPositive.test(name)) {
+      return 85;
+    }
+    // Diet / zero-cal sweetened (Diet Coke, Coke Zero, sugar-free Red Bull)
+    if (/\b(diet|zero|sugar.?free|no.?sugar)\b/.test(name) && /\b(soda|coke|pepsi|sprite|fanta|cola|red bull|monster|energy)\b/.test(name)) {
+      return 45;
+    }
+    // Truly empty (e.g. plain water typed as "water" with no macros)
+    // — still hydration-positive, scoring 75 since user is logging intent.
+    if (/\bwater\b/.test(name)) return 80;
+    // Unknown <10 kcal item — keep the old neutral default.
+    return 50;
+  }
+
   const totalMacroCal = protein * 4 + carbs * 4 + fat * 9;
   if (totalMacroCal < 5) return 50;
 
@@ -997,8 +1283,7 @@ function _computeFoodQuality({ calories = 0, protein = 0, carbs = 0, fat = 0, fo
   let bScore = balanceRatio >= 0.20 ? 100 : balanceRatio >= 0.12 ? 75 : balanceRatio >= 0.05 ? 50 : 30;
 
   // 3. Name-based heuristic — penalize known junk, reward whole foods
-  const name = (food_name || '').toLowerCase();
-  const junkPatterns = /\b(soda|coke|pepsi|sprite|candy|chip|crisp|donut|doughnut|cookie|cake|pastry|fries|burger king|mcdonald|kfc|cheeto|dorito|pop ?tart|ice cream|gummy|sugar|syrup|sweetened)\b/;
+  const junkPatterns = /\b(soda|coke|pepsi|sprite|fanta|candy|chip|crisp|donut|doughnut|cookie|cake|pastry|fries|burger king|mcdonald|kfc|cheeto|dorito|pop ?tart|ice cream|gummy|sugar|syrup|sweetened|sweetened juice)\b/;
   const wholePatterns = /\b(salmon|chicken breast|tuna|cod|tilapia|egg|broccoli|spinach|kale|quinoa|oats|oatmeal|lentil|bean|chickpea|tofu|tempeh|sweet potato|brown rice|avocado|berries|blueberr|strawberr|nuts|almond|walnut|greek yogurt|cottage cheese|sardine)\b/;
   let nScore = 60;
   if (junkPatterns.test(name)) nScore = 25;
@@ -1007,6 +1292,28 @@ function _computeFoodQuality({ calories = 0, protein = 0, carbs = 0, fat = 0, fo
   // Weighted blend: 50% protein density, 25% balance, 25% name signal
   const score = Math.round(pScore * 0.50 + bScore * 0.25 + nScore * 0.25);
   return Math.max(0, Math.min(100, score));
+}
+
+// ─── Beverage classifier (used by FE to de-emphasize macro bars) ──────
+// Returns 'positive' (plain tea/coffee/water), 'diet' (zero-cal
+// sweetened), 'sugary' (regular soda / juice / lattes / sweetened), or
+// null if not a beverage. The FE can use this to show a "💧 Hydration"
+// chip + soften the macro bars to muted-grey when the only logs today
+// are positive beverages.
+function _classifyBeverage(name = '', calories = 0) {
+  const n = (name || '').toLowerCase();
+  if (!n) return null;
+  const isBeverage = /\b(tea|coffee|water|seltzer|soda|cola|coke|pepsi|sprite|fanta|juice|smoothie|shake|drink|latte|cappuccino|espresso|americano|matcha|kombucha|red bull|monster|gatorade|powerade)\b/.test(n);
+  if (!isBeverage) return null;
+  // Positive: plain unsweetened forms only.
+  const plain = /\b(black tea|green tea|herbal tea|chamomile|peppermint|matcha|black coffee|plain coffee|espresso|americano|water|sparkling water|seltzer|club soda|mineral water|kombucha)\b/.test(n);
+  const sweetenerWords = /\b(latte|cappuccino|mocha|frap|frappuccino|with milk|sweetened|caramel|hazelnut|vanilla|honey|sugar|syrup)\b/.test(n);
+  if (plain && !sweetenerWords) return 'positive';
+  if (/\b(diet|zero|sugar.?free|no.?sugar)\b/.test(n)) return 'diet';
+  if (calories < 10) return 'positive';   // unknown but zero-cal — give benefit of doubt
+  // Sweetened / sugary catch-all
+  if (/\b(soda|coke|pepsi|sprite|fanta|cola|frap|sweetened|sweet tea|juice|gatorade|powerade)\b/.test(n)) return 'sugary';
+  return null;
 }
 
 async function refreshNutritionScore(deviceId) {
@@ -1102,6 +1409,10 @@ router.post('/log', async (req, res) => {
     const c   = Math.round((carbs || 0) * 10) / 10;
     const f   = Math.round((fat || 0) * 10) / 10;
     const food_quality_score = _computeFoodQuality({ calories: cal, protein: p, carbs: c, fat: f, food_name });
+    // 2026-05-26: classify beverages so FE can de-emphasize macro bars
+    // (a plain unsweetened tea shouldn't show "0/140g protein" as a
+    // dominating bar — it should show "💧 Hydration logged" feedback).
+    const beverage_category = _classifyBeverage(food_name, cal);
 
     const ref = await logsCol(deviceId).add({
       food_name,
@@ -1117,6 +1428,7 @@ router.post('/log', async (req, res) => {
       source:    source || 'manual',
       date_str:  today,
       food_quality_score,
+      beverage_category,   // 'positive' | 'diet' | 'sugary' | null
       logged_at: admin.firestore.FieldValue.serverTimestamp(),
     });
 
@@ -1197,7 +1509,13 @@ router.post('/log', async (req, res) => {
       } catch { /* non-fatal */ }
     });
 
-    res.json({ success: true, id: ref.id, streak: newStreak });
+    res.json({
+      success: true,
+      id: ref.id,
+      streak: newStreak,
+      food_quality_score,
+      beverage_category,
+    });
   } catch (err) {
     log.error('[nutrition] /log error:', err);
     res.status(500).json({ error: 'Log failed' });
@@ -1947,7 +2265,7 @@ const NUTRITION_VISION_SCHEMA = {
   required: ['items'],
 };
 
-async function _multiShotVision(shotsBase64, userCtx, hasDepth, hasFiducial) {
+async function _multiShotVision(shotsBase64, userCtx, hasDepth, hasFiducial, userCorrections = []) {
   if (!Array.isArray(shotsBase64) || !shotsBase64.length) {
     throw new Error('no_shots_provided');
   }
@@ -1958,15 +2276,31 @@ async function _multiShotVision(shotsBase64, userCtx, hasDepth, hasFiducial) {
   if (userCtx?.dietary_style === 'vegetarian') dietBits.push('USER IS VEGETARIAN.');
   if (userCtx?.allergies?.length)              dietBits.push(`ALLERGIES: ${userCtx.allergies.join(', ')}.`);
 
+  // V2 (2026-05-26): reference-object enumeration + per-user correction
+  // few-shot. ADDITIVE to the cached system prompt — both blocks live in
+  // the dynamic user message so the 5-min prompt cache on the system side
+  // still wins. ~50-200 tokens per call when corrections exist; zero
+  // extra tokens when they don't (correctionsBit returns '').
   const scaleBit = hasDepth ? 'LiDAR depth available — trust portions.'
     : hasFiducial ? 'Thumb fiducial in shot (~22mm) — calibrate from it.'
-    : `No fiducial — use plate (~26cm) and cutlery (fork ~20cm) as scale.`;
+    : `No fiducial — use plate (~26cm), cutlery (fork ~20cm), iPhone footprint (147x72mm) or hand outline (palm ≈ 3oz protein, fist ≈ 1 cup) as size references where visible.`;
 
   const shotsBit = shotsBase64.length === 1
     ? '1 photo.'
     : `${shotsBase64.length} photos of the same meal — cross-reference for accuracy.`;
 
-  const userMsgText = `${shotsBit} ${scaleBit}${dietBits.length ? ' ' + dietBits.join(' ') : ''}`;
+  // Per-user correction few-shot block. The vision-prompt lib builds these
+  // from recent {original, corrected} pairs ≤ 180 days old. Closes Cal AI's
+  // "you can't teach it" gap — each user's adjustments shape future calls.
+  let correctionsBit = '';
+  try {
+    if (Array.isArray(userCorrections) && userCorrections.length > 0) {
+      const { buildFewShotBlock } = require('./lib/nutrition-vision-prompt');
+      correctionsBit = buildFewShotBlock(userCorrections);
+    }
+  } catch (_) { /* non-fatal — falls back to no calibration */ }
+
+  const userMsgText = `${shotsBit} ${scaleBit}${dietBits.length ? ' ' + dietBits.join(' ') : ''}${correctionsBit ? '\n' + correctionsBit : ''}`;
 
   const modelUsed = MODELS.cameraPrimary;
   const detail = 'high';
@@ -2116,12 +2450,18 @@ router.post('/vision/analyze', async (req, res) => {
       return res.json({ ...visionCached, cached: true, latency_ms: Date.now() - t0 });
     }
 
-    // Load user context (small read, ~50-80ms — vision dominates anyway)
-    const nutSnap = await nutDoc(deviceId).get();
-    const setup   = nutSnap.exists ? (nutSnap.data() || {}) : {};
+    // Load user context (small read, ~50-80ms — vision dominates anyway) +
+    // recent corrections (~5 docs, parallel) for per-user prompt calibration.
+    const [nutSnap, recentCorrections] = await Promise.all([
+      nutDoc(deviceId).get(),
+      _correctionStore.readRecentCorrections(db(), deviceId, 5).catch(() => []),
+    ]);
+    const setup = nutSnap.exists ? (nutSnap.data() || {}) : {};
 
-    // Stage 1+2: vision recognition
-    const visionResult = await _multiShotVision(shots, setup, !!depth_present, !!fiducial_present);
+    // Stage 1+2: vision recognition (V2 — passes user corrections as few-shot)
+    const visionResult = await _multiShotVision(
+      shots, setup, !!depth_present, !!fiducial_present, recentCorrections,
+    );
 
     if (visionResult.is_label) {
       return res.json({ items: [], is_label: true, latency_ms: Date.now() - t0 });
@@ -2332,7 +2672,29 @@ router.post('/vision/confirm', async (req, res) => {
 router.post('/vision/correction', async (req, res) => {
   try {
     const { deviceId, food_name, model_grams, corrected_grams, model_calories, corrected_calories } = req.body;
-    if (!deviceId || !food_name) return res.status(400).json({ error: 'deviceId and food_name required' });
+    const { source, photo_hash, original, corrected, serving_multiplier } = req.body || {};
+
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+
+    // Two intake shapes supported:
+    //   (a) V1 legacy: flat {food_name, model_grams, corrected_grams, ...}
+    //   (b) V2 (2026-05-26): structured {original:{...}, corrected:{...}}
+    //       used by NutritionCorrectionSheet. V2 also writes to the
+    //       lib/nutrition-correction-store stream for prompt few-shot.
+    if (original && corrected) {
+      // V2 path
+      await _correctionStore.writeCorrection(db(), deviceId, {
+        source: source || 'manual',
+        photo_hash: photo_hash || null,
+        original,
+        corrected,
+        serving_multiplier: Number(serving_multiplier) || 1,
+      });
+      return res.json({ success: true, schema: 'v2' });
+    }
+
+    if (!food_name) return res.status(400).json({ error: 'food_name required' });
+    // V1 legacy path — preserved for backward compat with existing FE.
     await nutDoc(deviceId).collection('vision_corrections').add({
       food_name: String(food_name).toLowerCase(),
       model_grams: +model_grams || 0,
@@ -2342,7 +2704,17 @@ router.post('/vision/correction', async (req, res) => {
       delta_pct: model_grams > 0 ? Math.round(((corrected_grams - model_grams) / model_grams) * 100) : 0,
       created_at: admin.firestore.FieldValue.serverTimestamp(),
     });
-    res.json({ success: true });
+    // Also fanout to V2 store so future prompts learn from V1 corrections.
+    try {
+      await _correctionStore.writeCorrection(db(), deviceId, {
+        source: 'photo',
+        photo_hash: null,
+        original: { food_name, kcal: +model_calories || 0, qty_g: +model_grams || 0 },
+        corrected: { food_name, kcal: +corrected_calories || 0, qty_g: +corrected_grams || 0 },
+        serving_multiplier: model_grams > 0 ? corrected_grams / model_grams : 1,
+      });
+    } catch (_) {}
+    res.json({ success: true, schema: 'v1' });
   } catch (err) {
     log.error('[vision] /vision/correction error:', err);
     res.status(500).json({ error: 'correction_save_failed' });
@@ -2680,10 +3052,15 @@ router.get('/today', async (req, res) => {
 
     const targetDate = date || dateStr();
     const weekAgoStr = dateStr(new Date(Date.now() - 7 * 86400000));
-    const [logsSnap, nutSnap, weekSnap] = await Promise.all([
+    // 28-day window for the same-day-routine-memory lookup (2026-05-26).
+    // No extra Firestore round-trip — same query (date_str range) we use for
+    // the weekly summary, just widened. Cost-neutral.
+    const recentStartStr = dateStr(new Date(Date.now() - 28 * 86400000));
+    const [logsSnap, nutSnap, weekSnap, recentSnap] = await Promise.all([
       logsCol(deviceId).where('date_str', '==', targetDate).get(),
       nutDoc(deviceId).get(),
       logsCol(deviceId).where('date_str', '>=', weekAgoStr).get(),
+      logsCol(deviceId).where('date_str', '>=', recentStartStr).get(),
     ]);
 
     const nutData = nutSnap.exists ? nutSnap.data() : {};
@@ -2717,6 +3094,55 @@ router.get('/today', async (req, res) => {
     const protHitDays7d  = weekDays.filter(d => weekByDay[d].prot >= protTarget7d * 0.9).length;
     const daysLogged7d   = weekDays.length;
 
+    // ── Same-day routine memory (2026-05-26) ────────────────────────
+    // "Typical Monday breakfast" hero on Track tab. Pure helper takes the
+    // last-28-day logs + which meal types user already logged today and
+    // returns the best matching meal pattern to suggest, or null.
+    let sameDaySuggestion = null;
+    try {
+      const recentLogs = recentSnap.docs.map((d) => {
+        const data = d.data();
+        return {
+          date: data.date_str,
+          meal_type: (data.meal_type || '').toLowerCase(),
+          food_name: data.food_name,
+          quantity: data.quantity,
+          unit: data.unit,
+          calories: data.calories || 0,
+          protein: data.protein || 0,
+          carbs: data.carbs || 0,
+          fat: data.fat || 0,
+        };
+      });
+      const alreadyLoggedToday = Array.from(new Set(entries.map((e) => (e.meal_type || '').toLowerCase()).filter(Boolean)));
+      sameDaySuggestion = buildSameDayMealSuggestion({
+        logs: recentLogs,
+        todayDateStr: targetDate,
+        nowHour: new Date().getHours(),
+        alreadyLoggedToday,
+      });
+    } catch (_) { /* non-fatal */ }
+
+    // ── score_smoothed_7d (2026-05-26) — Home coach card pulls this if
+    // user hasn't opened Analysis tab. Cheap derivation from weekByDay.
+    let scoreSmoothed7d = null;
+    try {
+      const calTarget = nutData.calorie_target || 2000;
+      const protTarget = nutData.protein_target || 140;
+      const dayScores = weekDays.map((day) => {
+        const d = weekByDay[day];
+        if (!d) return 0;
+        const calRatio = d.cals > 0 ? d.cals / calTarget : 0;
+        const calScore = (calRatio >= 0.8 && calRatio <= 1.2) ? 100 : (calRatio >= 0.4 && calRatio <= 1.6) ? 70 : 40;
+        const protRatio = d.prot > 0 ? d.prot / protTarget : 0;
+        const protScore = Math.max(0, Math.min(100, protRatio * 100));
+        return Math.round(calScore * 0.5 + protScore * 0.5);
+      });
+      if (dayScores.length > 0) {
+        scoreSmoothed7d = Math.round(dayScores.reduce((a, b) => a + b, 0) / dayScores.length);
+      }
+    } catch (_) {}
+
     res.json({
       entries,
       totals: {
@@ -2735,10 +3161,84 @@ router.get('/today', async (req, res) => {
       },
       streak: nutData.streak || 0,
       weekly: { avg_cals: avgCals7d, protein_hit_days: protHitDays7d, days_logged: daysLogged7d },
+      // Nutrition 10/10 additions (2026-05-26)
+      same_day_suggestion: sameDaySuggestion,
+      score_smoothed_7d: scoreSmoothed7d,
     });
   } catch (err) {
     log.error('[nutrition] /today error:', err);
     res.status(500).json({ error: 'Failed to load today' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// GET /tdee — adaptive Total Daily Energy Expenditure (2026-05-26)
+// Match MacroFactor's gold-standard adaptive TDEE feature. Returns
+// `null` until the user has 14+ days of logs + 3+ weight points.
+// ═══════════════════════════════════════════════════════════════
+router.get('/tdee', async (req, res) => {
+  try {
+    const { deviceId } = req.query;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+
+    const start = dateStr(new Date(Date.now() - 30 * 86400000));
+    const [logsSnap, nutSnap, profileSnap] = await Promise.all([
+      logsCol(deviceId).where('date_str', '>=', start).get(),
+      nutDoc(deviceId).get(),
+      userDoc(deviceId).get(),
+    ]);
+
+    const nutData = nutSnap.exists ? nutSnap.data() : {};
+    const profile = profileSnap.exists ? profileSnap.data() : {};
+    const goal = (nutData.goal || profile.goal || 'maintain').toLowerCase();
+
+    // Aggregate to per-day kcal
+    const byDay = {};
+    logsSnap.docs.forEach((d) => {
+      const data = d.data();
+      if (!data.date_str) return;
+      byDay[data.date_str] = (byDay[data.date_str] || 0) + (data.calories || 0);
+    });
+    const dailyKcal = Object.entries(byDay).map(([date, kcal]) => ({date, kcal}));
+
+    // Weight points: prefer HK-synced; fall back to manual weigh-ins
+    // captured in `weight_log` subcollection if present. Don't fail
+    // hard if the subcollection doesn't exist.
+    let weightPoints = [];
+    try {
+      const wSnap = await userDoc(deviceId).collection('weight_log').orderBy('date_ms', 'desc').limit(60).get();
+      weightPoints = wSnap.docs.map((d) => {
+        const data = d.data();
+        return {
+          date_ms: Number(data.date_ms || 0),
+          weight_kg: Number(data.weight_kg || 0),
+        };
+      }).filter((p) => p.date_ms > 0 && p.weight_kg > 0);
+    } catch (_) {}
+
+    const tdee = computeAdaptiveTDEE({dailyKcal, weightPoints, spanDays: 14});
+    if (!tdee) {
+      return res.json({
+        ok: true,
+        tdee: null,
+        reason: 'insufficient_data',
+        needs: {
+          min_days_with_logs: 14,
+          min_weight_points: 3,
+          have_days: dailyKcal.length,
+          have_weight: weightPoints.length,
+        },
+      });
+    }
+    const suggestion = suggestedTargetFromTDEE({
+      tdee,
+      goal,
+      currentTarget: nutData.calorie_target || 2000,
+    });
+    res.json({ ok: true, tdee, suggestion });
+  } catch (err) {
+    log.error('[nutrition] /tdee error:', err);
+    res.status(500).json({ error: 'tdee_failed' });
   }
 });
 
@@ -3329,6 +3829,17 @@ router.post('/describe', async (req, res) => {
       return res.status(400).json({ error: 'Could not understand audio. Please try again.' });
     }
 
+    // Voice V2 (2026-05-26): apply BE-side STT correction map as a safety
+    // net. The FE already runs this same correction pass before POST, but
+    // server-side audio paths (Siri intent drain, audio_base64 upload,
+    // future Deepgram WS) bypass the FE. Idempotent + deterministic + <1ms.
+    try {
+      const corrected = applyNutritionCorrections(transcript);
+      if (corrected && typeof corrected === 'string' && corrected.length >= 2) {
+        transcript = corrected;
+      }
+    } catch (_) { /* non-fatal */ }
+
     const result = await _runDescribePipeline({ deviceId, transcript });
     const hr = new Date().getHours();
     const meal_type = hr < 11 ? 'breakfast' : hr < 15 ? 'lunch' : hr < 21 ? 'dinner' : 'snack';
@@ -3700,8 +4211,11 @@ async function runProactiveChecks() {
               const topicIndex = nutData.proactive_topic_index || 0;
               const topic      = topics[topicIndex % topics.length];
               const firstName  = (userData.name || '').split(' ')[0];
+              // Cron has no req — resolve language from stored profile.
+              const { resolveUserLanguage } = require('./lib/i18n-prompt');
+              const lang = await resolveUserLanguage(admin.firestore(), deviceId);
 
-              msg  = await buildTopicProactive(topic, firstName, nutData);
+              msg  = await buildTopicProactive(topic, firstName, nutData, lang);
               type = 'discussion_topic';
 
               await nutDoc(deviceId).update({
@@ -3777,7 +4291,7 @@ async function runStreakReminders() {
   }
 }
 
-async function buildTopicProactive(topic, firstName, nutData) {
+async function buildTopicProactive(topic, firstName, nutData, language) {
   const challenge = Array.isArray(nutData.biggest_challenge) ? nutData.biggest_challenge.join(', ') : (nutData.biggest_challenge || 'nutrition');
   const prompt = `You are a warm, direct nutrition coach in a wellness app. Write ONE short message (2-3 sentences) to check in with a user about their nutrition topic.
 
@@ -3794,10 +4308,13 @@ Rules:
 
 Return only the message text.`;
 
+  const langDirective = appendLanguageInstruction('', language);
   try {
     const completion = await openai.chat.completions.create({
       model: MODELS.fast, max_completion_tokens: 100,
-      messages: [{ role: 'user', content: prompt }],
+      messages: langDirective
+        ? [{ role: 'system', content: langDirective }, { role: 'user', content: prompt }]
+        : [{ role: 'user', content: prompt }],
     });
     return completion.choices[0].message.content.trim();
   } catch {
@@ -4330,6 +4847,48 @@ router.get('/analysis', async (req, res) => {
       if (hkCards.length) aha_moments = [...hkCards, ...aha_moments];
     } catch { /* best-effort */ }
 
+    // ── 365-day journey heatmap (2026-05-26) ────────────────────────
+    // Same anchor → today span all other 10/10 agents expose. The FE
+    // <NutritionHeatmap365> component reads `daily_logs[date].has_log`
+    // already, so we just need to make sure daily_logs is populated for
+    // every dated meal. We do NOT precompute the SVG cell array on BE
+    // — the FE component does its own grid layout (matches Water canon).
+    // The `journey` envelope is added for parity with Water shape.
+    const journeyCells = [];
+    try {
+      if (anchor.anchorDateStr) {
+        const [ay, am, ad] = anchor.anchorDateStr.split('-').map(Number);
+        const startMs = new Date(ay, am - 1, ad).getTime();
+        const dayMs = 86_400_000;
+        const dayLogs = payload?.daily_logs || {};
+        let logged = 0;
+        for (let i = 0; i < 365; i++) {
+          const d = new Date(startMs + i * dayMs);
+          const ds = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+          const log = dayLogs[ds];
+          const hasLog = !!log?.has_log;
+          if (hasLog) logged += 1;
+          journeyCells.push({
+            date: ds,
+            has_log: hasLog,
+            quality: log?.quality || null,
+            pre_anchor: ds < anchor.anchorDateStr,
+            future: ds > win.todayDate,
+          });
+        }
+        var _journeyEnvelope = {
+          cells: journeyCells,
+          summary: {
+            days_logged: logged,
+            from: anchor.anchorDateStr,
+            to: journeyCells[journeyCells.length - 1]?.date || anchor.anchorDateStr,
+          },
+        };
+      } else {
+        var _journeyEnvelope = null;
+      }
+    } catch (_) { var _journeyEnvelope = null; }
+
     res.set('Cache-Control', 'private, max-age=60');
     res.json({
       ...payload,
@@ -4343,6 +4902,8 @@ router.get('/analysis', async (req, res) => {
       score_7d_smoothed: std.score_7d_smoothed,
       score_lifetime: std.score_lifetime,
       missed_days: std.missed_days,
+      // Nutrition 10/10 additions (2026-05-26)
+      journey: _journeyEnvelope,
       latency_ms: Date.now() - t0,
     });
   } catch (err) {
@@ -4435,22 +4996,58 @@ if (shouldRunCron()) {
 // ── Nightly analytics pre-warm cron (02:30 server time) ──
 // For every user who logged in the last 7 days, regenerate /analysis
 // for ranges 7+30 so the next morning's open is instant. Stale-while-revalidate.
-const _nutritionPreWarmTick = async () => {
-  const t0 = Date.now();
-  let users = 0, ok = 0, failed = 0;
+// Pull recent-active deviceIds. Fast path: collectionGroup query (needs
+// firestore.indexes.json COLLECTION_GROUP_ASC on food_logs.logged_at).
+// Fallback (2026-05-27): if the index is missing/building (Firestore
+// throws FAILED_PRECONDITION), iterate wellness_users → query each
+// user's food_logs subcollection. Slower but never crashes the cron.
+async function _activeDeviceIdsLast7d(limit = 2000) {
+  const recent = admin.firestore.Timestamp.fromMillis(Date.now() - 7 * 86400000);
+  const deviceIds = new Set();
   try {
-    const recent = admin.firestore.Timestamp.fromMillis(Date.now() - 7 * 86400000);
     const snap = await admin.firestore()
       .collectionGroup('food_logs')
       .where('logged_at', '>=', recent)
       .select('date_str')
-      .limit(2000)
+      .limit(limit)
       .get();
-    const deviceIds = new Set();
     snap.docs.forEach(d => {
       const m = d.ref.path.match(/wellness_users\/([^/]+)/);
       if (m) deviceIds.add(m[1]);
     });
+    return deviceIds;
+  } catch (e) {
+    const isIndexErr = e?.code === 9
+      || /FAILED_PRECONDITION/i.test(e?.message || '')
+      || /requires an index/i.test(e?.message || '');
+    if (!isIndexErr) throw e;
+    log.warn('[nutrition cron] collectionGroup index missing — using per-user fallback. Run: firebase deploy --only firestore:indexes');
+    const usersSnap = await admin.firestore().collection('wellness_users').select().limit(limit).get();
+    const tasks = usersSnap.docs.map(async (u) => {
+      try {
+        const sub = await admin.firestore()
+          .collection('wellness_users').doc(u.id)
+          .collection('agents').doc('nutrition').collection('food_logs')
+          .where('logged_at', '>=', recent)
+          .select()
+          .limit(1)
+          .get();
+        if (!sub.empty) deviceIds.add(u.id);
+      } catch (_) { /* per-user failure non-fatal */ }
+    });
+    const chunk = 20;
+    for (let i = 0; i < tasks.length; i += chunk) {
+      await Promise.all(tasks.slice(i, i + chunk));
+    }
+    return deviceIds;
+  }
+}
+
+const _nutritionPreWarmTick = async () => {
+  const t0 = Date.now();
+  let users = 0, ok = 0, failed = 0;
+  try {
+    const deviceIds = await _activeDeviceIdsLast7d(2000);
     users = deviceIds.size;
     const { resolveUserLanguage } = require('./lib/i18n-prompt');
     for (const deviceId of deviceIds) {
@@ -4483,18 +5080,8 @@ const _nutritionActionRxTick = async () => {
   const t0 = Date.now();
   let users = 0, generated = 0, skipped = 0, failed = 0;
   try {
-    const recent = admin.firestore.Timestamp.fromMillis(Date.now() - 7 * 86400000);
-    const snap = await admin.firestore()
-      .collectionGroup('food_logs')
-      .where('logged_at', '>=', recent)
-      .select('date_str')
-      .limit(3000)
-      .get();
-    const deviceIds = new Set();
-    snap.docs.forEach(d => {
-      const m = d.ref.path.match(/wellness_users\/([^/]+)/);
-      if (m) deviceIds.add(m[1]);
-    });
+    // Same fast-path-with-fallback shape as the pre-warm cron above.
+    const deviceIds = await _activeDeviceIdsLast7d(3000);
     users = deviceIds.size;
 
     for (const deviceId of deviceIds) {

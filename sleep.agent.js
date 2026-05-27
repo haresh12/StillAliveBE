@@ -593,37 +593,45 @@ router.post('/log', async (req, res) => {
     const sinceLast  = totalCount - lastGenAt;
 
     // ── Every 3 logs → retire active → generate fresh batch ──
+    // PERF FIX (2026-05-24): the LLM `generateActions` call below routinely
+    // takes 15-23s. Keeping it in the response path was costing the user a
+    // safeFetch timeout (FE bails at 10s) on every 3rd log. Now it runs
+    // fire-and-forget; the FE re-fetches /actions when the user visits the
+    // Actions tab (which it already does on mount, with optimistic
+    // rollback). action_refresh:true in the response is the signal that
+    // new actions are coming.
     // ABSOLUTE LAW: single agents never read sibling-agent data.
     // Cross-agent insights flow ONLY through the cross-agent engine.
-    let newActions = null;
-    if (sinceLast >= 3) {
-      const [recentLogsSnap, recentChatSnap, profileSnap] = await Promise.all([
-        logsCol(deviceId).orderBy('logged_at', 'desc').limit(10).get(),
-        chatsCol(deviceId).orderBy('created_at', 'desc').limit(10).get(),
-        userDoc(deviceId).get(),
-      ]);
+    const _shouldRegenActions = sinceLast >= 3;
+    const actionsTask = !_shouldRegenActions ? Promise.resolve() : (async () => {
+      try {
+        const [recentLogsSnap, recentChatSnap, profileSnap] = await Promise.all([
+          logsCol(deviceId).orderBy('logged_at', 'desc').limit(10).get(),
+          chatsCol(deviceId).orderBy('created_at', 'desc').limit(10).get(),
+          userDoc(deviceId).get(),
+        ]);
 
-      const recentLogs     = recentLogsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-      const recentChat     = recentChatSnap.docs.reverse().map(d => d.data());
-      const profile        = profileSnap.exists ? profileSnap.data() : {};
-      const recentlySkipped = (sleepDataBefore.skip_history || []).slice(-8);
+        const recentLogs     = recentLogsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+        const recentChat     = recentChatSnap.docs.reverse().map(d => d.data());
+        const profile        = profileSnap.exists ? profileSnap.data() : {};
+        const recentlySkipped = (sleepDataBefore.skip_history || []).slice(-8);
 
-      newActions = await generateActions({
-        profile,
-        setup:     sleepDataBefore,
-        recentLogs,
-        recentChat,
-        recentlySkipped,
-        isFirstGen: false,
-        crossAgentCtx: '',
-      });
+        const newActions = await generateActions({
+          profile,
+          setup:     sleepDataBefore,
+          recentLogs,
+          recentChat,
+          recentlySkipped,
+          isFirstGen: false,
+          crossAgentCtx: '',
+        });
 
-      const activeSnap = await actionsCol(deviceId).where('status', '==', 'active').get();
-      const batch      = db().batch();
-      activeSnap.docs
-        .filter(d => d.data().source !== 'user_intention')
-        .forEach(d => batch.update(d.ref, { status: 'past' }));
-      newActions.forEach(action => {
+        const activeSnap = await actionsCol(deviceId).where('status', '==', 'active').get();
+        const batch      = db().batch();
+        activeSnap.docs
+          .filter(d => d.data().source !== 'user_intention')
+          .forEach(d => batch.update(d.ref, { status: 'past' }));
+        newActions.forEach(action => {
         const ref = actionsCol(deviceId).doc();
         batch.set(ref, {
           ...action,
@@ -634,15 +642,27 @@ router.post('/log', async (req, res) => {
           completed_at: null,
         });
       });
-      await batch.commit();
-      await sleepDoc(deviceId).update({ last_action_gen_at_log: totalCount });
-    }
+        await batch.commit();
+        await sleepDoc(deviceId).update({ last_action_gen_at_log: totalCount });
+      } catch (err) {
+        log.error('[sleep] actions regen background error:', err.message);
+      }
+    })();
+    // actionsTask intentionally NOT awaited — runs after res.json returns.
+    void actionsTask;
 
     // ── PROACTIVE GATE: max 1 proactive message per day, highest priority wins ──
     // Priority: poor_sleep > sleep_debt (urgent ≥4h) > sleep_debt (mild ≥2h) > streak_milestone
     // A single global guard (last_proactive_date) prevents any overlap regardless of type.
+    //
+    // PERF FIX (2026-05-24): the entire proactive block is fire-and-forget so
+    // /log can return to the user in <500ms instead of 15s. The proactive
+    // message is written to the chat collection in the background; the FE
+    // polls /chat/unread on app foreground and picks it up there. We wrap in
+    // an IIFE so the awaits inside don't block the route handler's response.
     const lastProactiveDate = sleepDataBefore.last_proactive_date;
-    if (lastProactiveDate !== today) {
+    const _runProactive = lastProactiveDate !== today;
+    const proactiveTask = !_runProactive ? Promise.resolve() : (async () => {
       try {
         const [profileSnap, recentLogsSnap] = await Promise.all([
           userDoc(deviceId).get(),
@@ -660,7 +680,7 @@ router.post('/log', async (req, res) => {
         // P1 — Poor quality (quality ≤ 2)
         if ((sleep_quality || 3) <= 2) {
           proactiveMsg  = await buildPoorSleepProactive(
-            pName, sleep_quality, disruptors || [], note || '', recent, sleepDataBefore
+            pName, sleep_quality, disruptors || [], note || '', recent, sleepDataBefore, deviceId
           );
           proactiveType = 'poor_sleep';
           extraUpdate   = { last_poor_sleep_date: today };
@@ -709,7 +729,10 @@ router.post('/log', async (req, res) => {
       } catch (err) {
         log.error('[sleep] proactive error:', err.message);
       }
-    }
+    })();
+    // proactiveTask is intentionally NOT awaited — runs in background after
+    // res.json returns. Reference it so the linter doesn't strip the binding.
+    void proactiveTask;
 
     // Invalidate context cache — new log changes metrics the coach uses
     invalidateContextCache(deviceId);
@@ -725,8 +748,12 @@ router.post('/log', async (req, res) => {
         total_sleep_hours: parseFloat(totalSleep.toFixed(2)),
         sleep_efficiency:  efficiency,
       },
-      action_refresh: sinceLast >= 3,
-      new_actions:    newActions,
+      // action_refresh:true → FE re-fetches /actions when user navigates
+      // to the Actions tab. We no longer ship `new_actions` inline because
+      // generating them takes 15-23s (LLM call) and we want this response
+      // back to the user in <1s.
+      action_refresh: _shouldRegenActions,
+      new_actions:    null,
     });
   } catch (err) {
     log.error('[sleep] /log error:', err);
@@ -1488,7 +1515,12 @@ Return ONLY valid JSON array of 3 objects — no markdown, no explanation:
   try {
     const completion = await openai.chat.completions.create({
       model: AI.REASONING_PRO,
-      max_completion_tokens: 800,
+      // 900 to match Fitness/Mind action generation. Sleep's prompt is
+      // longer (CBT-I clinical framing + pre-computed metrics + 8 setup-
+      // driven candidates) so 800 was risking truncation of the JSON tail
+      // on the third action's proof. 900 leaves enough room for the
+      // strict-schema response without ever clipping mid-quote.
+      max_completion_tokens: 900,
       messages: [{ role: 'user', content: prompt }],
     });
 
@@ -1538,7 +1570,7 @@ function pickMIType(recentLogs, lastMsgType) {
   return filtered[0]; // fallback for new users
 }
 
-async function buildPoorSleepProactive(name, quality, disruptors, note, recentLogs, setupData) {
+async function buildPoorSleepProactive(name, quality, disruptors, note, recentLogs, setupData, deviceId) {
   const problem    = setupData.primary_problem || 'sleep';
   const last3      = recentLogs.slice(0, 3);
   const avgQuality = last3.length
@@ -1582,8 +1614,12 @@ Hard rules:
       model: AI.REASONING_PRO, max_completion_tokens: 200,
       messages: [{ role: 'user', content: prompt }],
     });
-    // Store msg type for next rotation (fire-and-forget)
-    sleepDoc(setupData._deviceId || '').update({ last_poor_sleep_msg_type: msgType }).catch(()=>{});
+    // Store msg type for next rotation (fire-and-forget). `deviceId` is
+    // passed in explicitly — `setupData._deviceId` was always undefined,
+    // which produced "documentPath must be non-empty" log spam.
+    if (deviceId) {
+      sleepDoc(deviceId).update({ last_poor_sleep_msg_type: msgType }).catch(()=>{});
+    }
     return completion.choices[0].message.content.trim();
   } catch (err) {
     log.error('[sleep.agent] buildPoorSleepProactive LLM:', err.message);
@@ -2109,11 +2145,15 @@ function buildSignalPoints(allLogs, range = 'all') {
     const n   = entries.length;
     const avg = (field, def) => parseFloat((entries.reduce((s, e) => s + (e[field] || def), 0) / n).toFixed(1));
     const d   = new Date(ds + 'T12:00:00');
+    const sleepQuality    = avg('sleep_quality', 3);
+    const totalSleepHours = avg('total_sleep_hours', 0);
     return {
       date_str:          ds,
       label:             d.toLocaleDateString('en', { month: 'short', day: 'numeric' }),
-      sleep_quality:     avg('sleep_quality', 3),
-      total_sleep_hours: avg('total_sleep_hours', 0),
+      sleep_quality:     sleepQuality,
+      total_sleep_hours: totalSleepHours,
+      hours:             totalSleepHours,
+      quality:           sleepQuality,
       sleep_efficiency:  Math.round(entries.reduce((s, e) => s + (e.sleep_efficiency || 0), 0) / n),
       morning_energy:    avg('morning_energy', 3),
       disruptors:        [],

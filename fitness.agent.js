@@ -104,6 +104,8 @@ function validDow(dow) {
   return typeof dow === 'string' && DOW_NAMES.includes(dow.toLowerCase());
 }
 
+const { entryTypeFor: _entryTypeFor, validateSet: _validateSet, ENTRY_TYPES: _ENTRY_TYPES } = require('./lib/fitness-entry-types');
+
 function normalizeWorkoutExercises(input) {
   if (!Array.isArray(input) || input.length === 0) {
     throw Object.assign(new Error("exercises array required"), { status: 400 });
@@ -117,28 +119,22 @@ function normalizeWorkoutExercises(input) {
     if (!Array.isArray(ex.sets) || ex.sets.length === 0) {
       throw Object.assign(new Error(`${name}: at least one set required`), { status: 400 });
     }
+    const muscle_group = ex.muscle_group || detectMuscleGroup(name);
+    // Resolve entry_type: trust the FE if it sent one (it has the same
+    // override table); else infer from name + muscle group. Same code path
+    // for manual + voice flows.
+    const entry_type = (ex.entry_type && Object.values(_ENTRY_TYPES).includes(ex.entry_type))
+      ? ex.entry_type
+      : _entryTypeFor(name, muscle_group);
 
-    const sets = ex.sets.map((s, setIdx) => {
-      const hasReps = s && s.reps !== undefined && s.reps !== null && s.reps !== '';
-      const hasWeight = s && s.weight_kg !== undefined && s.weight_kg !== null && s.weight_kg !== '';
-      const reps = hasReps ? parseInt(s.reps, 10) : NaN;
-      const weight_kg = hasWeight ? parseFloat(s.weight_kg) : NaN;
-      if (!Number.isFinite(reps) || reps <= 0) {
-        throw Object.assign(new Error(`${name} set ${setIdx + 1}: reps required`), { status: 400 });
-      }
-      if (!Number.isFinite(weight_kg) || weight_kg < 0) {
-        throw Object.assign(new Error(`${name} set ${setIdx + 1}: weight required`), { status: 400 });
-      }
-      const rpe = s.rpe != null ? Math.max(1, Math.min(10, parseFloat(s.rpe))) : null;
-      const e1rm = weight_kg > 0
-        ? Math.round(weight_kg * (1 + 0.0333 * reps) * 10) / 10
-        : null;
-      return { reps, weight_kg, ...(rpe != null ? { rpe } : {}), ...(e1rm != null ? { e1rm } : {}) };
-    });
+    const sets = ex.sets.map((s, setIdx) =>
+      _validateSet(s, entry_type, { label: `${name} set ${setIdx + 1}` })
+    );
 
     return {
       name,
-      muscle_group: ex.muscle_group || detectMuscleGroup(name),
+      muscle_group,
+      entry_type,
       sets,
     };
   });
@@ -584,12 +580,38 @@ async function buildFitnessContext(deviceId) {
         }
       }
 
+      // Entry-type dimensional aggregates (2026-05-24) — session
+      // duration the user actually entered, cardio km/min, iso hold time,
+      // interval rounds. Lets the coach reference what the user did
+      // beyond strength sets ("you ran 12 km this month, nice").
+      const sd = F.deriveSessionDurationStats(last30);
+      const ns = F.deriveNonStrengthStats(last30);
+      // Lifetime cumulative — "since you started, X hours / Y sessions".
+      // Loaded from the full workouts list (90-cap above is enough for
+      // most users; long-term users still see a meaningful floor).
+      const lt = F.deriveLifetimeStats(workouts);
+
       const sigLines = [
         `Readiness ${banister.readiness}/100, band=${banister.band}.`,
         `Effort: ${effort.working_pct}% of working sets in RPE 7-9 zone (last 30d).`,
         `Balance: push ${ppl.push_pct}% / pull ${ppl.pull_pct}% / legs ${ppl.legs_pct}%${ppl.warn ? ' — imbalance' : ''}.`,
         freq.length ? `Frequency: ${freq.slice(0, 3).map((m) => `${m.muscle} ${m.per_week}/wk`).join(', ')}.` : '',
         prior ? `vs prior 30d: vol ${prior.delta_vol_pct >= 0 ? '+' : ''}${prior.delta_vol_pct ?? 0}%, sets ${prior.delta_sets_pct >= 0 ? '+' : ''}${prior.delta_sets_pct ?? 0}%, PRs ${prior.delta_prs_abs >= 0 ? '+' : ''}${prior.delta_prs_abs}.` : '',
+        sd.avg_session_duration_min != null
+          ? `Avg session duration: ${sd.avg_session_duration_min} min (across ${sd.sessions_with_duration} sessions in last 30d).`
+          : '',
+        lt.total_sessions > 0
+          ? `Lifetime since anchor: ${lt.total_hours}h trained · ${lt.total_sessions} sessions · ${lt.days_active} days active.`
+          : '',
+        ns.cardio.sessions > 0
+          ? `Cardio (30d): ${ns.cardio.sessions} sessions · ${ns.cardio.total_distance_km} km · ${ns.cardio.total_duration_min} min total.`
+          : '',
+        ns.iso.sessions > 0
+          ? `Isometric (30d): ${ns.iso.sessions} sessions · ${ns.iso.total_duration_min} min hold time.`
+          : '',
+        ns.interval.sessions > 0
+          ? `Intervals (30d): ${ns.interval.sessions} sessions · ${ns.interval.total_rounds} rounds · ${ns.interval.total_work_min} work min.`
+          : '',
         plateauNotes.length ? `Plateau flags: ${plateauNotes.join('; ')}.` : '',
       ].filter(Boolean).join('\n');
       analysisLines = sigLines ? `Live Analysis signals (the same numbers the user sees on their Analysis tab):\n${sigLines}` : '';
@@ -2139,7 +2161,7 @@ router.delete("/templates/:dow", async (req, res) => {
 
 // POST /log — log a workout session
 router.post("/log", async (req, res) => {
-  const { deviceId, exercises, date } = req.body;
+  const { deviceId, exercises, date, duration_min: durationMinRaw } = req.body;
   if (!deviceId) return res.status(400).json({ error: "deviceId required" });
   try {
     const anchor = await resolveAnchor(deviceId);
@@ -2155,13 +2177,67 @@ router.post("/log", async (req, res) => {
     // are rejected here, not converted to zero.
     const enriched = normalizeWorkoutExercises(exercises);
 
-    // Compute total volume
-    const totalVolume = enriched.reduce(
-      (sum, ex) =>
-        sum + ex.sets.reduce((s2, st) => s2 + st.reps * st.weight_kg, 0),
-      0,
-    );
+    // Aggregates — branch per set's entry_type. Only weight×reps sets
+    // contribute to total_volume_kg; cardio / iso / interval / carry get
+    // their own dimensional aggregates so downstream stats stay sane.
+    let totalVolume = 0;
+    let cardioDistanceM = 0;
+    let cardioDurationSec = 0;
+    let isoDurationSec = 0;
+    let intervalRounds = 0;
+    let intervalWorkSec = 0;
+    let carryDistanceM = 0;
     const totalSets = enriched.reduce((sum, ex) => sum + ex.sets.length, 0);
+    for (const ex of enriched) {
+      for (const st of ex.sets) {
+        switch (st.entry_type) {
+          case _ENTRY_TYPES.WEIGHT_REPS:
+          case _ENTRY_TYPES.BODYWEIGHT_REPS:
+            if (Number.isFinite(st.weight_kg) && Number.isFinite(st.reps)) {
+              totalVolume += st.weight_kg * st.reps;
+            }
+            break;
+          case _ENTRY_TYPES.DISTANCE_TIME:
+            if (Number.isFinite(st.distance_m)) cardioDistanceM += st.distance_m;
+            if (Number.isFinite(st.duration_sec)) cardioDurationSec += st.duration_sec;
+            break;
+          case _ENTRY_TYPES.TIME_ONLY:
+            if (Number.isFinite(st.duration_sec)) isoDurationSec += st.duration_sec;
+            break;
+          case _ENTRY_TYPES.INTERVAL:
+            if (Number.isFinite(st.rounds)) intervalRounds += st.rounds;
+            if (Number.isFinite(st.rounds) && Number.isFinite(st.work_sec)) {
+              intervalWorkSec += st.rounds * st.work_sec;
+            }
+            break;
+          case _ENTRY_TYPES.WEIGHT_DISTANCE:
+            if (Number.isFinite(st.distance_m)) carryDistanceM += st.distance_m;
+            if (Number.isFinite(st.weight_kg) && Number.isFinite(st.distance_m)) {
+              // Loaded carry "volume" proxy = kg × m; rare to surface but
+              // keeps progressive-overload coaching possible later.
+              totalVolume += st.weight_kg * (st.distance_m / 10);
+            }
+            break;
+          default:
+            break;
+        }
+      }
+    }
+
+    // Workout-level user-entered duration. REQUIRED (user explicit ask
+    // 2026-05-24). Clamped 1..600 min. Rejected at the boundary so older
+    // clients without the field also fail loudly — easier to debug than
+    // a silent "duration always 0" everywhere downstream.
+    let duration_min = null;
+    if (durationMinRaw !== undefined && durationMinRaw !== null && durationMinRaw !== '') {
+      const dm = parseFloat(durationMinRaw);
+      if (Number.isFinite(dm) && dm > 0) {
+        duration_min = Math.min(600, Math.max(1, Math.round(dm)));
+      }
+    }
+    if (duration_min == null) {
+      return res.status(400).json({ error: 'duration_min required (in minutes)' });
+    }
 
     const workoutRef = workoutsCol(deviceId).doc();
 
@@ -2182,6 +2258,17 @@ router.post("/log", async (req, res) => {
       exercises: enriched,
       total_sets: totalSets,
       total_volume_kg: round(totalVolume, 1),
+      // ── Non-strength aggregates (only written when > 0; absent fields
+      //    read as 0 downstream, never null/undefined) ──
+      ...(cardioDistanceM   > 0 ? { cardio_distance_m:   Math.round(cardioDistanceM) } : {}),
+      ...(cardioDurationSec > 0 ? { cardio_duration_sec: Math.round(cardioDurationSec) } : {}),
+      ...(isoDurationSec    > 0 ? { iso_duration_sec:    Math.round(isoDurationSec) } : {}),
+      ...(intervalRounds    > 0 ? { interval_rounds:     intervalRounds } : {}),
+      ...(intervalWorkSec   > 0 ? { interval_work_sec:   Math.round(intervalWorkSec) } : {}),
+      ...(carryDistanceM    > 0 ? { carry_distance_m:    Math.round(carryDistanceM) } : {}),
+      // Workout-level duration (manual user input — not a timer). Null when
+      // the user skipped the field; downstream treats missing as "unknown".
+      ...(duration_min != null ? { duration_min } : {}),
       personal_records: [],          // filled in by background job
       logged_at: admin.firestore.FieldValue.serverTimestamp(),
     });
@@ -2196,13 +2283,31 @@ router.post("/log", async (req, res) => {
     // Uses a Firestore transaction so two concurrent logs can't clobber
     // each other's appends. Doesn't block the response (setImmediate).
     setImmediate(() => {
+      // Templates preserve entry_type + ALL dimensional fields so cardio
+      // / iso / interval / carry templates round-trip correctly. Older
+      // template writes lost everything except reps + weight_kg, which
+      // meant a "Long Run 8km in 42 min" Sunday template would render
+      // next Sunday as "0 reps × 0 kg" — silently broken. Now the FE
+      // ConfirmSheet's normalize path picks up whatever the set had.
       const tplExercises = enriched.map((ex) => ({
         name: ex.name,
         muscle_group: ex.muscle_group,
-        sets: (ex.sets || []).map((s) => ({
-          reps: s.reps || 0,
-          weight_kg: s.weight_kg || 0,
-        })),
+        entry_type: ex.entry_type,
+        sets: (ex.sets || []).map((s) => {
+          const out = {};
+          if (Number.isFinite(s.reps))         out.reps = s.reps;
+          if (Number.isFinite(s.weight_kg))    out.weight_kg = s.weight_kg;
+          if (Number.isFinite(s.distance_m))   out.distance_m = s.distance_m;
+          if (Number.isFinite(s.duration_sec)) out.duration_sec = s.duration_sec;
+          if (Number.isFinite(s.rounds))       out.rounds = s.rounds;
+          if (Number.isFinite(s.work_sec))     out.work_sec = s.work_sec;
+          if (Number.isFinite(s.rest_sec))     out.rest_sec = s.rest_sec;
+          // For strength sets the legacy template shape had `reps:0, weight_kg:0`
+          // as fallbacks — keep that so any old consumer still works.
+          if (out.reps == null && (ex.entry_type === _ENTRY_TYPES.WEIGHT_REPS || ex.entry_type === _ENTRY_TYPES.BODYWEIGHT_REPS)) out.reps = 0;
+          if (out.weight_kg == null && ex.entry_type === _ENTRY_TYPES.WEIGHT_REPS) out.weight_kg = 0;
+          return out;
+        }),
       }));
       const tplRef = templatesCol(deviceId).doc(dayOfWeek);
       db().runTransaction(async (tx) => {
@@ -2763,21 +2868,65 @@ router.post("/describe", async (req, res) => {
       '  pull-up / row → back; OHP / lateral raise → shoulders; curl / pushdown → arms;',
       '  plank / crunch → core; treadmill / rower → cardio; clean / burpee → full_body.',
       '',
+      'CANONICAL EXERCISE NAMES — always emit the canonical form so the FE',
+      'picker can match the exercise to its catalog entry. Common aliases:',
+      '  "rower" / "row machine" / "concept 2" → "Rowing Machine"',
+      '  "bike" / "cycle" / "spinning" → "Cycling"',
+      '  "run" / "running" / "jogging" → "Outdoor Run" (or "Treadmill Run" if treadmill mentioned)',
+      '  "ohp" / "shoulder press" / "military press" → "Overhead Press"',
+      '  "deadlift" / "DL" / "deads" → "Deadlift"',
+      '  "ez bar curl" / "ez curl" → "EZ Bar Curl"',
+      '  "bench" / "BP" → "Bench Press"',
+      '  "squat" / "back squat" → "Back Squat"',
+      'When in doubt, use Title Case with the most-common gym name. Never invent',
+      'a 1-word name like "Rower" or "Bike" if a longer canonical exists.',
+      '',
+      'ENTRY TYPE — pick exactly ONE per exercise:',
+      '  "WEIGHT_REPS"      — barbell/dumbbell/machine (sets × reps × weight)',
+      '  "BODYWEIGHT_REPS"  — pull-up, push-up, dip, etc. (reps; weight optional for added load)',
+      '  "DISTANCE_TIME"    — treadmill run, cycling, rowing, swimming, walking, hiking (distance + duration)',
+      '  "TIME_ONLY"        — plank, wall sit, dead hang, jump rope, battle ropes (just duration)',
+      '  "INTERVAL"         — Tabata, HIIT sprints, sprint intervals (rounds × work seconds / rest seconds)',
+      '  "WEIGHT_DISTANCE"  — farmer\'s walk, sandbag carry, sled push (distance × load)',
+      'Per-set fields differ by type — emit ONLY the fields relevant to the picked type:',
+      '  WEIGHT_REPS:      { reps, weight_kg }',
+      '  BODYWEIGHT_REPS:  { reps, weight_kg?  }  // weight_kg = added load (omit/null if none)',
+      '  DISTANCE_TIME:    { distance_m?, duration_sec?  }  // at least one of the two',
+      '  TIME_ONLY:        { duration_sec }',
+      '  INTERVAL:         { rounds, work_sec, rest_sec? }',
+      '  WEIGHT_DISTANCE:  { distance_m, weight_kg? }',
+      'Always also accept "rir" and "notes" on any set (optional).',
+      '',
+      'UNIT NORMALIZATION:',
+      '- "5k", "5 km" → distance_m: 5000',
+      '- "3 miles" → distance_m: 4828   (1 mi = 1609.344 m; round to nearest meter)',
+      '- "26 minutes", "26 min" → duration_sec: 1560',
+      '- "1 hour 5 min", "1:05" → duration_sec: 3900',
+      '- "60 seconds", "1 min" (for plank) → duration_sec: 60',
+      '- "20 on 10 off" (Tabata) → work_sec: 20, rest_sec: 10',
+      '',
       'OUTPUT (strict JSON):',
       '{',
       '  "exercises": [',
       '    {',
-      '      "exercise": canonical name (e.g. "Back Squat", "Bench Press"),',
+      '      "exercise": canonical name (e.g. "Back Squat", "Treadmill Run", "Plank"),',
       '      "muscle_group": one of the muscle group ids listed above,',
-      '      "sets": [{ "reps": int, "weight_kg": number|null, "rir": int|null, "notes": string|null }],',
+      '      "entry_type": one of the entry types listed above,',
+      '      "sets": [ { ...fields for this entry_type... } ],',
       '      "missing": []  // see PER-FIELD CONFIDENCE below',
       '    },',
       '    ...',
       '  ],',
       '  "session_notes": string|null,',
+      '  "session_duration_min": integer|null,  // overall workout time if user says it ("all in all 60 minutes", "took about an hour", "spent two hours total")',
       '  "confidence": integer 0-100,',
       '  "ambiguous_fields": array',
       '}',
+      '',
+      'SESSION_DURATION_MIN — extract ONLY if the user states a total session',
+      'time. Examples: "the whole session took 75 minutes" → 75. "spent about',
+      'an hour" → 60. "two hours total" → 120. "1.5 hours" → 90. If they only',
+      'say per-exercise time, do NOT add session_duration_min — leave null.',
       '',
       'PER-FIELD CONFIDENCE (Sleep-style, REQUIRED):',
       'For EACH exercise, populate `missing` with any fields the user did NOT',
@@ -2809,17 +2958,29 @@ router.post("/describe", async (req, res) => {
             properties: {
               exercise:     { type: 'string' },
               muscle_group: { type: 'string' },
+              entry_type:   { type: 'string', nullable: true },
               sets: {
                 type: 'array',
                 items: {
                   type: 'object',
                   properties: {
-                    reps:      { type: 'integer' },
-                    weight_kg: { type: 'number', nullable: true },
-                    rir:       { type: 'integer', nullable: true },
-                    notes:     { type: 'string', nullable: true },
+                    // Strength fields
+                    reps:      { type: 'integer', nullable: true },
+                    weight_kg: { type: 'number',  nullable: true },
+                    // Cardio / iso fields
+                    distance_m:   { type: 'integer', nullable: true },
+                    duration_sec: { type: 'integer', nullable: true },
+                    // Interval fields
+                    rounds:   { type: 'integer', nullable: true },
+                    work_sec: { type: 'integer', nullable: true },
+                    rest_sec: { type: 'integer', nullable: true },
+                    // Optional everywhere
+                    rir:   { type: 'integer', nullable: true },
+                    notes: { type: 'string',  nullable: true },
                   },
-                  required: ['reps', 'weight_kg'],
+                  // No `required` — fields shown depend on entry_type, which
+                  // varies per exercise. Server-side normalize + validate
+                  // handles type-specific required-ness at log time.
                 },
               },
               missing: { type: 'array', items: { type: 'string' } },
@@ -2828,6 +2989,10 @@ router.post("/describe", async (req, res) => {
           },
         },
         session_notes:    { type: 'string', nullable: true },
+        // Overall workout duration in minutes — when user says "all in all
+        // 60 minutes" or "took about an hour" the LLM extracts it here so
+        // the FE Confirm sheet can pre-fill the SESSION field.
+        session_duration_min: { type: 'integer', nullable: true },
         confidence:       { type: 'integer' },
         ambiguous_fields: { type: 'array', items: { type: 'string' } },
       },
@@ -2917,16 +3082,36 @@ router.post("/describe", async (req, res) => {
     const VALID_MUSCLE_GROUPS = new Set([
       'chest', 'back', 'legs', 'shoulders', 'arms', 'core', 'cardio', 'full_body',
     ]);
+    // Per-set sanitizer — accepts any of the fields the LLM may emit. Each
+    // field clamped to a sane range; out-of-bounds → null. Downstream
+    // validateSet enforces type-specific required-ness at log time.
     const sanitizeSets = (raw) => (Array.isArray(raw) ? raw.slice(0, 20) : [])
       .map(s => {
-        const hasWeight = s.weight_kg !== undefined && s.weight_kg !== null && s.weight_kg !== '';
-        const parsedWeight = hasWeight ? parseFloat(s.weight_kg) : NaN;
-        return {
-          reps:      Math.max(0, Math.min(100, parseInt(s.reps, 10) || 0)),
-          weight_kg: Number.isFinite(parsedWeight) ? Math.max(0, Math.min(500, parsedWeight)) : null,
-          ...(Number.isFinite(parseInt(s.rir, 10)) ? { rir: Math.max(0, Math.min(10, parseInt(s.rir, 10))) } : {}),
-          ...(s.notes ? { notes: String(s.notes).slice(0, 100) } : {}),
+        const numOrNull = (v, lo, hi) => {
+          if (v === undefined || v === null || v === '') return null;
+          const n = Number(v);
+          if (!Number.isFinite(n)) return null;
+          return Math.max(lo, Math.min(hi, n));
         };
+        const out = {};
+        const reps   = numOrNull(s.reps, 0, 999);
+        const weight = numOrNull(s.weight_kg, 0, 500);
+        const dist   = numOrNull(s.distance_m, 0, 100000);     // up to 100km
+        const dur    = numOrNull(s.duration_sec, 0, 14400);    // up to 4h
+        const rounds = numOrNull(s.rounds, 0, 200);
+        const work   = numOrNull(s.work_sec, 0, 3600);
+        const rest   = numOrNull(s.rest_sec, 0, 3600);
+        if (reps   != null) out.reps         = Math.round(reps);
+        if (weight != null) out.weight_kg    = weight;
+        if (dist   != null) out.distance_m   = Math.round(dist);
+        if (dur    != null) out.duration_sec = Math.round(dur);
+        if (rounds != null) out.rounds       = Math.round(rounds);
+        if (work   != null) out.work_sec     = Math.round(work);
+        if (rest   != null) out.rest_sec     = Math.round(rest);
+        const rir = numOrNull(s.rir, 0, 10);
+        if (rir != null) out.rir = Math.round(rir);
+        if (s.notes) out.notes = String(s.notes).slice(0, 100);
+        return out;
       });
     // Note: NO filter here. Placeholder sets (reps=0, weight=null) are kept
     // when the exercise has "reps"/"weight"/"sets_count" in `missing` so
@@ -2947,12 +3132,22 @@ router.post("/describe", async (req, res) => {
     }
     exercisesRaw = exercisesRaw || [];
 
+    const _VALID_ENTRY_TYPES = new Set(Object.values(_ENTRY_TYPES));
     const buildExercises = (rawList) => (rawList || []).slice(0, 10).map(ex => {
       const name = String(ex.exercise || '').slice(0, 60);
       const mg = String(ex.muscle_group || '').toLowerCase();
+      const validMg = VALID_MUSCLE_GROUPS.has(mg) ? mg : null;
+      // Trust the LLM's entry_type when it's valid; otherwise resolve from
+      // name + muscle group so the FE always gets a usable type. Falling
+      // back to WEIGHT_REPS keeps legacy strength flows unchanged.
+      const llmType = String(ex.entry_type || '').toUpperCase();
+      const resolvedType = _VALID_ENTRY_TYPES.has(llmType)
+        ? llmType
+        : _entryTypeFor(name, validMg);
       return {
         exercise:     name,
-        muscle_group: VALID_MUSCLE_GROUPS.has(mg) ? mg : null,
+        muscle_group: validMg,
+        entry_type:   resolvedType,
         sets:         sanitizeSets(ex.sets),
         missing:      sanitizeMissing(ex.missing),
       };
@@ -3031,10 +3226,18 @@ router.post("/describe", async (req, res) => {
     // The FE always opens the confirm sheet; a blank starter row appears if
     // exercises is empty, so the user can fill manually instead of seeing
     // a red error.
+    // Sanitize session_duration_min: clamp to 1..600 min, drop garbage.
+    const _sdMin = (() => {
+      const n = parseFloat(parsed.session_duration_min);
+      if (!Number.isFinite(n) || n <= 0) return null;
+      return Math.min(600, Math.max(1, Math.round(n)));
+    })();
+
     res.json({
       ok: true,
       exercises,
       session_notes:    parsed.session_notes ? String(parsed.session_notes).slice(0, 280) : null,
+      session_duration_min: _sdMin,
       confidence:       exercises.length === 0 ? Math.max(20, confidence) : confidence,
       ambiguous_fields: ambiguous,
       empty_reason:     exercises.length === 0
@@ -4437,6 +4640,11 @@ router.get("/analysis", async (req, res) => {
     const strength_trend = computeStrengthTrend(workouts, rangeDays);
 
     // ── LLM-driven insights (cached, cross-agent aware) ──
+    //
+    // PERF (2026-05-24): never block the response on an LLM call. If cache
+    // is warm, use it (5ms). If cold, ship fallbacks immediately AND kick
+    // off the LLM in the background so the NEXT request is warm. Cuts
+    // cold-start /analysis from ~10s → ~1s without losing eventual depth.
     const insightContext = {
       score, grade, days_logged, rangeDays,
       avg_volume_kg, avg_sets, avg_rpe, avg_quality,
@@ -4446,11 +4654,13 @@ router.get("/analysis", async (req, res) => {
       top_exercises: top_exercises.slice(0, 4),
       bottom_exercises: bottom_exercises.slice(0, 2),
     };
-    let llmOutput = null;
-    try {
-      llmOutput = await _generateFitnessV2Insights(deviceId, range, insightContext);
-    } catch (e) {
-      log.warn("[fitness] V2 insights generation failed:", e?.message);
+    let llmOutput = _v2CacheGet(deviceId, range);  // cache hit = instant
+    if (!llmOutput) {
+      // Cache miss → fire-and-forget LLM refresh; serve fallback now.
+      setImmediate(() => {
+        _generateFitnessV2Insights(deviceId, range, insightContext)
+          .catch((e) => log.warn('[fitness] V2 insights bg refresh failed:', e?.message));
+      });
     }
     const ai_reads    = llmOutput?.ai_reads    || _fallbackAiReads(insightContext);
     const aha_moments = llmOutput?.aha_moments || _fallbackAhaMoments(insightContext);
@@ -4479,17 +4689,21 @@ router.get("/analysis", async (req, res) => {
     const { computeStandardOutputs } = require('./lib/score-lifetime');
 
     // HK blend: Apple Watch workouts / steps / active calories fill no-log days.
-    // Manual workout days untouched.
+    // Manual workout days untouched. 2s ceiling: if HK Firestore reads stall,
+    // fall back to manual-only quality map so /analysis still responds fast.
     const { blendQualityByDate } = require('./lib/healthkit/blend');
-    const { merged: dayQualityByDateBlended } = await blendQualityByDate({
-      coach: 'fitness',
-      manualQualityByDate: dayQualityByDate,
-      deviceId,
-      anchorDateStr: anchor.anchorDateStr,
-      todayDateStr: win.todayDate,
-      db: admin.firestore(),
-      utcOffsetMinutes: anchor.utcOffsetMinutes || 0,
-    });
+    const dayQualityByDateBlended = await Promise.race([
+      blendQualityByDate({
+        coach: 'fitness',
+        manualQualityByDate: dayQualityByDate,
+        deviceId,
+        anchorDateStr: anchor.anchorDateStr,
+        todayDateStr: win.todayDate,
+        db: admin.firestore(),
+        utcOffsetMinutes: anchor.utcOffsetMinutes || 0,
+      }).then((r) => r.merged),
+      new Promise((resolve) => setTimeout(() => resolve(dayQualityByDate), 2000)),
+    ]).catch(() => dayQualityByDate);
 
     const std = computeStandardOutputs({
       qualityByDate: dayQualityByDateBlended,
@@ -4602,10 +4816,24 @@ router.get("/analysis", async (req, res) => {
       return { ...l, weeks_stalled: p.weeks_stalled, stalled: p.stalled };
     });
 
-    // 9. duration / density (session-timer-derived; null for direct-log)
+    // 9. duration / density (now sourced from user-entered duration_min,
+    //    fall back to legacy session-model timestamps inside the helper).
     const _dd = _fitScoring.deriveDurationDensity(workouts);
     const avg_duration_min = _dd.avg_duration_min;
     const set_density = _dd.set_density;
+
+    // 10. entry_type dimensional aggregates (cardio / iso / interval / carry).
+    //     Populated by POST /log when the workout includes non-strength sets.
+    //     Always present in response; zero-sessions branches are empty objects
+    //     downstream so FE can render conditionally without null checks.
+    const non_strength = _fitScoring.deriveNonStrengthStats(workouts);
+    const _sdStats = _fitScoring.deriveSessionDurationStats(workouts);
+
+    // 11. Lifetime aggregates since anchor — "you've spent X hours since
+    //     you signed up". Same energy as lifetime kg lifted, just time.
+    //     Computed from lifetimeWorkouts (NOT the windowed list) so the
+    //     number doesn't shrink when the user switches range chips.
+    const lifetime = _fitScoring.deriveLifetimeStats(lifetimeWorkouts);
 
     res.json({
       setup_completed: true,
@@ -4663,19 +4891,35 @@ router.get("/analysis", async (req, res) => {
       contribution_map:     contrib.cells,
       contribution_summary: contrib.summary,
       ai_reads,
+      // HK enrichment with hard 1.5s ceiling so a slow Firestore read can
+      // never inflate /analysis latency. Falls back to LLM-only aha_moments
+      // on timeout or error — the user still sees something.
       aha_moments: await (async () => {
         try {
           const { buildHKAhaCards } = require('./lib/healthkit/aha-cards');
-          const hkCards = await buildHKAhaCards({ coach: 'fitness', deviceId, db: admin.firestore() });
-          return hkCards.length ? [...hkCards, ...(aha_moments || [])] : aha_moments;
+          const hkCards = await Promise.race([
+            buildHKAhaCards({ coach: 'fitness', deviceId, db: admin.firestore() }),
+            new Promise((resolve) => setTimeout(() => resolve([]), 1500)),
+          ]);
+          return (Array.isArray(hkCards) && hkCards.length)
+            ? [...hkCards, ...(aha_moments || [])]
+            : aha_moments;
         } catch { return aha_moments; }
       })(),
       hero_insight: { headline },
       stats: {
         days_logged, total_logs: days_logged, total_volume_kg, total_sets,
         avg_volume_kg, avg_sets, avg_quality, avg_rpe,
-        avg_duration_min,                              // NEW (null if no timer data)
-        set_density,                                   // NEW (null if no timer data)
+        avg_duration_min,                              // user-entered (null when no sessions had it)
+        set_density,                                   // sets / 10 min (null when no duration)
+        // ── entry_type dimensional aggregates (2026-05-24) ──
+        non_strength,                                  // { cardio:{}, iso:{}, interval:{}, carry:{} }
+        sessions_with_duration: _sdStats.sessions_with_duration,
+        total_session_duration_min: _sdStats.total_session_duration_min,
+        // ── Lifetime since anchor (2026-05-24) ──
+        // Headline cumulative stats. Independent of range chip — number
+        // never shrinks when the user looks at a smaller window.
+        lifetime,                                      // { total_hours, total_sessions, days_active, ... }
         vol_hit_days:  workouts.filter((w) => (w.total_volume_kg || 0) >= VOL_TARGET).length,
         sets_hit_days: workouts.filter((w) => (w.total_sets || 0) >= SETS_TARGET).length,
       },

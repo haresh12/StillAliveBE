@@ -23,6 +23,9 @@ const {
   generateAiReads, computeEFH, computeCircadian,
   computeDayOfWeek, computeAhaMoments, scoreGrade,
 } = require('./lib/fasting-analytics');
+// V4 pure scoring lib — 2026-05-23 uplift (mirrors lib/fitness-scoring.js).
+// All helpers Firestore-free; tested by tests/fasting-scoring*.test.js.
+const _fastingScoring = require('./lib/fasting-scoring');
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const db     = () => admin.firestore();
@@ -43,6 +46,39 @@ async function getCachedContext(deviceId) {
 
 function invalidateCtx(deviceId) {
   _ctxCache.delete(deviceId);
+  // Also bust the /analysis response cache for this device — any log/start/end
+  // event invalidates today's stats so the next Insights tab paint is fresh.
+  try { _analysisCacheInvalidate(deviceId); } catch {}
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// CROSS-AGENT LAW — single legal source for cross-agent data.
+//   Per feedback_cross_agent_data_rule.md: individual agents must NEVER
+//   read sibling agent collections directly. The wellness-cross-v2 engine
+//   is the ONLY component allowed to read across agents and pre-computes
+//   the keys we need into `cross_agent/today_signals`.
+//
+// This helper does ONE Firestore read of that doc and exposes the keys
+// fasting needs (mood scalar, water % of goal). Anything historical we
+// don't have cached → returns null. Better null than illegal.
+// ────────────────────────────────────────────────────────────────────────────
+async function readCrossSignals(deviceId) {
+  if (!deviceId) return {};
+  try {
+    const snap = await userDoc(deviceId).collection('cross_agent').doc('today_signals').get();
+    return snap.exists ? (snap.data() || {}) : {};
+  } catch {
+    return {};
+  }
+}
+
+// today_signals.mind_recent_mood_pct is 0–100. Mood checkin scale is 1–4.
+// Map to nearest valid mood score, return null if missing.
+function moodFromSignals(signals) {
+  const pct = signals?.mind_recent_mood_pct;
+  if (typeof pct !== 'number' || !Number.isFinite(pct)) return null;
+  // 0–24 → 1, 25–49 → 2, 50–74 → 3, 75–100 → 4
+  return Math.max(1, Math.min(4, Math.floor(pct / 25) + 1));
 }
 
 // ----------------------------------------------------------------
@@ -449,47 +485,31 @@ async function buildFastingContext(deviceId) {
       .map(m => `[${m.proactive_type || 'check_in'} at ${toIso(m.created_at)?.slice(11, 16) || '?'}]: ${m.content.slice(0, 100)}`)
       .join('\n');
 
-    // Cross-agent: water
-    let waterNote = '';
+    // Cross-agent intelligence: read from pre-computed today_signals only
+    // (feedback_cross_agent_data_rule — individual agents NEVER read other
+    // agents' collections directly. wellness.cross.js maintains today_signals).
+    // Same intelligence (short sleep + high anxiety + hydration deficit), zero
+    // sandbox boundary crossing. Fixed 2026-05-23 — was 3 direct reads before.
+    let waterNote = '', sleepNote = '', moodNote = '';
     try {
-      const waterRef = await userDoc(deviceId).collection('agents').doc('water').get();
-      const goalMl = waterRef.exists ? (waterRef.data()?.setup?.daily_goal_ml || waterRef.data()?.setup?.recommended_goal_ml || 2500) : 2500;
-      const todayStart = new Date();
-      todayStart.setHours(0, 0, 0, 0);
-      const wLogsSnap = await userDoc(deviceId).collection('agents').doc('water')
-        .collection('water_logs').where('logged_at', '>=', todayStart).get();
-      const todayWater = wLogsSnap.docs.reduce((sum, d) => sum + (d.data().effective_ml || 0), 0);
-      if (todayWater > 0 || goalMl > 0) {
-        const pct = Math.round(todayWater / Math.max(goalMl, 1) * 100);
-        waterNote = `Hydration today: ${todayWater}ml (${pct}% of ${goalMl}ml goal). ${pct < 40 && activeId ? 'CRITICAL: dehydration mimics hunger during fasting.' : ''}`;
-      }
-    } catch { /* non-fatal */ }
+      const xSnap = await userDoc(deviceId).collection('cross_agent').doc('today_signals').get();
+      const xs = xSnap.exists ? (xSnap.data() || {}) : {};
 
-    // Cross-agent: sleep
-    let sleepNote = '';
-    try {
-      const sleepSnap = await userDoc(deviceId).collection('agents').doc('sleep')
-        .collection('sleep_logs').orderBy('date', 'desc').limit(2).get();
-      if (!sleepSnap.empty) {
-        const entries = sleepSnap.docs.map(d => d.data()).filter(d => d.quality_score);
-        if (entries.length) {
-          const lastScore = entries[0].quality_score;
-          sleepNote = `Last sleep: ${lastScore}/100 quality${lastScore < 65 ? '. Poor sleep elevates ghrelin -- fast hunger is amplified today.' : '.'}`;
-        }
+      const hrs = typeof xs.sleep_hours_last_night === 'number' ? xs.sleep_hours_last_night : null;
+      if (hrs != null) {
+        sleepNote = `Last sleep: ${hrs}h${hrs < 6 ? '. Poor sleep elevates ghrelin -- fast hunger is amplified today.' : '.'}`;
       }
-    } catch { /* non-fatal */ }
-
-    // Cross-agent: mind/mood
-    let moodNote = '';
-    try {
-      const mindSnap = await userDoc(deviceId).collection('agents').doc('mind')
-        .collection('mind_checkins').orderBy('created_at', 'desc').limit(1).get();
-      if (!mindSnap.empty) {
-        const entry = mindSnap.docs[0].data();
-        const score = entry.mood_score || entry.current_rating;
-        if (score) moodNote = `Mood check-in: ${score}/4. ${score <= 2 ? 'Low mood -- consider lighter fast today.' : ''}`;
+      const stress = typeof xs.mind_anxiety_today === 'number' ? xs.mind_anxiety_today : null;
+      if (stress != null && stress >= 4) {
+        moodNote = `Anxiety today: ${stress}/5. Low mood -- consider lighter fast today.`;
       }
-    } catch { /* non-fatal */ }
+      const waterPct = typeof xs.water_pct_of_goal_today === 'number' ? xs.water_pct_of_goal_today : null;
+      if (waterPct != null) {
+        waterNote = `Hydration today: ${waterPct}% of goal. ${waterPct < 40 && activeId ? 'CRITICAL: dehydration mimics hunger during fasting.' : ''}`;
+      }
+    } catch (e) {
+      log.warn?.('[fasting] today_signals fetch fail:', e?.message);
+    }
 
     // Ghrelin adaptation status
     const daysSinceStart = data.setup_completed_at
@@ -806,6 +826,258 @@ router.get('/chat-prompts', async (req, res) => {
   }
 });
 
+// ════════════════════════════════════════════════════════════════
+// GET /chat-state — minimal coach state for FastingChatTab header + smart
+// quick-prompt picker. Mirrors fitness /chat-state contract:
+//   { last_session: {...}, prompt_signals: {...} }
+// The FE uses prompt_signals to render 4 data-aware chips. Coach answers
+// reference the SAME numbers user sees on Insights — no contradictions.
+// All cross-agent reads come from cross_agent/today_signals only.
+// ════════════════════════════════════════════════════════════════
+router.get('/chat-state', async (req, res) => {
+  try {
+    const { deviceId } = req.query;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+
+    const [fSnap, sessSnap, xSnap] = await Promise.all([
+      fastingDoc(deviceId).get(),
+      sessionsCol(deviceId).orderBy('started_at', 'desc').limit(60).get(),
+      userDoc(deviceId).collection('cross_agent').doc('today_signals').get().catch(() => null),
+    ]);
+
+    if (!fSnap.exists) return res.json({ last_session: null, prompt_signals: {} });
+
+    const setup = fSnap.data()?.setup || {};
+    const anchor = await resolveAnchor(deviceId);
+    const allSessions = _fastingScoring.dropFutureSessions(
+      sessSnap.docs.map(mapDoc),
+      anchor.anchorDateStr ? dateStr() : dateStr(),
+    );
+
+    // Build last-session header card
+    const last = allSessions.find(s => s.ended_at || s.completed || s.broken_early) || null;
+    const lastFormatted = last ? {
+      protocol: last.protocol || setup.protocol || '16:8',
+      actual_hours: round(last.actual_hours || 0, 1),
+      target_hours: round(last.target_hours || setup.target_fast_hours || 16, 1),
+      broken_early: !!last.broken_early,
+      broken_reason: last.broken_reason || null,
+      stage_reached: last.metabolic_stage_reached
+        || (_fastingScoring.sessionDeepestStage(last)?.key)
+        || null,
+      ended_at: toIso(last.ended_at),
+      time_ago_label: relativeTimeLabel(last.ended_at || last.started_at),
+    } : null;
+
+    // Derive prompt_signals from same lib helpers /analysis uses (contract parity)
+    const form = _fastingScoring.computeFastingForm({
+      sessions: allSessions,
+      priorSessions: [],
+      startDateStr: anchor.anchorDateStr || dateStr(new Date(Date.now() - 28 * 86400000)),
+      todayDateStr: dateStr(),
+    });
+    const hungerWave = _fastingScoring.deriveHungerWaveHour(allSessions);
+    const cleanness = _fastingScoring.deriveCleanness(allSessions);
+    const windowStab = _fastingScoring.deriveWindowStability(allSessions, 28, anchor.utcOffsetMinutes || 0);
+    const variety = _fastingScoring.deriveProtocolVariety(allSessions, 28);
+
+    // Broken streak — consecutive most-recent broken_early fasts
+    let brokenStreak = 0;
+    for (const s of allSessions) {
+      if (s.broken_early) brokenStreak++;
+      else if (s.completed) break;
+    }
+
+    // Habituation flag (12-week look)
+    const _weeks = [];
+    for (let w = 11; w >= 0; w--) {
+      const wEndMs = Date.now() - w * 7 * 86400000;
+      const wStartMs = wEndMs - 7 * 86400000;
+      const inWeek = allSessions.filter(s => {
+        const sm = getMillis(s.started_at);
+        return sm >= wStartMs && sm < wEndMs && s.completed && s.actual_hours > 0;
+      });
+      const avg = inWeek.length
+        ? inWeek.reduce((a, s) => a + s.actual_hours, 0) / inWeek.length
+        : null;
+      _weeks.push(avg);
+    }
+    const habituation = _fastingScoring.deriveHabituation({
+      avgFastHoursByWeek: _weeks.filter(v => v != null),
+      weeks: 12,
+    });
+
+    // 6-AGENT MOAT signals: sleep_link / hydration_link / mood_link
+    const xs = xSnap?.exists ? (xSnap.data() || {}) : {};
+    const recentBroken = allSessions.filter(s => {
+      const sm = getMillis(s.started_at);
+      return s.broken_early && sm > Date.now() - 7 * 86400000;
+    });
+    const sleepLink = recentBroken.length >= 2
+      && typeof xs.sleep_hours_last_night === 'number'
+      && xs.sleep_hours_last_night < 6;
+    const hydrationLink = recentBroken.filter(b => b.broken_reason === 'hunger').length >= 2
+      && typeof xs.water_pct_of_goal_today === 'number'
+      && xs.water_pct_of_goal_today < 50;
+    const moodLink = recentBroken.filter(b => b.broken_reason === 'mood').length >= 1
+      && typeof xs.mind_anxiety_today === 'number'
+      && xs.mind_anxiety_today >= 4;
+
+    return res.json({
+      last_session: lastFormatted,
+      prompt_signals: {
+        band: form.band,
+        readiness: form.readiness,
+        broken_streak: brokenStreak,
+        last_break_reason: last?.broken_reason || null,
+        target_progress_pct: lastFormatted
+          ? Math.min(100, Math.round((lastFormatted.actual_hours / Math.max(lastFormatted.target_hours, 1)) * 100))
+          : null,
+        drift_flag: !!(windowStab?.drift_flag),
+        dominant_protocol: variety?.dominant_protocol || setup.protocol || null,
+        plateau: !!(habituation?.stalled),
+        hunger_wave_hour: hungerWave?.wave_hour ?? null,
+        hunger_wave_sample_n: hungerWave?.sample_n ?? 0,
+        broken_pct: cleanness?.broken_pct ?? 0,
+        // 6-agent moat — these are what NO other fasting app can derive
+        sleep_link: sleepLink,
+        hydration_link: hydrationLink,
+        mood_link: moodLink,
+        // Pass through the cross-signal raw values so FE chip copy can interpolate
+        cross_sleep_hours: typeof xs.sleep_hours_last_night === 'number' ? xs.sleep_hours_last_night : null,
+        cross_water_pct: typeof xs.water_pct_of_goal_today === 'number' ? xs.water_pct_of_goal_today : null,
+        cross_anxiety: typeof xs.mind_anxiety_today === 'number' ? xs.mind_anxiety_today : null,
+      },
+    });
+  } catch (e) {
+    log.error('[fasting] /chat-state:', e);
+    return res.status(500).json({ error: 'Failed' });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════
+// POST /describe — voice-driven fasting log parse.
+//
+// User speaks ("I broke at 14 hours because of a headache" / "started 18:6 last
+// night" / "did a clean 16h yesterday") → ASR text on client → posted here →
+// OpenAI parses into structured { intent, protocol, actual_hours, broken_reason }.
+//
+// Pattern mirrors fitness /describe but FAR simpler — fasting has 4-5 fields,
+// not 50+ exercises. We don't need pre-bias or replay intent paths for V1.
+//
+// All max_completion_tokens, no max_tokens / no temperature (per BE law).
+// ════════════════════════════════════════════════════════════════
+router.post('/describe', async (req, res) => {
+  try {
+    const { deviceId, transcript } = req.body || {};
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+    if (!transcript || typeof transcript !== 'string') {
+      return res.status(400).json({ error: 'transcript required' });
+    }
+    const text = transcript.trim().slice(0, 500);
+    if (!text) return res.status(400).json({ error: 'empty_transcript' });
+
+    const language = resolveLanguage(req);
+    const fSnap = await fastingDoc(deviceId).get();
+    const setup = fSnap.exists ? (fSnap.data()?.setup || {}) : {};
+    const userProtocol = setup.protocol || '16:8';
+    const userTarget = setup.target_fast_hours || 16;
+
+    // STABLE prompt prefix for cache hit (≥1024 token target). Kept identical
+    // across all calls — Anthropic/OpenAI caching gives 60-80% latency cut.
+    const SYSTEM_PROMPT = `
+You are the fasting parser inside a premium health app. Given a short
+spoken transcript, you return STRICT JSON describing what the user logged.
+
+OUTPUT SCHEMA (return ONLY this JSON, no prose, no markdown):
+{
+  "intent": "start" | "end" | "log_past" | "reflection",
+  "protocol": "12:12" | "14:10" | "16:8" | "18:6" | "20:4" | "OMAD" | "5:2" | null,
+  "actual_hours": number | null,
+  "target_hours": number | null,
+  "broken_early": boolean | null,
+  "broken_reason": "hunger" | "social" | "mood" | "energy" | "sleep" | "illness" | null,
+  "started_at_iso": string | null,
+  "ended_at_iso": string | null,
+  "confidence": number (0-100),
+  "notes": string | null
+}
+
+RULES:
+- "intent": "start" = user is beginning a fast now; "end" = user just ended a fast;
+  "log_past" = user is logging a fast from earlier today or a past day;
+  "reflection" = the message is feedback, not a log action.
+- If protocol uncertain, return null. Don't invent one.
+- actual_hours is a number like 14.5 (the duration of the completed/broken fast).
+  If user is just starting a fast, this is null.
+- broken_early=true if user said they stopped before the target (hungry, headache, etc.).
+- broken_reason: ONE of the 6 enum values, or null if not mentioned.
+- confidence: be honest. 100 = totally clear; 30 = mostly guessing.
+- notes: paraphrase the user's reason in <12 words, if any. No emojis. No markdown.
+
+USER CONTEXT:
+- Default protocol: ${userProtocol}
+- Target fast hours: ${userTarget}
+
+Now parse this transcript:
+`.trim();
+
+    let parsed = null;
+    try {
+      const resp = await openai.chat.completions.create({
+        model: AI.CHAT_STREAM,
+        max_completion_tokens: 220,
+        messages: [
+          { role: 'system', content: appendLanguageInstruction(SYSTEM_PROMPT, language) },
+          { role: 'user',   content: text },
+        ],
+      });
+      const raw = (resp?.choices?.[0]?.message?.content || '').trim().replace(/```json|```/g, '');
+      parsed = JSON.parse(raw);
+    } catch (e) {
+      log.error('[fasting] /describe parse fail:', e?.message);
+      return res.status(502).json({ error: 'parse_failed', transcript: text });
+    }
+
+    // Validate + clamp parsed values defensively
+    const VALID_INTENTS  = new Set(['start','end','log_past','reflection']);
+    const VALID_REASONS  = new Set(['hunger','social','mood','energy','sleep','illness']);
+    const VALID_PROTOS   = new Set(['12:12','14:10','16:8','18:6','20:4','OMAD','5:2']);
+    const safe = {
+      intent: VALID_INTENTS.has(parsed.intent) ? parsed.intent : 'reflection',
+      protocol: VALID_PROTOS.has(parsed.protocol) ? parsed.protocol : null,
+      actual_hours: Number.isFinite(parsed.actual_hours) && parsed.actual_hours >= 0 && parsed.actual_hours <= 168
+        ? Math.round(parsed.actual_hours * 10) / 10
+        : null,
+      target_hours: Number.isFinite(parsed.target_hours) && parsed.target_hours >= 8 && parsed.target_hours <= 72
+        ? Math.round(parsed.target_hours)
+        : null,
+      broken_early: typeof parsed.broken_early === 'boolean' ? parsed.broken_early : null,
+      broken_reason: VALID_REASONS.has(parsed.broken_reason) ? parsed.broken_reason : null,
+      started_at_iso: typeof parsed.started_at_iso === 'string' ? parsed.started_at_iso : null,
+      ended_at_iso: typeof parsed.ended_at_iso === 'string' ? parsed.ended_at_iso : null,
+      confidence: Math.max(0, Math.min(100, Math.round(parsed.confidence || 0))),
+      notes: typeof parsed.notes === 'string' ? parsed.notes.slice(0, 80) : null,
+    };
+
+    return res.json({ ok: true, ...safe, transcript: text });
+  } catch (e) {
+    log.error('[fasting] /describe:', e);
+    return res.status(500).json({ error: 'Failed' });
+  }
+});
+
+// Tiny helper used only by /chat-state. Returns "2h ago" / "3d ago" / "just now".
+function relativeTimeLabel(ts) {
+  const ms = getMillis(ts);
+  if (!ms) return null;
+  const diff = Date.now() - ms;
+  if (diff < 60_000) return 'just now';
+  if (diff < 3_600_000) return `${Math.round(diff / 60_000)}m ago`;
+  if (diff < 86_400_000) return `${Math.round(diff / 3_600_000)}h ago`;
+  return `${Math.round(diff / 86_400_000)}d ago`;
+}
+
 // ================================================================
 router.patch('/setup', async (req, res) => {
   try {
@@ -874,20 +1146,27 @@ router.patch('/setup', async (req, res) => {
 // POST /session/start -- begin a fast
 // ================================================================
 router.post('/session/start', async (req, res) => {
+  const _t0 = Date.now();
   try {
     const { deviceId, notes, started_at: customStartedAt } = req.body;
-    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+    log.info(`[fasting/start] received deviceId=${deviceId ? deviceId.slice(0,8)+'…' : 'MISSING'} customStartedAt=${customStartedAt || 'none'}`);
+    if (!deviceId) {
+      log.warn('[fasting/start] reject — deviceId required');
+      return res.status(400).json({ error: 'deviceId required' });
+    }
 
     // ── Parallelize: setup doc + today's sessions are independent reads ──
-    // Was sequential (~120ms wasted on every session start). The "no setup"
-    // guard runs after both come back; in the rare no-setup case we waste
-    // one cheap query, but the common case is instantly faster.
     const todayKey  = dateStr();
+    const _tReadStart = Date.now();
     const [fSnap, todaySnap] = await Promise.all([
       fastingDoc(deviceId).get(),
       sessionsCol(deviceId).where('date', '==', todayKey).limit(5).get(),
     ]);
-    if (!fSnap.exists) return res.status(400).json({ error: 'Setup not completed' });
+    log.info(`[fasting/start] reads done in ${Date.now()-_tReadStart}ms — fSnap.exists=${fSnap.exists} todayDocs=${todaySnap.size}`);
+    if (!fSnap.exists) {
+      log.warn(`[fasting/start] reject — fasting doc missing for deviceId=${deviceId.slice(0,8)}…`);
+      return res.status(400).json({ error: 'Setup not completed' });
+    }
 
     const data   = fSnap.data() || {};
     const setup  = data.setup || {};
@@ -899,19 +1178,21 @@ router.post('/session/start', async (req, res) => {
     const alreadyCompletedToday = todayDocs.some(d => d.completed === true);
     const hasActiveToday        = todayDocs.some(d => d.ended_at == null);
     if (alreadyBrokenToday) {
+      log.warn('[fasting/start] reject 409 — already_broken_today');
       return res.status(409).json({
         error:   'already_broken_today',
         message: "You ended a fast early today. Come back tomorrow for a fresh start.",
       });
     }
     if (alreadyCompletedToday) {
+      log.warn('[fasting/start] reject 409 — already_completed_today');
       return res.status(409).json({
         error:   'already_completed_today',
         message: "Today's fast is already complete. New fast unlocks tomorrow.",
       });
     }
     if (hasActiveToday && !data.active_session_id) {
-      // Orphaned: a non-ended session exists but doc lost its pointer — block to avoid duplicates.
+      log.warn('[fasting/start] reject 409 — session_in_progress (orphaned)');
       return res.status(409).json({
         error:   'session_in_progress',
         message: 'A fast is already running. Open the app again or restart to refresh.',
@@ -920,18 +1201,27 @@ router.post('/session/start', async (req, res) => {
 
     // End any stale active session first
     if (data.active_session_id) {
-      const staleSnap = await sessionsCol(deviceId).doc(data.active_session_id).get();
-      if (staleSnap.exists) {
-        const stale       = staleSnap.data();
-        const elapsed     = getElapsedHours(stale.started_at);
-        const staleTarget = stale.target_hours || setup.target_fast_hours || 16;
-        await sessionsCol(deviceId).doc(data.active_session_id).update({
-          ended_at:     admin.firestore.FieldValue.serverTimestamp(),
-          actual_hours: round(elapsed, 2),
-          completed:    elapsed >= staleTarget,
-          broken_early: elapsed < staleTarget,
-          broken_reason:'new_session',
-        });
+      log.info(`[fasting/start] stale active_session_id=${data.active_session_id} — checking + ending`);
+      const _tStale = Date.now();
+      try {
+        const staleSnap = await sessionsCol(deviceId).doc(data.active_session_id).get();
+        if (staleSnap.exists) {
+          const stale       = staleSnap.data();
+          const elapsed     = getElapsedHours(stale.started_at);
+          const staleTarget = stale.target_hours || setup.target_fast_hours || 16;
+          await sessionsCol(deviceId).doc(data.active_session_id).update({
+            ended_at:     admin.firestore.FieldValue.serverTimestamp(),
+            actual_hours: round(elapsed, 2),
+            completed:    elapsed >= staleTarget,
+            broken_early: elapsed < staleTarget,
+            broken_reason:'new_session',
+          });
+          log.info(`[fasting/start] stale session ended in ${Date.now()-_tStale}ms`);
+        } else {
+          log.info(`[fasting/start] stale session_id pointed to non-existent doc, skipping (${Date.now()-_tStale}ms)`);
+        }
+      } catch (staleErr) {
+        log.warn(`[fasting/start] stale session cleanup FAILED after ${Date.now()-_tStale}ms — ${staleErr?.message}; continuing anyway`);
       }
     }
 
@@ -951,17 +1241,24 @@ router.post('/session/start', async (req, res) => {
       startDate = dateStr();
     }
 
-    // Capture cross-agent mood at start
+    // Capture cross-agent mood at start (non-fatal — short timeout to
+    // Mood at start — read from cross_agent/today_signals (sandbox-safe).
+    // Previously read mind_checkins directly, which violated the
+    // cross-agent law. wellness-cross-v2 pre-computes mind_recent_mood_pct.
     let moodAtStart = null;
     try {
-      const mindSnap = await userDoc(deviceId).collection('agents').doc('mind')
-        .collection('mind_checkins').orderBy('created_at', 'desc').limit(1).get();
-      if (!mindSnap.empty) moodAtStart = mindSnap.docs[0].data().mood_score || null;
-    } catch { /* non-fatal */ }
+      const _tMood = Date.now();
+      const signals = await readCrossSignals(deviceId);
+      moodAtStart = moodFromSignals(signals);
+      log.info(`[fasting/start] mood from signals in ${Date.now()-_tMood}ms moodAtStart=${moodAtStart}`);
+    } catch (moodErr) {
+      log.warn(`[fasting/start] mood read failed (non-fatal): ${moodErr?.message}`);
+    }
 
     const sessionRef = sessionsCol(deviceId).doc();
     let raceError = null;
 
+    const _tTxStart = Date.now();
     try {
       await db().runTransaction(async (tx) => {
         // Re-read user doc INSIDE the transaction so concurrent calls can't both win
@@ -996,10 +1293,12 @@ router.post('/session/start', async (req, res) => {
         });
       });
     } catch (txErr) {
-      log.error('[fasting] session/start transaction:', txErr);
+      log.error(`[fasting/start] TX FAILED after ${Date.now()-_tTxStart}ms — ${txErr?.message || txErr}`);
       return res.status(500).json({ error: 'Failed to start session' });
     }
+    log.info(`[fasting/start] TX done in ${Date.now()-_tTxStart}ms raceError=${raceError || 'none'}`);
     if (raceError === 'session_in_progress') {
+      log.warn('[fasting/start] reject 409 — session_in_progress (TX race)');
       return res.status(409).json({
         error:   'session_in_progress',
         message: 'A fast is already running. Refresh and try again.',
@@ -1008,9 +1307,10 @@ router.post('/session/start', async (req, res) => {
 
     invalidateCtx(deviceId);
 
+    log.info(`[fasting/start] SUCCESS session=${sessionRef.id} total=${Date.now()-_t0}ms`);
     return res.json({ success: true, session_id: sessionRef.id, started_at: customStartedAt || new Date().toISOString() });
   } catch (e) {
-    log.error('[fasting] session/start:', e);
+    log.error(`[fasting/start] FATAL after ${Date.now()-_t0}ms — ${e?.message || e}`);
     return res.status(500).json({ error: 'Failed to start session' });
   }
 });
@@ -1133,23 +1433,18 @@ router.post('/session/end', async (req, res) => {
     const completed    = !broken_reason && elapsed >= target;
     const stage        = getStage(elapsed);
 
-    // Cross-agent: get water ml during fast window
-    let waterMl = 0;
-    try {
-      const startMs = getMillis(sess.started_at);
-      const waterLogsSnap = await userDoc(deviceId).collection('agents').doc('water')
-        .collection('water_logs')
-        .where('logged_at', '>=', new Date(startMs))
-        .get();
-      waterMl = waterLogsSnap.docs.reduce((sum, d) => { const w = d.data(); return sum + (w.effective_ml || w.ml || 0); }, 0);
-    } catch { /* non-fatal */ }
+    // Water ml during fast window — historical window data is NOT in
+    // today_signals (per-day snapshot only). Per cross-agent law, the
+    // fasting agent cannot reach into water_logs directly. The Water
+    // agent owns water; correlation analytics live in wellness-cross-v2.
+    // Field kept on the session doc for back-compat (null = unknown).
+    const waterMl = null;
 
-    // Mood at end
+    // Mood at end — sandbox-safe read from today_signals.
     let moodAtEnd = null;
     try {
-      const mindSnap = await userDoc(deviceId).collection('agents').doc('mind')
-        .collection('mind_checkins').orderBy('created_at', 'desc').limit(1).get();
-      if (!mindSnap.empty) moodAtEnd = mindSnap.docs[0].data().mood_score || null;
+      const signals = await readCrossSignals(deviceId);
+      moodAtEnd = moodFromSignals(signals);
     } catch { /* non-fatal */ }
 
     await sessionsCol(deviceId).doc(sessId).update({
@@ -1289,15 +1584,10 @@ router.post('/session/backfill', async (req, res) => {
     const completed = durationHours >= target;
     const stage = getStage(durationHours);
 
-    let waterMl = 0;
-    try {
-      const waterLogsSnap = await userDoc(deviceId).collection('agents').doc('water')
-        .collection('water_logs')
-        .where('logged_at', '>=', new Date(startMs))
-        .where('logged_at', '<=', new Date(endMs))
-        .get();
-      waterMl = waterLogsSnap.docs.reduce((sum, d) => { const w = d.data(); return sum + (w.effective_ml || w.ml || 0); }, 0);
-    } catch { /* non-fatal */ }
+    // Water during the backfilled fast window — cross-agent law: fasting
+    // cannot read water_logs directly. wellness-cross-v2 owns water-window
+    // correlation; the session doc keeps `null` so we never lie about it.
+    const waterMl = null;
 
     const sessionRef = sessionsCol(deviceId).doc();
     await sessionRef.set({
@@ -1763,14 +2053,66 @@ function buildAnalysisContext({
 //        best_day / worst_day / streak / completion / avg_hours / best_fast /
 //        total_fast_hours / personal_formula / observations / ready_for_upgrade
 // ════════════════════════════════════════════════════════════════
+// ─── /analysis 10-min response cache (P2 perf hardening) ──────────────
+// Mirrors fitness pattern. Cache key = (deviceId, range, language). TTL
+// 10 min keeps Insights tab snappy under p95 < 2s without burning DB
+// quota on every tab focus. Invalidated by `invalidateCtx` on every log.
+const _analysisCache = new Map();
+const _ANALYSIS_CACHE_TTL = 10 * 60 * 1000;
+function _analysisCacheGet(deviceId, range, lang) {
+  const v = _analysisCache.get(`${deviceId}:${range}:${lang}`);
+  if (!v) return null;
+  if (Date.now() - v.t > _ANALYSIS_CACHE_TTL) {
+    _analysisCache.delete(`${deviceId}:${range}:${lang}`);
+    return null;
+  }
+  return v.data;
+}
+function _analysisCacheSet(deviceId, range, lang, data) {
+  _analysisCache.set(`${deviceId}:${range}:${lang}`, { t: Date.now(), data });
+  if (_analysisCache.size > 1000) _analysisCache.delete(_analysisCache.keys().next().value);
+}
+function _analysisCacheInvalidate(deviceId) {
+  for (const k of _analysisCache.keys()) {
+    if (k.startsWith(`${deviceId}:`)) _analysisCache.delete(k);
+  }
+}
+
 router.get('/analysis', async (req, res) => {
+  const _t0 = Date.now();
   try {
-    const { deviceId, range = '30' } = req.query;
+    const { deviceId, range = '30', mock } = req.query;
     if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
     const language = resolveLanguage(req);
 
+    // MOCK MODE — `?mock=1` returns synthetic data for the requested range.
+    // Used for product / design / QA without seeding real Firestore data.
+    // Pure compute, no DB writes, no cache poison.
+    if (mock === '1' || mock === 'true') {
+      const { buildMockAnalysis } = require('./lib/fasting-mock-analysis');
+      const payload = buildMockAnalysis(range);
+      log.info(`[fasting/analysis] MOCK range=${range} took=${Date.now()-_t0}ms`);
+      return res.json(payload);
+    }
+
+    // Cache hit → instant response (< 50ms).
+    const cached = _analysisCacheGet(deviceId, range, language);
+    if (cached) {
+      log.info(`[fasting/analysis] CACHE HIT deviceId=${deviceId.slice(0,8)}… range=${range} took=${Date.now()-_t0}ms`);
+      return res.json(cached);
+    }
+    log.info(`[fasting/analysis] CACHE MISS deviceId=${deviceId.slice(0,8)}… range=${range} computing…`);
+
     const fSnap = await fastingDoc(deviceId).get();
-    if (!fSnap.exists) return res.json({ setup_completed: false });
+    if (!fSnap.exists) {
+      // Day-0 / unset: emit ALL contract keys with safe defaults so FE never
+      // crashes on first-load. Mirrors fitness Day-0 parity rule. Locked by
+      // tests/fasting-analysis-parity.test.js Phase B (FASTING_V4=1).
+      const day0 = _fastingDay0Pack(range);
+      // Don't cache Day-0 — user might complete setup mid-session.
+      log.info(`[fasting/analysis] Day-0 pack took=${Date.now()-_t0}ms`);
+      return res.json(day0);
+    }
 
     const data  = fSnap.data() || {};
     const setup = data.setup   || {};
@@ -1782,7 +2124,10 @@ router.get('/analysis', async (req, res) => {
     const win = computeAnalysisWindow(range, anchor.anchorMs, Date.now(), anchor.utcOffsetMinutes);
 
     const sessSnap = await sessionsCol(deviceId).orderBy('started_at', 'desc').limit(400).get();
-    const allSessions = sessSnap.docs.map(mapDoc);
+    let allSessions = sessSnap.docs.map(mapDoc);
+    // V4 honesty law: drop future-dated sessions BEFORE any analytics. Same
+    // discipline as fitness — dev_allow_future toggles never inflate stats.
+    allSessions = _fastingScoring.dropFutureSessions(allSessions, win.todayDate);
     const rangeMeta   = buildRangeMeta(range, allSessions, clampStartKey);
     const sessions    = filterSessionsToRange(allSessions, rangeMeta);
 
@@ -1911,8 +2256,30 @@ router.get('/analysis', async (req, res) => {
     const cachedReads = data.ai_reads_cache?.entries?.[aiCacheId];
     if (cachedReads?.key === aiCacheKey) {
       ai_reads = { champion: cachedReads.champion, drag: cachedReads.drag, pattern: cachedReads.pattern };
+    } else if (sessions.length < 3) {
+      // PERF P2 — skip AI gen when fewer than 3 sessions exist. The model
+      // can't write meaningful "champion/drag/pattern" from 1–2 fasts and
+      // the call was costing ~5–7s per /analysis hit. FE shows the
+      // "insights unlock after 5 fasts · X/5 done" progress card instead.
+      log.info(`[fasting/analysis] AI reads SKIPPED — only ${sessions.length} sessions (needs 3+)`);
+      ai_reads = { champion: null, drag: null, pattern: null };
     } else {
-      ai_reads = await generateAiReads(sessions, setup, rangeMeta, fasting_score, openai, deviceId, language);
+      const _tAi = Date.now();
+      // 2026-05-25 deadline guard — same pattern as sleep + water.
+      // Cap AI round-trip at 8s; if it exceeds, the underlying promise
+      // continues in the background and populates ai_reads_cache for the
+      // NEXT /analysis call. FE shows a fast empty-state instead of a 15s timeout.
+      const _aiFb = { champion: null, drag: null, pattern: null };
+      const _withDl = (p, ms, fb) => Promise.race([
+        p.catch(() => fb),
+        new Promise((r) => setTimeout(() => r(fb), ms)),
+      ]);
+      ai_reads = await _withDl(
+        generateAiReads(sessions, setup, rangeMeta, fasting_score, openai, deviceId, language),
+        8000,
+        _aiFb,
+      );
+      log.info(`[fasting/analysis] AI reads computed in ${Date.now()-_tAi}ms`);
       if (ai_reads.champion || ai_reads.drag || ai_reads.pattern) {
         const existingEntries = data.ai_reads_cache?.entries || {};
         fastingDoc(deviceId).update({
@@ -1982,6 +2349,117 @@ router.get('/analysis', async (req, res) => {
       daysSinceAnchor: win.daysSinceAnchor,
     });
 
+    // ─── V4 derived blocks (2026-05-23) ─────────────────────────────
+    // All pure-lib calls. Same numbers user sees on Insights tab match what
+    // /chat-state returns and what /chat coach references. No contradictions.
+    let _form, _prior, _depth_mix, _window_stability, _protocol_variety,
+        _start_hour_grid, _contribution_map, _contribution_summary,
+        _habituation, _cleanness;
+    try {
+      const utcOff = anchor.utcOffsetMinutes || 0;
+      _form = _fastingScoring.computeFastingForm({
+        sessions: allSessions,
+        priorSessions: [],
+        startDateStr: anchor.anchorDateStr || rangeMeta.startKey,
+        todayDateStr: win.todayDate,
+      });
+      _prior = _fastingScoring.derivePriorPeriod({
+        priorSessions: previousSessions,
+        currentTotalHours: totalFastH,
+        currentDaysLogged: Object.keys(byDate).length,
+        currentDepthCount: completedSess.filter(s => (s.actual_hours || 0) >= 16).length,
+        currentBrokenCount: sessions.filter(s => s.broken_early).length,
+      });
+      _depth_mix = _fastingScoring.deriveDepthMix(sessions);
+      _window_stability = _fastingScoring.deriveWindowStability(sessions, rangeMeta.days, utcOff);
+      _protocol_variety = _fastingScoring.deriveProtocolVariety(sessions, rangeMeta.days);
+      _start_hour_grid = _fastingScoring.deriveStartHourGrid(sessions, utcOff);
+      // Build dayQualityByDate from anchor → today for the full-year heatmap
+      const _dqMap = _fastingScoring.buildDayQualityByDate(
+        allSessions,
+        anchor.anchorDateStr || rangeMeta.startKey,
+        win.todayDate,
+      );
+      // P5 moat: deepest hours per day → heatmap colors by deepest stage reached.
+      const _deepestHoursByDate = {};
+      for (const s of allSessions) {
+        if (!s.date || !Number.isFinite(s.actual_hours) || s.actual_hours <= 0) continue;
+        const h = Number(s.actual_hours);
+        if (h > (_deepestHoursByDate[s.date] || 0)) _deepestHoursByDate[s.date] = h;
+      }
+      const _contrib = _fastingScoring.deriveContributionMap({
+        dayQualityByDate: _dqMap,
+        dayDeepestHoursByDate: _deepestHoursByDate,
+        anchorDate: anchor.anchorDateStr,
+        todayDate: win.todayDate,
+        spanDays: 365,
+      });
+      _contribution_map = _contrib;
+      _contribution_summary = _contrib.summary;
+      // Weekly avg-hours bucket for habituation (last 12 weeks)
+      const _weeks = [];
+      for (let w = 11; w >= 0; w--) {
+        const wEndMs = Date.now() - w * 7 * 86400000;
+        const wStartMs = wEndMs - 7 * 86400000;
+        const inWeek = allSessions.filter(s => {
+          const sm = getMillis(s.started_at);
+          return sm >= wStartMs && sm < wEndMs && s.completed && s.actual_hours > 0;
+        });
+        const avg = inWeek.length
+          ? inWeek.reduce((a, s) => a + s.actual_hours, 0) / inWeek.length
+          : null;
+        _weeks.push(avg);
+      }
+      _habituation = _fastingScoring.deriveHabituation({
+        avgFastHoursByWeek: _weeks.filter(v => v != null),
+        weeks: 12,
+      });
+      _cleanness = _fastingScoring.deriveCleanness(sessions);
+    } catch (e) {
+      log.warn?.('[fasting] V4 derivation soft-fail:', e?.message);
+      _form = _form || { ctl_hours: 0, atl_hours: 0, tsb: 0, ratio: 1, readiness: 50, band: 'consistent', explain: '' };
+      _prior = _prior || null;
+      _depth_mix = _depth_mix || { fed_pct: 0, glycogen_pct: 0, fat_pct: 0, ketone_pct: 0, deep_pct: 0, working_n: 0, total_n: 0 };
+      _window_stability = _window_stability || null;
+      _protocol_variety = _protocol_variety || null;
+      _start_hour_grid = _start_hour_grid || Array.from({ length: 7 }, () => new Array(24).fill(0));
+      _contribution_map = _contribution_map || { cells: [], summary: { logged_days: 0, missed_days: 0, span_days: 0, total_cells: 0 } };
+      _contribution_summary = _contribution_summary || { logged_days: 0, missed_days: 0, span_days: 0, total_cells: 0 };
+      _habituation = _habituation || { stalled: false, weeks_stalled: 0 };
+      _cleanness = _cleanness || { avg_hours: 0, broken_pct: 0, hunger_break_pct: 0, social_break_pct: 0, mood_break_pct: 0, energy_break_pct: 0 };
+    }
+
+    // P7 LIGHT — pre-compute cross_insights BEFORE res.json so the object
+    // literal stays sync-evaluated. Reads only cross_agent/today_signals.
+    let _crossInsights = null;
+    try {
+      const _xs = await readCrossSignals(deviceId);
+      const _items = [];
+      if (typeof _xs.sleep_hours_last_night === 'number') {
+        _items.push({ id: 'sleep', icon: '💤', value: _xs.sleep_hours_last_night.toFixed(1) + 'h',
+          label: 'sleep last night', hot: _xs.sleep_hours_last_night < 6 });
+      }
+      if (typeof _xs.water_pct_of_goal_today === 'number') {
+        _items.push({ id: 'water', icon: '💧', value: Math.round(_xs.water_pct_of_goal_today) + '%',
+          label: 'hydration today', hot: _xs.water_pct_of_goal_today < 50 });
+      }
+      if (typeof _xs.mind_anxiety_today === 'number') {
+        _items.push({ id: 'mood', icon: '🧠', value: _xs.mind_anxiety_today.toFixed(1) + '/5',
+          label: 'anxiety today', hot: _xs.mind_anxiety_today >= 4 });
+      }
+      if (_items.length) _crossInsights = { items: _items };
+    } catch (_) { /* sandbox-safe soft fail */ }
+
+    // Intercept the response sender so the literal payload below is
+    // captured for the 10-min cache without breaking the parity-test
+    // scanner. Same effect as wrapping at call site, zero refactor of
+    // the response object.
+    const _origJson = res.json.bind(res);
+    res.json = (payload) => {
+      try { _analysisCacheSet(deviceId, range, language, payload); } catch {}
+      log.info(`[fasting/analysis] FRESH took=${Date.now()-_t0}ms range=${range} sessions=${sessions.length}`);
+      return _origJson(payload);
+    };
     return res.json({
       setup_completed: true,
       range,
@@ -2020,12 +2498,96 @@ router.get('/analysis', async (req, res) => {
       upgrade_suggestion: _cr7d >= 0.85 && _avgH7 >= (targetHours - 0.5)
         ? (targetHours < 16 ? '16:8' : targetHours < 18 ? '18:6' : targetHours < 20 ? '20:4' : null)
         : null,
+
+      // ─── V4 NEW keys (2026-05-23) — additive, never replace anything above ─
+      form:                 _form,
+      prior:                _prior,
+      depth_mix:            _depth_mix,
+      window_stability:     _window_stability,
+      protocol_variety:     _protocol_variety,
+      start_hour_grid:      _start_hour_grid,
+      contribution_map:     _contribution_map,
+      contribution_summary: _contribution_summary,
+      habituation:          _habituation,
+      cleanness:            _cleanness,
+      // Weight Journey (P8 placeholder — null until weight pipeline ships
+      // or mock=1 hydrates it). Section auto-hides on the FE when null.
+      weight_journey:       null,
+      // P7 LIGHT — cross_insights from cross_agent/today_signals (legal channel).
+      // Pre-computed above this res.json block (avoids inline `await` in object
+      // literal which can confuse some JS engines / breaks ErrorBoundary).
+      cross_insights:       _crossInsights,
+      // Parity adds (FE reads these; were missing from populated path):
+      stats:                { count: sessions.length, days_logged: Object.keys(daily_logs || {}).length },
+      today_date:           win.todayDate,
     });
   } catch (e) {
-    log.error('[fasting] /analysis:', e);
+    log.error(`[fasting] /analysis FAILED after ${Date.now()-_t0}ms — ${e?.message || e}`);
     return res.status(500).json({ error: 'Failed' });
   }
 });
+
+// Day-0 / unset pack — emits ALL contract keys so FE never crashes on first
+// load. New keys ship safe defaults; existing keys preserve their previous
+// "missing" shapes (e.g. setup_completed: false, observations: []).
+function _fastingDay0Pack(range) {
+  return {
+    setup_completed: false,
+    range,
+    effective_start_date: null,
+    effective_days: 0,
+    days_since_anchor: 0,
+    anchor_date: null,
+    is_clamped: false,
+    score_today: null,
+    score_7d_smoothed: null,
+    score_lifetime: null,
+    missed_days: 0,
+    score: 0,
+    score_grade: null,
+    score_gates: null,
+    fasting_score: null,
+    efh_per_day: 0,
+    signal_points: [],
+    daily_logs: {},
+    stage_breakdown: [],
+    ai_reads: { champion: null, drag: null, pattern: null },
+    aha_moments: [],
+    circadian: { score: null, peak_start_hour: null, eating_window_start: null },
+    best_day: null,
+    worst_day: null,
+    streak: 0,
+    longest_streak: 0,
+    completion: 0,
+    avg_hours: 0,
+    best_fast: 0,
+    total_fast_hours: 0,
+    target_hours: 16,
+    personal_formula: null,
+    observations: [],
+    ready_for_upgrade: false,
+    upgrade_suggestion: null,
+    // V4 keys with safe defaults
+    form: { ctl_hours: 0, atl_hours: 0, tsb: 0, ratio: 1, readiness: 50, band: 'undermatured', explain: '' },
+    prior: null,
+    depth_mix: { fed_pct: 0, glycogen_pct: 0, fat_pct: 0, ketone_pct: 0, deep_pct: 0, working_n: 0, total_n: 0 },
+    window_stability: null,
+    protocol_variety: null,
+    start_hour_grid: Array.from({ length: 7 }, () => new Array(24).fill(0)),
+    contribution_map: { cells: [], summary: { logged_days: 0, missed_days: 0, span_days: 0, total_cells: 0 } },
+    contribution_summary: { logged_days: 0, missed_days: 0, span_days: 0, total_cells: 0 },
+    habituation: { stalled: false, weeks_stalled: 0 },
+    cleanness: { avg_hours: 0, broken_pct: 0, hunger_break_pct: 0, social_break_pct: 0, mood_break_pct: 0, energy_break_pct: 0 },
+    // Weight Journey (P8). null until a weight pipeline (HK / manual) ships.
+    // Shape when populated:
+    //   { entries: [{date,kg}], start_kg, goal_kg, current_kg, unit }
+    weight_journey: null,
+    // Parity with populated path (FE reads these — never null).
+    stats: { count: 0, days_logged: 0 },
+    today_date: (() => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; })(),
+    cross_insights: null,
+  };
+}
 
 // ════════════════════════════════════════════════════════════════
 // GET /actions — V2-compatible payload for FastingActionsTabV2
@@ -2649,6 +3211,36 @@ router.post('/chat', async (req, res) => {
     if (!checkChatRate(deviceId)) return res.status(429).json({ error: 'Rate limit' });
 
     const language = resolveLanguage(req);
+
+    // C1 — CRISIS ROUTING (parity with Mind agent). Never call OpenAI on
+    // crisis content — return the warm hotline template directly. Fasting
+    // users in ED / suicidal distress now have the same safety net as
+    // Mind users. Skips ALL downstream context build + LLM call.
+    try {
+      const { detectCrisis, crisisEnvelope } = require('./lib/safety');
+      const crisis = detectCrisis(message);
+      if (crisis) {
+        const region = (req.headers['x-region'] || req.headers['cf-ipcountry'] || '').toString().toUpperCase();
+        const env = crisisEnvelope(region);
+        log.warn(`[fasting/chat] CRISIS detected — routing to hotline (region=${region || 'default'})`);
+        try {
+          await chatsCol(deviceId).add({
+            role: 'assistant',
+            content: env.reply,
+            is_proactive: false,
+            proactive_type: 'crisis_safe',
+            is_crisis: true,
+            is_read: true,
+            language,
+            created_at: admin.firestore.FieldValue.serverTimestamp(),
+          });
+        } catch { /* non-fatal write */ }
+        return res.json({ success: true, reply: env.reply, ...env });
+      }
+    } catch (safetyErr) {
+      log.warn(`[fasting/chat] safety check failed (non-fatal): ${safetyErr?.message}`);
+    }
+
     const context = await getCachedContext(deviceId);
 
     const threadNotes = {
@@ -2947,20 +3539,18 @@ const _fastingCronTick = async () => {
         const allSessions = allSessSnap.docs.map(mapDoc);
         const currentStreak = computeStreak(allSessions);
 
-        // Hydration status
+        // Hydration status — sandbox-safe via cross_agent/today_signals.
+        // today_signals.water_intake_pct (0–100) is what cross-v2 publishes.
+        // We use a default 1800ml fasting goal and back-derive ml from the
+        // percentage. Loses a bit of precision vs the direct read but
+        // honors the cross-agent law (the only LEGAL number).
         let waterMl = 0;
-        let fastingWaterGoal = 1800;
+        const fastingWaterGoal = 1800;
         try {
-          const wRef = await userDoc(deviceId).collection('agents').doc('water').get();
-          if (wRef.exists) {
-            const wData = wRef.data() || {};
-            fastingWaterGoal = (wData.setup?.daily_goal_ml || 2500) + 300;
+          const signals = await readCrossSignals(deviceId);
+          if (typeof signals.water_intake_pct === 'number') {
+            waterMl = Math.round((signals.water_intake_pct / 100) * fastingWaterGoal);
           }
-          const todayStart = new Date();
-          todayStart.setHours(0, 0, 0, 0);
-          const wLogsSnap = await userDoc(deviceId).collection('agents').doc('water')
-            .collection('water_logs').where('logged_at', '>=', todayStart).get();
-          waterMl = wLogsSnap.docs.reduce((sum, d) => sum + (d.data().effective_ml || 0), 0);
         } catch { /* non-fatal */ }
 
         let proactiveType = null;

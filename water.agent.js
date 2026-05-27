@@ -113,6 +113,7 @@ const { mountActionRoutes, gradeActions: _gradeActionsShared } = require('./lib/
 const { computeWaterCandidates, waterGraders } = require('./lib/candidates/water');
 const { assertNoCrossAgent } = require('./lib/sandbox');
 const { computeWaterScore: _computeWaterScore } = require('./lib/agent-scores');
+const _waterScoring = require('./lib/water-scoring');
 // Cross-agent reads are handled by wellness.cross.js — water.agent.js never reads sibling agents.
 assertNoCrossAgent('water', computeWaterCandidates);
 const _v2Hooks = mountActionRoutes(router, {
@@ -1331,6 +1332,38 @@ async function buildWaterContext(deviceId) {
       : lastLogMins < 60 ? `Last logged: ${lastLogMins} min ago.`
       : `Last logged: ${Math.round(lastLogMins / 60)}h ago.`;
 
+    // ── Phase 11 (2026-05-24): bundle Analysis-tab numbers ──
+    // Coach should speak the same vocabulary the user sees on Analysis.
+    // No new Firestore reads — derive purely from `logs` + cached score.
+    let analysisLine = '';
+    try {
+      const cachedScore = waterData.current_score;
+      const scoreComponents = waterData.score_components || {};
+      const scoreLabel = waterData.score_label || null;
+      // vs-prior 7d delta (lightweight — reuses byDate already grouped)
+      const priorKeys = Array.from({ length: 7 }, (_, i) => {
+        const dt = new Date(); dt.setDate(dt.getDate() - (13 - i));
+        return dateStr(dt);
+      });
+      const priorAvg = Math.round(avg(priorKeys.map(k => byDate[k]?.effective_ml || 0)));
+      const deltaPct = priorAvg > 0 ? Math.round(((avg7 - priorAvg) / priorAvg) * 100) : null;
+      const deltaPhrase = deltaPct == null ? 'no prior baseline yet'
+        : deltaPct > 0 ? `+${deltaPct}% vs prior 7d`
+        : deltaPct < 0 ? `${deltaPct}% vs prior 7d`
+        : 'flat vs prior 7d';
+      const tierKey = scoreComponents.chronobiology >= 85 ? 'excellent'
+        : scoreComponents.chronobiology >= 65 ? 'strong'
+        : scoreComponents.chronobiology >= 40 ? 'building'
+        : scoreComponents.chronobiology >= 20 ? 'low' : 'starting';
+      analysisLine = [
+        cachedScore != null ? `Hydration Score: ${cachedScore}/100${scoreLabel ? ` (${scoreLabel})` : ''}.` : '',
+        scoreComponents.hydration_adequacy != null
+          ? `Score breakdown — adequacy ${scoreComponents.hydration_adequacy}, consistency ${scoreComponents.consistency}, chronobiology ${scoreComponents.chronobiology} (${tierKey}), bev quality ${scoreComponents.beverage_quality}.`
+          : '',
+        `vs Prior: ${deltaPhrase} (today's 7d avg ${avg7} ml, prior 7d ${priorAvg} ml).`,
+      ].filter(Boolean).join(' ');
+    } catch { /* non-fatal — analysis line is enrichment, not required */ }
+
     return [
       `Current time: ${minsToLabel(nowHour * 60 + nowMinute)} (${timeLabel}).`,
       `Setup: ${setup.weight_kg || '?'}kg, ${setup.activity_level || 'moderate'} activity, ${setup.climate || 'mild'} climate, wake ${minsToLabel(wake)}, bed ${minsToLabel(bed)}.`,
@@ -1343,6 +1376,7 @@ async function buildWaterContext(deviceId) {
       scheduleNote,
       `7-day average: ${avg7} ml/day. Current streak: ${streak} days.`,
       `Beverage mix: ${beverageMix}.`,
+      analysisLine, // Phase 11 — Analysis-tab numbers for vocabulary parity
       sleepNote,
       recentProactives ? `Recent coach notifications:\n${recentProactives}` : '',
       'Active coach priorities:',
@@ -1432,7 +1466,9 @@ router.get('/setup-status', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// GET /chat-prompts  — returns 6 prompts personalised from setup + logs
+// GET /chat-prompts  — returns up to 6 prompts personalised from setup
+// (goals, climate, activity, schedule). Live-log signals power the chat
+// state header + smart prompts via the separate /chat-state endpoint.
 // ═══════════════════════════════════════════════════════════════
 router.get('/chat-prompts', async (req, res) => {
   try {
@@ -1486,6 +1522,116 @@ router.get('/chat-prompts', async (req, res) => {
   } catch (err) {
     log.error('[water] /chat-prompts error:', err);
     res.status(500).json({ error: 'Failed' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// GET /chat-state — Coach tab header (last log + streak + smart-prompt signals)
+// Mirrors the fitness chat-state canon (single source of truth for the
+// Chat header strip + data-aware quick prompts). All signals derived
+// from already-loaded data — no extra Firestore reads beyond the lookups
+// the route already does.
+// ═══════════════════════════════════════════════════════════════════════
+router.get('/chat-state', async (req, res) => {
+  try {
+    const { deviceId } = req.query;
+    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+
+    const [lastSnap, wSnap, recentSnap] = await Promise.all([
+      logsCol(deviceId).orderBy('logged_at', 'desc').limit(1).get(),
+      waterDoc(deviceId).get(),
+      logsCol(deviceId).orderBy('logged_at', 'desc').limit(120).get(),
+    ]);
+
+    const wd = wSnap.data() || {};
+    const setup = wd.setup || {};
+    const goalMl = setup.daily_goal_ml || 2500;
+    const streak = wd.current_streak || 0;
+
+    if (lastSnap.empty) {
+      return res.json({ last_log: null, streak, prompt_signals: null });
+    }
+
+    const lastDoc = lastSnap.docs[0].data();
+    const lastMs  = getMillis(lastDoc.logged_at);
+    const lastAgo = Math.max(0, Math.round((Date.now() - lastMs) / 60000));
+    const last_log = {
+      ago_minutes:   lastAgo,
+      ml:            Number(lastDoc.ml || 0),
+      effective_ml:  Number(lastDoc.effective_ml || lastDoc.ml || 0),
+      beverage_type: lastDoc.beverage_type || lastDoc.drink_type || 'water',
+      date:          lastDoc.date || null,
+    };
+
+    // ── Smart-prompt signals — same derivation lib as Analysis tab ──
+    // Fitness canon: chat coach speaks the same numbers user sees on
+    // Analysis. Without this, Chat answers contradict the Analysis cards.
+    let prompt_signals = null;
+    try {
+      const logs = recentSnap.docs.map((d) => {
+        const x = d.data();
+        return {
+          ml: x.ml || 0,
+          effective_ml: x.effective_ml,
+          beverage_type: x.beverage_type || x.drink_type || 'water',
+          date: x.date || null,
+          logged_at: x.logged_at,
+        };
+      });
+      const todayKey = dateStr();
+      const recentKeys = [];
+      for (let i = 6; i >= 0; i--) {
+        const dt = new Date(); dt.setDate(dt.getDate() - i);
+        recentKeys.push(dateStr(dt));
+      }
+      const goalByDate = recentKeys.reduce((acc, k) => ({ ...acc, [k]: goalMl }), {});
+      const byDate = _waterScoring.groupLogsByDate(logs);
+
+      const chrono   = _waterScoring.deriveChronobiology(byDate, goalByDate, recentKeys);
+      const tier     = _waterScoring.effortMixTier(chrono);
+      const adequacy = _waterScoring.deriveHydrationAdequacy(byDate, goalByDate, recentKeys);
+      const dow      = _waterScoring.deriveDayOfWeek(byDate, goalByDate, recentKeys);
+
+      // Weekend (Sat=5 / Sun=6) vs weekday gap
+      const weekdays = dow.filter((d) => d.dow < 5 && d.count > 0);
+      const weekend  = dow.filter((d) => d.dow >= 5 && d.count > 0);
+      const wkdAvg = weekdays.length ? weekdays.reduce((s, d) => s + d.pct_of_goal, 0) / weekdays.length : 0;
+      const wndAvg = weekend.length  ? weekend.reduce((s, d) => s + d.pct_of_goal, 0) / weekend.length : 0;
+      const weekendGapPct = wkdAvg > 0 ? Math.round(((wkdAvg - wndAvg) / wkdAvg) * 100) : 0;
+
+      // Evening-heavy: >40% post-19h on ≥3 of last 4 days
+      const last4 = recentKeys.slice(-4);
+      const eveningHeavyDays = last4.filter((k) => {
+        const d = byDate[k];
+        if (!d || !d.effective_ml) return false;
+        return d.late_ml / d.effective_ml > 0.4;
+      }).length;
+
+      // Hydration debt — sum of daily deficits over last 7d, capped
+      const debt7d = recentKeys.reduce((s, k) => s + Math.max(0, goalMl - (byDate[k]?.effective_ml || 0)), 0);
+
+      // Coarse band label from adequacy + tier (matches Analysis Verdict bands)
+      const band =
+        adequacy >= 90 ? 'thriving' :
+        adequacy >= 70 ? 'strong'   :
+        adequacy >= 50 ? 'building' :
+        adequacy >= 25 ? 'low'      : 'starting';
+
+      prompt_signals = {
+        band,
+        chronobiology_tier: tier.tier_key,
+        weekend_gap_pct: weekendGapPct,
+        evening_heavy: eveningHeavyDays >= 3,
+        debt_ml: Math.round(debt7d),
+        streak,
+        streak_at_risk: streak >= 3 && last_log.ago_minutes >= 60 * 8 && new Date().getHours() >= 20,
+      };
+    } catch (e) { log.error('[water] chat-state prompt_signals:', e.message); }
+
+    return res.json({ last_log, streak, prompt_signals });
+  } catch (err) {
+    log.error('[water] /chat-state error:', err);
+    res.status(500).json({ error: 'state failed' });
   }
 });
 
@@ -1556,43 +1702,40 @@ async function refreshWaterScore(deviceId) {
       logsCol(deviceId).orderBy('logged_at', 'desc').limit(70).get(),
       waterDoc(deviceId).get(),
     ]);
-    const setup = (waterSnap.data() || {}).setup || {};
+    const wd = waterSnap.data() || {};
+    const setup = wd.setup || {};
     const goalMl = setup.daily_goal_ml || 2500;
 
-    // Group by date
-    const byDate = {};
-    logsSnap.docs.forEach(doc => {
+    // Map raw docs into the log shape the scoring lib expects.
+    const logs = logsSnap.docs.map((doc) => {
       const data = doc.data();
-      const ds = data.date || data.date_str;
-      if (!ds) return;
-      if (!byDate[ds]) byDate[ds] = { ml: 0, morningMl: 0, lateMl: 0, total: 0 };
-      const effectiveMl = data.effective_ml || data.ml || 0;
-      byDate[ds].ml    += effectiveMl;
-      byDate[ds].total += effectiveMl;
-      const h = data.hour || (data.logged_at?.toDate ? data.logged_at.toDate().getHours() : 12);
-      if (h < 12) byDate[ds].morningMl += effectiveMl;
-      if (h >= 20) byDate[ds].lateMl    += effectiveMl;
+      return {
+        ml: data.ml || 0,
+        effective_ml: data.effective_ml,
+        beverage_type: data.beverage_type || 'water',
+        date: data.date || data.date_str || null,
+        logged_at: data.logged_at,
+      };
     });
 
-    const dates = Object.keys(byDate).sort().slice(-7);
-    if (!dates.length) return;
-    const daysLogged = Object.keys(byDate).length;
-    const n = dates.length;
+    // recentKeys = last 7 calendar days ending today. Anchor-clamped if available.
+    const todayKey = dateStr();
+    const recentKeys = [];
+    for (let i = 6; i >= 0; i--) {
+      const dt = new Date(); dt.setDate(dt.getDate() - i);
+      recentKeys.push(dateStr(dt));
+    }
+    const goalByDate = recentKeys.reduce((acc, k) => ({ ...acc, [k]: goalMl }), {});
 
-    const hydrationAdequacy = Math.round(dates.reduce((s, d) => s + Math.min(100, (byDate[d].ml / goalMl) * 100), 0) / n);
-    const consistency       = Math.round((dates.filter(d => byDate[d].ml >= goalMl * 0.8).length / n) * 100);
-    const frontLoadPct      = Math.round((dates.filter(d => byDate[d].morningMl >= Math.max(300, goalMl * 0.22)).length / n) * 100);
-    const lateTaperPct      = Math.round((dates.filter(d => byDate[d].lateMl <= 250).length / n) * 100);
-    const chronobiology     = Math.round(frontLoadPct * 0.60 + lateTaperPct * 0.40);
-    const avg7dMl           = Math.round(dates.reduce((s, d) => s + (byDate[d].ml || 0), 0) / n);
-
-    const result = _computeWaterScore({
-      hydration_adequacy: hydrationAdequacy,
-      consistency,
-      chronobiology,
-      beverage_quality: 70, // default; full calc only in analysis
-      avg_7d_ml: avg7dMl,
-      days_logged: daysLogged,
+    // Single entry point — same lib used by analysis route + cross-v2 adapter.
+    // Gone: hardcoded `beverage_quality: 70`. Bev quality is now derived from
+    // the actual beverage mix in the last 7 days of logs.
+    const result = _waterScoring.computeWaterScore({
+      logs,
+      goalByDate,
+      recentKeys,
+      utcOffsetMinutes: 0,
+      todayDateStr: todayKey,
     });
     if (!result) return;
 
@@ -2355,7 +2498,7 @@ router.get('/analysis', async (req, res) => {
     const logsSnap = await logsCol(deviceId).orderBy('logged_at', 'desc').limit(fetchLimit).get();
     const { dateStr: _dsLocalLogs } = require('./lib/range-helpers');
     const _tzOffsetLogs = anchor.utcOffsetMinutes || 0;
-    const allLogs  = logsSnap.docs.map(d => {
+    const _rawLogs = logsSnap.docs.map(d => {
       const x = d.data();
       const ms = x.logged_at?.toMillis ? x.logged_at.toMillis() : new Date(x.logged_at || 0).getTime();
       return {
@@ -2366,6 +2509,11 @@ router.get('/analysis', async (req, res) => {
         date:        x.date || (ms ? _dsLocalLogs(new Date(ms), _tzOffsetLogs) : null),
       };
     }).filter(l => l.logged_at && new Date(l.logged_at).getTime() >= cutoff);
+    // Anti-future-log law (Phase 3, 2026-05-24): drop any log dated strictly
+    // after today's local date. Without this, a future-dated dev log would
+    // inflate Verdict / score_gates / hydration_score while the chart stays
+    // clamped — the exact "lying chart" bug that bit fitness.
+    const allLogs = _waterScoring.dropFutureLogs(_rawLogs, win.todayDate);
 
     // Hydration score
     const hydrationScore = _waterAnalytics.computeHydrationScore({
@@ -2450,7 +2598,20 @@ router.get('/analysis', async (req, res) => {
     if (cached) {
       ai_reads = cached;
     } else {
-      ai_reads = await _waterAnalytics.generateAiReads(allLogs, target_ml, hydrationScore, openai, deviceId, language);
+      // 2026-05-25 deadline guard — same fix as sleep-analytics.
+      // OpenAI cold-cache round-trip can run 8-25s; without a cap the FE
+      // 15s safeFetch fires. Cap at 8s, let the AI promise finish in the
+      // background to populate the cache for the next /analysis call.
+      const _aiFallback = { champion: null, drag: null, pattern: null };
+      const _withDeadline = (p, ms, fb) => Promise.race([
+        p.catch(() => fb),
+        new Promise((r) => setTimeout(() => r(fb), ms)),
+      ]);
+      ai_reads = await _withDeadline(
+        _waterAnalytics.generateAiReads(allLogs, target_ml, hydrationScore, openai, deviceId, language),
+        8000,
+        _aiFallback,
+      );
       if (ai_reads.champion || ai_reads.drag || ai_reads.pattern) {
         waterDoc(deviceId).set({
           ai_reads_cache_v2: { [aiCacheKey]: ai_reads, _generated_at: new Date().toISOString() },
@@ -2565,6 +2726,97 @@ router.get('/analysis', async (req, res) => {
       daysSinceAnchor: win.daysSinceAnchor,
     });
 
+    // ════════════════════════════════════════════════════════════════
+    // Phase 5-8 (2026-05-24): vs-prior + 365 heatmap + balance + numbers
+    // All derivations through lib/water-scoring.js — single source of truth.
+    // Pure JS, no extra Firestore reads except the prior-period fetch (only
+    // fires when current window has ≥3 logs to keep /analysis under the 3s
+    // performance budget).
+    // ════════════════════════════════════════════════════════════════
+    const _tzOffsetWin = anchor.utcOffsetMinutes || 0;
+    const _todayKeyWin = win.todayDate;
+    const _currentRecentKeys = dayKeys; // already built above for signal_points
+    const _goalByDateWin = _currentRecentKeys.reduce((acc, k) => ({ ...acc, [k]: target_ml }), {});
+    const _byDateWin = _waterScoring.groupLogsByDate(allLogs, { utcOffsetMinutes: _tzOffsetWin });
+
+    // ── Phase 5: vs Prior Period ──
+    let prior = null;
+    if (_currentRecentKeys.length >= 3) {
+      try {
+        const priorEndMs = cutoff;
+        const priorStartMs = anchor.anchorMs
+          ? Math.max(priorEndMs - days * 86_400_000, anchor.anchorMs)
+          : priorEndMs - days * 86_400_000;
+        if (priorEndMs - priorStartMs >= 3 * 86_400_000) {
+          const priorSnap = await logsCol(deviceId)
+            .orderBy('logged_at', 'desc')
+            .limit(Math.min(days * 25, 3000))
+            .get();
+          const priorLogsRaw = priorSnap.docs.map((d) => {
+            const x = d.data();
+            const ms = x.logged_at?.toMillis ? x.logged_at.toMillis() : new Date(x.logged_at || 0).getTime();
+            return {
+              ml: x.ml || 0,
+              effective_ml: x.effective_ml,
+              beverage_type: x.beverage_type || x.drink_type || 'water',
+              date: x.date || (ms ? _dsLocalLogs(new Date(ms), _tzOffsetLogs) : null),
+              logged_at: ms ? new Date(ms).toISOString() : null,
+            };
+          }).filter((l) => l.logged_at && new Date(l.logged_at).getTime() >= priorStartMs && new Date(l.logged_at).getTime() < priorEndMs);
+          const priorRecentKeys = [];
+          for (let ms = priorStartMs; ms < priorEndMs; ms += 86_400_000) {
+            priorRecentKeys.push(_waterAnalytics?.computeHydrationScore ? _dsTz(new Date(ms), _tzOffsetWin) : null);
+          }
+          const priorGoalMap = priorRecentKeys.filter(Boolean).reduce((acc, k) => ({ ...acc, [k]: target_ml }), {});
+          const currentDaysLoggedNum = Object.keys(byDate).length;
+          prior = _waterScoring.derivePriorPeriod({
+            priorLogs: priorLogsRaw,
+            priorGoalByDate: priorGoalMap,
+            priorRecentKeys: priorRecentKeys.filter(Boolean),
+            currentTotalMl: total_ml,
+            currentAvgMl: avg_ml,
+            currentDaysLogged: currentDaysLoggedNum,
+            currentCompletion: completion,
+          });
+        }
+      } catch (e) { log.error('[water] derivePriorPeriod:', e.message); }
+    }
+
+    // ── Phase 6: 365-day Your Journey heatmap ──
+    const journey = _waterScoring.derive365Heatmap({
+      dailyQualityByDate: blendedQualityByDate,
+      anchorDate: anchor.anchorDateStr,
+      todayDate: win.todayDate,
+      spanDays: 365,
+    });
+
+    // ── Phase 7: Balance — beverage mix + day-of-week ──
+    const balance = {
+      beverage_mix: _waterScoring.deriveBeverageMix(_byDateWin, _currentRecentKeys),
+      day_of_week:  _waterScoring.deriveDayOfWeek(_byDateWin, _goalByDateWin, _currentRecentKeys),
+    };
+
+    // ── Phase 8: Effort Mix tier + expanded "The Numbers" grid ──
+    const effort_mix = _waterScoring.effortMixTier(hydrationScore?.components?.timing);
+    // Peak hour: hour-of-day with the largest aggregate intake across window.
+    const hourTotals = new Array(24).fill(0);
+    for (const l of allLogs) {
+      if (!l.logged_at) continue;
+      const h = new Date(l.logged_at).getHours();
+      hourTotals[h] += l.ml || 0;
+    }
+    const peak_hour = hourTotals.indexOf(Math.max(...hourTotals));
+    const days_at_goal = signal_points.filter((p) => p.completed).length;
+    const variety_count = drink_breakdown.length;
+    const the_numbers = {
+      avg_ml,
+      best_day_ml: Math.round(best_ml),
+      completion_pct: Math.round(completion * 100),
+      peak_hour,
+      days_at_goal,
+      variety_count,
+    };
+
     return res.json({
       setup_completed: true,
       range,
@@ -2606,6 +2858,12 @@ router.get('/analysis', async (req, res) => {
       best_day_ml:      Math.round(best_ml),
       total_ml:         Math.round(total_ml),
       target_ml,
+      // Phase 5-8 additions — additive, never replace existing keys.
+      prior,
+      journey,
+      balance,
+      effort_mix,
+      the_numbers,
     });
   } catch (e) {
     log.error('[water] /analysis:', e);
