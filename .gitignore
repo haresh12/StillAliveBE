@@ -4,3 +4,7 @@ firebase-service-account.json
 *.log
 .DS_Store
 secrets
+# Local backups + score snapshots — not part of source
+*.backup-*
+*.bak
+snapshots/
