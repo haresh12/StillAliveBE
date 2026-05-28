@@ -44,6 +44,7 @@ const {
 } = require('./lib/goal-plans/prompts');
 const {
   PATHS, ERROR_CODES, DURATIONS, LIMITS,
+  MIN_DURATION_DAYS, MAX_DURATION_DAYS, isValidDuration,
 } = require('./lib/goal-plans/constants');
 const { buildRemindersForPlan } = require('./lib/goal-plans/reminders');
 
@@ -142,6 +143,14 @@ router.get('/list', async (req, res) => {
         today_ratio: day ? `${completedCount}/${allItems.length}` : null,
         today_items: todayItems,
         today_overflow: todayOverflow,
+        // FULL set of completed item IDs for today. today_items is sliced to
+        // the first 5 for card display, so the FE can't reconstruct the
+        // overflow items' completion state from today_items.completed alone.
+        // The FE uses this list to reconcile its optimistic store with BE
+        // truth on every tab focus — without it, an overflow item's checkmark
+        // disappears every time the user navigates back to the library.
+        today_date_key: day?.date_key || null,
+        completed_item_ids: completedIds,
       };
     }));
 
@@ -179,9 +188,12 @@ router.post('/draft', async (req, res) => {
   // legacy FE bundles are still in flight; remove `|| req.body?.transcript`
   // once the new bundle is verified live on every dev device.
   const goalText = String(req.body?.goal_text || req.body?.transcript || '').trim();
-  const requestedDays = DURATIONS.includes(Number(req.body?.duration_days))
-    ? Number(req.body.duration_days)
-    : 30;
+  // Free-form duration: accept any integer in [MIN, MAX]. The clamp below
+  // enforces per-tier ceilings (free → 14, premium → 60). If the FE doesn't
+  // send a value, leave it undefined so the clamp's tier-appropriate default
+  // wins (14 for free, 30 for premium).
+  const rawDurReq = Number(req.body?.duration_days);
+  const requestedDays = isValidDuration(rawDurReq) ? rawDurReq : null;
   const locale = String(req.body?.locale || 'en').toLowerCase().slice(0, 2);
 
   if (goalText.length < 3) return fail(res, 400, ERROR_CODES.INVALID_GOAL, 'goal_text too short');
@@ -256,8 +268,13 @@ router.post('/draft', async (req, res) => {
       schema: COMPOSE_QUESTIONS,
       systemPrompt: qPrompts.systemPrompt,
       userPrompt:   qPrompts.userPrompt,
-      // Structured Q-list generation — gpt-4.1 lands in ~5-8s.
-      openai: { model: AI.STRUCTURED_HEAVY, timeoutMs: 30_000 },
+      // 2026-05-28: upgraded from STRUCTURED_HEAVY (gpt-4.1) → REASONING_PRO
+      // (gpt-5.4). User feedback: previous questions were generic across goals
+      // ("any injuries?" on every plan). The new prompt has anti-generic rules
+      // + goal-specific exemplars; reasoning-class models follow that structure
+      // much better. Trade-off: +5-15s latency for materially sharper Qs. The
+      // L2 fallback stays on STRUCTURED_HEAVY so a slow gpt-5.4 still ships.
+      openai: { model: AI.REASONING_PRO,    timeoutMs: 45_000 },
       gemini: { model: AI.VISION_PRIMARY,   timeoutMs: 30_000 },
       telemetry,
       language: locale,
@@ -578,7 +595,15 @@ router.post('/complete-item', async (req, res) => {
 
   if (!planId || !itemId)              return fail(res, 400, ERROR_CODES.PLAN_NOT_FOUND);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) return fail(res, 400, ERROR_CODES.INVALID_DATE);
-  if (dateKey > localDateKey())         return fail(res, 400, ERROR_CODES.INVALID_DATE, 'cannot complete a future day');
+  // BE runs in UTC; the user's wall clock may be ahead of UTC by up to ~14h.
+  // Reject only days that are >1 day past BE's UTC today — that still blocks
+  // "obvious future" submissions while letting any real timezone complete today.
+  {
+    const beToday = localDateKey();
+    const [by, bm, bd] = beToday.split('-').map(Number);
+    const beTomorrow = localDateKey(new Date(by, bm - 1, bd + 1));
+    if (dateKey > beTomorrow) return fail(res, 400, ERROR_CODES.INVALID_DATE, 'cannot complete a future day');
+  }
 
   try {
     const logRef = db().doc(PATHS.logDoc(deviceId, planId, dateKey));

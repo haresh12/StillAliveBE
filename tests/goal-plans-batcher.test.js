@@ -4,7 +4,7 @@
  * Locks in the 2026-05-27 v2 anti-tiling law (L2):
  *   • 7-day plan = 1 batch, 7 distinct days
  *   • 30-day plan = 5 batches (7+7+7+7+2), 30 distinct days
- *   • 90-day plan = 13 batches, 90 distinct days
+ *   • 60-day plan = 12 batches of 5, 60 distinct days (was 90 → trimmed 2026-05-28)
  *   • Batches yield in strict day-index order (snake/path paints cleanly)
  *   • ANY batch fail after retries → throw (no partial plans persisted)
  *
@@ -127,14 +127,16 @@ await test('30-day plan: 6 batches of 5, 30 distinct days', async () => {
   assert.strictEqual(days[29].day_index, 30);
 });
 
-await test('90-day plan: 18 batches of 5, 90 distinct days', async () => {
+// 2026-05-28: max premium duration trimmed 90 → 60 (cost control). Test now
+// covers the 60-day path = 12 batches of 5.
+await test('60-day plan: 12 batches of 5, 60 distinct days', async () => {
   const responses = [];
-  for (let i = 0; i < 18; i++) responses.push(fakeBatchResponse(i * 5 + 1, 5));
+  for (let i = 0; i < 12; i++) responses.push(fakeBatchResponse(i * 5 + 1, 5));
   __setTestOverrides({ openai: openAIClient(responses) });
-  const days = await generateAllDays({ ...baseOpts, duration_days: 90 });
-  assert.strictEqual(days.length, 90);
+  const days = await generateAllDays({ ...baseOpts, duration_days: 60 });
+  assert.strictEqual(days.length, 60);
   assert.strictEqual(days[0].day_index, 1);
-  assert.strictEqual(days[89].day_index, 90);
+  assert.strictEqual(days[59].day_index, 60);
 });
 
 await test('date_key is correctly offset from start_date', async () => {
@@ -191,10 +193,29 @@ await test('L1 returns wrong day count → throws (no partial plan)', async () =
 });
 
 await test('rejects invalid duration_days', async () => {
-  let threw = null;
-  try { await generateAllDays({ ...baseOpts, duration_days: 45 }); }
-  catch (e) { threw = e; }
-  assert.ok(threw && /invalid duration_days/.test(threw.message));
+  // 2026-05-28: duration is now free-form in [3, 90]. 45 is valid; we test
+  // the actual boundary failures (too low, too high, non-integer).
+  for (const bad of [0, 1, 2, 91, 100, 'abc', null, undefined, 5.5]) {
+    let threw = null;
+    try { await generateAllDays({ ...baseOpts, duration_days: bad }); }
+    catch (e) { threw = e; }
+    assert.ok(
+      threw && /invalid duration_days/.test(threw.message),
+      `expected throw for duration_days=${JSON.stringify(bad)}`
+    );
+  }
+});
+
+await test('accepts free-form duration in [3, 90]', async () => {
+  // Pick a non-bucket value (10 days = 2 batches of 5) to prove arbitrary
+  // counts work end-to-end, not just the legacy [7, 14, 30, 60] presets.
+  __setTestOverrides({
+    openai: openAIClient([fakeBatchResponse(1, 5), fakeBatchResponse(6, 5)]),
+  });
+  const days = await generateAllDays({ ...baseOpts, duration_days: 10 });
+  assert.strictEqual(days.length, 10);
+  assert.strictEqual(days[0].day_index, 1);
+  assert.strictEqual(days[9].day_index, 10);
 });
 
 await test('rejects bad start_date', async () => {

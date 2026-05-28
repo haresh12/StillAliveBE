@@ -79,7 +79,10 @@ test('returns prompts with cross-domain instruction (L4)', () => {
     locale: 'en',
     durationDays: 30,
   });
-  assert.ok(p.systemPrompt.includes('Cross-domain coverage matters'));
+  // 2026-05-28 prompt rewrite: cross-domain rule moved from "Cross-domain
+  // coverage matters" prose to Rule D's "lose 5kg" exemplar. Phrasing is
+  // stable across the rewrite.
+  assert.ok(/EVERY listed coach gets at least one question/.test(p.systemPrompt));
   assert.ok(p.systemPrompt.includes('Coaches involved: fitness, nutrition'));
 });
 
@@ -114,14 +117,16 @@ test('defaults to fitness when coachesInvolved missing', () => {
   assert.ok(p.systemPrompt.includes('Coaches involved: fitness'));
 });
 
-test('clamps duration to 30 when invalid', () => {
+test('clamps duration to 14 when invalid', () => {
   const p = buildComposeQuestionsPrompt({
     goalText: 'foo bar baz',
     coachesInvolved: ['mind'],
     locale: 'en',
     durationDays: 999,
   });
-  assert.ok(p.systemPrompt.includes('Plan duration: 30 days'));
+  // Fallback bucket is the free-tier default (14) since 2026-05-28 trimmed
+  // the valid set to [7, 14, 30, 60] and free max = 14.
+  assert.ok(p.systemPrompt.includes('Plan duration: 14 days'));
 });
 
 test('accepts 7-day plan', () => {
