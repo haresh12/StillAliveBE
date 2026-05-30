@@ -1727,7 +1727,13 @@ app.post('/api/account/delete', getDeviceId, async (req, res) => {
 
     await Promise.all(cleanupWatcherPromises);
 
-    await db.collection('wellness_users').doc(deviceId).delete();
+    // Recursively wipe wellness_users/{deviceId} + every subcollection under
+    // it (agents/{coach}/{coach}_logs|chats|checkins|sessions|workouts|...,
+    // wellness_feedback, anything else nested). A plain .doc(...).delete()
+    // would leave orphaned subcollection docs that the next signup on the
+    // same hardware deviceId would inherit.
+    const userRef = db.collection('wellness_users').doc(deviceId);
+    await db.recursiveDelete(userRef);
 
     const targetSnapshot = await db
       .collection('watching')
@@ -1750,6 +1756,48 @@ app.post('/api/account/delete', getDeviceId, async (req, res) => {
     const alertDeletes = alertsSnapshot.docs.map(doc => doc.ref.delete());
     await Promise.all(alertDeletes);
 
+    // aliveChecks/{deviceId} — legacy doc still read by cron-user-context +
+    // i18n-prompt + user-anchor; orphans would re-introduce stale lang/tz
+    // for a reused deviceId.
+    let aliveChecksDeleted = 0;
+    try {
+      const aliveRef = db.collection('aliveChecks').doc(deviceId);
+      const aliveSnap = await aliveRef.get();
+      if (aliveSnap.exists) {
+        await db.recursiveDelete(aliveRef);
+        aliveChecksDeleted = 1;
+      }
+    } catch (e) { log.warn('[account/delete] aliveChecks wipe failed:', e?.message); }
+
+    // referrals — both directions (this user was referred / this user referred others)
+    let referralsDeleted = 0;
+    try {
+      const [asNew, asReferrer] = await Promise.all([
+        db.collection('referrals').where('newUserDeviceId', '==', deviceId).get(),
+        db.collection('referrals').where('referrerDeviceId', '==', deviceId).get(),
+      ]);
+      const refDeletes = [...asNew.docs, ...asReferrer.docs].map(d => d.ref.delete());
+      await Promise.all(refDeletes);
+      referralsDeleted = refDeletes.length;
+    } catch (e) { log.warn('[account/delete] referrals wipe failed:', e?.message); }
+
+    // challengeEnrollments/{challengeId}/members/{deviceId} — sweep across
+    // every challenge so the next signup isn't auto-re-enrolled.
+    let challengeMembershipsDeleted = 0;
+    try {
+      const memberDeletes = [];
+      for (const ch of STATIC_CHALLENGES) {
+        const memberRef = db.collection('challengeEnrollments').doc(ch.id).collection('members').doc(deviceId);
+        const snap = await memberRef.get();
+        if (snap.exists) memberDeletes.push(memberRef.delete());
+        // Also wipe challengeActivity/{deviceId}_{challengeId} grid
+        const activityRef = db.collection('challengeActivity').doc(`${deviceId}_${ch.id}`);
+        memberDeletes.push(db.recursiveDelete(activityRef).catch(() => {}));
+      }
+      await Promise.all(memberDeletes);
+      challengeMembershipsDeleted = memberDeletes.length;
+    } catch (e) { log.warn('[account/delete] challenge wipe failed:', e?.message); }
+
     res.json({
       success: true,
       deleted: {
@@ -1758,6 +1806,9 @@ app.post('/api/account/delete', getDeviceId, async (req, res) => {
         watchingEntriesWatcher: watchingAsWatcherSnap.size,
         checkins: checkinsSnapshot.size,
         alerts: alertsSnapshot.size,
+        aliveChecks: aliveChecksDeleted,
+        referrals: referralsDeleted,
+        challengeMemberships: challengeMembershipsDeleted,
       },
     });
   } catch (error) {
