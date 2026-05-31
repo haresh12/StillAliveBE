@@ -142,6 +142,14 @@ app.use('/api/v2/healthkit', require('./healthkit.agent'));
 app.use('/api/v2/starter-insights', require('./starter-insights.agent'));
 app.use('/webhooks/revenuecat', require('./lib/revenuecat-webhook'));
 app.use('/api/analytics', require('./lib/analytics-api'));
+app.use('/api/voice',     require('./voice.agent'));
+
+// ── Android Monetization (Phase 2, 2026-05-31) ────────────────
+// ANDROID-ONLY routes. iOS clients never hit these.
+// See ANDROID_COINS_ADS_REFERRALS_400H_PLAN.md and stillalive-backend/android/.
+app.use('/api/android/coins',     require('./android/coins.agent'));
+app.use('/api/android/ads',       require('./android/ads.agent'));
+app.use('/api/android/referrals', require('./android/referrals.agent'));
 
 // ============================================
 // V2 CROSS-AGENT NIGHTLY BATCH CRON
@@ -2579,6 +2587,118 @@ app.get('/api/admin/users/:deviceId', async (req, res) => {
   } catch (err) {
     log.error('❌ Admin user detail error:', err);
     res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ============================================
+// PUSH NOTIFICATIONS (FCM/APNs)
+// ============================================
+
+// POST /api/notifications/register-token
+// Called by the FE (src/lib/notifications/fcm.js setupFCM) after the device
+// has obtained an FCM registration token. Stores token + platform on the
+// wellness_users doc so sendPushTo() can deliver pushes later.
+//
+// Platform-agnostic — same endpoint handles iOS APNs-mapped tokens and
+// Android FCM tokens. The `platform` field tells `sendPushTo` how to shape
+// the outgoing payload (apns vs android blocks).
+app.post('/api/notifications/register-token', async (req, res) => {
+  try {
+    const { deviceId, token, platform } = req.body || {};
+    if (!deviceId || !token || !platform) {
+      return res.status(400).json({ success: false, error: 'deviceId, token, platform required' });
+    }
+    if (platform !== 'ios' && platform !== 'android') {
+      return res.status(400).json({ success: false, error: 'platform must be ios|android' });
+    }
+    await db.collection('wellness_users').doc(deviceId).set({
+      fcmToken: token,
+      fcmPlatform: platform,
+      fcmTokenUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+    log.info(`[push] token registered device=${deviceId.slice(0, 8)} platform=${platform}`);
+    res.json({ success: true });
+  } catch (e) {
+    log.error('[push] register-token error:', e);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// POST /api/notifications/test-push — debug-only.
+// FE calls this from __sendTestPush() (gated by __DEV__) to fire a push at
+// an emulator/simulator deviceId without needing a real cron trigger.
+// In production we still allow it (no auth) — it requires a valid token to
+// already be registered, so it can only hit a device the caller owns.
+app.post('/api/notifications/test-push', async (req, res) => {
+  try {
+    const { deviceId, title, body, data } = req.body || {};
+    if (!deviceId) return res.status(400).json({ success: false, error: 'deviceId required' });
+    const { sendPushTo } = require('./lib/push');
+    const result = await sendPushTo(deviceId, {
+      title: title || 'Test push',
+      body:  body  || 'Hello from Wellness OS',
+      data:  data  || { agent: 'fitness', deep_link: 'wellnessos://home' },
+    });
+    if (!result.ok) return res.status(400).json({ success: false, error: result.error });
+    res.json({ success: true, messageId: result.messageId, platform: result.platform });
+  } catch (e) {
+    log.error('[push] test-push error:', e);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ============================================
+// VOICE TRANSCRIBE — cloud Whisper fallback
+// ============================================
+// Used by src/lib/voice/cloudStrategy.js (Strategy B in the dual voice
+// stack). Triggered when native SpeechRecognizer is unavailable
+// (Android emulators without Google Search, iOS Sim, Android 11+
+// without RecognitionService discoverable, etc.) OR when native
+// fails to produce a partial within the manager's warmup window.
+//
+// Cost: ~$0.006/min. Manager only falls back rarely, so per-user
+// spend stays low. Audio is processed in-memory + discarded; never
+// persisted on disk or in Firestore.
+const multer = require('multer');
+const voiceUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024 }, // 25MB — Whisper's hard limit
+});
+
+app.post('/api/voice/transcribe', voiceUpload.single('audio'), async (req, res) => {
+  try {
+    if (!req.file || !req.file.buffer || req.file.buffer.length === 0) {
+      return res.status(400).json({ error: 'no_audio_file' });
+    }
+    const language = (req.body?.language || req.headers['x-user-language'] || 'en')
+      .toString()
+      .slice(0, 8);
+    const agent = (req.body?.agent || 'unknown').toString().slice(0, 32);
+
+    const OpenAI = require('openai');
+    const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+    // Whisper accepts a file-like object. OpenAI's Node SDK exposes
+    // `toFile` for buffer → File conversion.
+    const { toFile } = OpenAI;
+    const filename = req.file.originalname || `voice.${language === 'en' ? 'm4a' : 'm4a'}`;
+    const file = await toFile(req.file.buffer, filename, { type: req.file.mimetype || 'audio/m4a' });
+
+    const lang2 = language.split('-')[0]; // 'en-US' → 'en'
+
+    const result = await client.audio.transcriptions.create({
+      file,
+      model: 'whisper-1',
+      language: lang2,
+      response_format: 'json',
+    });
+
+    const text = String(result?.text || '').trim();
+    log.info(`[voice] transcribe agent=${agent} lang=${lang2} chars=${text.length}`);
+    return res.json({ text, language: lang2, agent });
+  } catch (e) {
+    log.error('[voice] transcribe error:', e?.message || e);
+    return res.status(500).json({ error: 'transcribe_failed', detail: String(e?.message || e).slice(0, 200) });
   }
 });
 

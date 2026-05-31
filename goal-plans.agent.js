@@ -216,8 +216,19 @@ router.post('/draft', async (req, res) => {
 
     // Free users get a max of 3 plans total (any status). Premium is bounded
     // by LIMITS.MAX_ACTIVE_PLANS_PER_USER (10). Count BEFORE we burn an LLM
-    // call — surface TOO_MANY_PLANS so the FE can show an upgrade nudge.
+    // call — surface TOO_MANY_PLANS so the FE can offer a rewarded-ad unlock.
+    //
+    // Android free users can earn EXTRA slots beyond the cap by watching a
+    // rewarded ad (one slot per ad). The slot counter lives on the user doc
+    // at `androidBonusPlanSlots` and is consumed on every successful plan create.
     const FREE_PLAN_CAP = 3;
+    let bonusSlotsAvailable = 0;
+    try {
+      const userSnap = await db().doc(PATHS.userDoc(deviceId)).get();
+      bonusSlotsAvailable = Number(userSnap?.data()?.androidBonusPlanSlots || 0);
+    } catch {/* default 0 — no bonus */}
+
+    let plansToConsumeSlot = false;
     try {
       const existing = await db()
         .collection(PATHS.plansCol(deviceId))
@@ -227,11 +238,24 @@ router.post('/draft', async (req, res) => {
         .map(d => d.data())
         .filter(p => p && p.schema_version === SCHEMA_VERSION)
         .length;
-      const cap = isPremium ? LIMITS.MAX_ACTIVE_PLANS_PER_USER : FREE_PLAN_CAP;
-      if (planCount >= cap) {
+      const baseCap = isPremium ? LIMITS.MAX_ACTIVE_PLANS_PER_USER : FREE_PLAN_CAP;
+      const effectiveCap = baseCap + bonusSlotsAvailable;
+
+      if (planCount >= effectiveCap) {
         return fail(res, 409, ERROR_CODES.TOO_MANY_PLANS, isPremium
           ? `cap_${LIMITS.MAX_ACTIVE_PLANS_PER_USER}`
           : `free_cap_${FREE_PLAN_CAP}`);
+      }
+
+      // If user is over the base cap but within effective (= using a bonus
+      // slot), consume one slot NOW (early). The slot is "1 LLM-call attempt
+      // at creating a plan" — if user bails on finalize, slot is still spent.
+      // Fair: they watched the ad, they got the LLM call.
+      if (planCount >= baseCap) {
+        await db().doc(PATHS.userDoc(deviceId)).set({
+          androidBonusPlanSlots: Math.max(0, bonusSlotsAvailable - 1),
+        }, { merge: true });
+        log.info(`[goal-plans/draft] consumed 1 bonus plan slot for ${deviceId} (remaining: ${bonusSlotsAvailable - 1})`);
       }
     } catch (e) {
       log.warn('[goal-plans/draft] plan count check fail (allowing draft):', e?.message);
