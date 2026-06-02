@@ -2686,10 +2686,20 @@ app.post('/api/voice/transcribe', voiceUpload.single('audio'), async (req, res) 
 
     const lang2 = language.split('-')[0]; // 'en-US' → 'en'
 
+    // A short domain prompt biases the model toward wellness vocabulary
+    // (sets/reps/weights, foods/calories, hydration, sleep, mood, fasting) so
+    // it doesn't mishear coach-specific terms. OpenAI's `prompt` param is the
+    // recommended accuracy lever; the per-agent client lexicons still run after.
+    const prompt =
+      'Wellness voice log. Likely terms: workout, sets, reps, kg, lb, RPE, ' +
+      'calories, protein, grams, ounces, water, ml, glasses, sleep, bedtime, ' +
+      'wake, mood, anxiety, gratitude, fasting, hours.';
+
     const result = await client.audio.transcriptions.create({
       file,
-      model: 'whisper-1',
+      model: AI.TRANSCRIBE,      // registry default = gpt-4o-transcribe (more accurate than whisper-1)
       language: lang2,
+      prompt,
       response_format: 'json',
     });
 
