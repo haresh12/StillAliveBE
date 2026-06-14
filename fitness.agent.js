@@ -26,6 +26,10 @@ const { resolveAnchor } = require("./lib/user-anchor");
 const { assertLoggableDate, sendLogGuardError } = require("./lib/log-guard");
 const crypto = require("crypto");
 const { computeFitnessScore: _computeFitnessScore } = require('./lib/agent-scores');
+// big-change: route the user root through the namespace wrapper so all fitness data
+// lands in wellness_bc_* (DATA_NAMESPACE defaults to 'bc'). Live wellness_* is untouched.
+const { ns: bcNs, userDoc: bcUserDoc } = require("./lib/collections");
+const { domainHealth, domainHealthView, domainHealthText, domainHealthQualityByDate } = require("./lib/hk-domain"); // Apple Health recovery/steps/workouts (null if no HK)
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const db = () => admin.firestore();
@@ -85,7 +89,7 @@ const ACTION_LOOKBACK_DAYS = 30;
 // ----------------------------------------------------------------
 // Firestore paths
 // ----------------------------------------------------------------
-const userDoc = (id) => db().collection("wellness_users").doc(id);
+const userDoc = (id) => bcUserDoc(id); // → wellness_bc_users (big-change namespace)
 const fitnessDoc = (id) => userDoc(id).collection("agents").doc("fitness");
 const workoutsCol = (id) => fitnessDoc(id).collection("fitness_workouts");
 const actionsCol = (id) => fitnessDoc(id).collection("fitness_actions");
@@ -169,9 +173,11 @@ const _v2Hooks = mountActionRoutes(router, {
   },
 });
 function _onFitnessLog(deviceId) {
-  fitnessDoc(deviceId).update({
+  // .set(merge) not .update(): on a brand-new user the fitness doc may not exist yet, and an
+  // .update() would throw NOT_FOUND (silently dropping the count). merge creates-or-updates.
+  fitnessDoc(deviceId).set({
     log_count_since_last_batch: admin.firestore.FieldValue.increment(1),
-  }).catch(() => {});
+  }, { merge: true }).catch(() => {});
   _v2Hooks.queueGeneration(deviceId);
   _gradeActionsShared({
     agentName: 'fitness', deviceId, actionsCol, logsCol: workoutsCol,
@@ -1588,10 +1594,11 @@ function tryReserveProactiveSlot(deviceId) {
 async function checkProactiveBudgetFromDB(deviceId) {
   try {
     const sinceMs = Date.now() - 24 * 3600 * 1000;
+    // Single-field where only (NO composite index — law). No limit + no orderBy: an unordered limit would
+    // return an ARBITRARY slice (not the newest), under-counting today and defeating the cap. Proactive is
+    // capped ~1/day so the set is tiny; the loop derives todayCount + latestMs from the full set.
     const snap = await chatsCol(deviceId)
       .where("is_proactive", "==", true)
-      .orderBy("created_at", "desc")
-      .limit(5)
       .get();
     let todayCount = 0;
     let latestMs = 0;
@@ -1761,17 +1768,17 @@ async function refreshFitnessScore(deviceId) {
   const result = _computeFitnessScore({ consistency, volume, progression, intensity, days_logged });
   if (!result) return;
 
-  await fitnessDoc(deviceId).update({
+  await fitnessDoc(deviceId).set({
     current_score:    result.score,
     score_label:      result.label,
     score_components: result.components,
     score_updated_at: admin.firestore.FieldValue.serverTimestamp(),
-  });
+  }, { merge: true }); // set+merge: the fitness doc may not exist yet for a new user
 }
 
 // POST /log — log a workout session
 router.post("/log", async (req, res) => {
-  const { deviceId, exercises, date } = req.body;
+  const { deviceId, exercises, date, duration_min } = req.body;
   if (!deviceId) return res.status(400).json({ error: "deviceId required" });
   if (!Array.isArray(exercises) || exercises.length === 0) {
     return res.status(400).json({ error: "exercises array required" });
@@ -1787,6 +1794,8 @@ router.post("/log", async (req, res) => {
     const enriched = exercises.map((ex) => ({
       name: ex.name || "Unknown",
       muscle_group: detectMuscleGroup(ex.name),
+      // Preserve entry_type so analysis/UI know how to read this exercise (strength/cardio/time/etc).
+      ...(ex.entry_type ? { entry_type: ex.entry_type } : {}),
       sets: (ex.sets || []).map((s) => {
         const reps = parseInt(s.reps, 10) || 0;
         const weight_kg = parseFloat(s.weight_kg) || 0;
@@ -1795,7 +1804,28 @@ router.post("/log", async (req, res) => {
         const e1rm = weight_kg > 0 && reps > 0
           ? Math.round(weight_kg * (1 + 0.0333 * reps) * 10) / 10
           : null;
-        return { reps, weight_kg, ...(rpe != null ? { rpe } : {}), ...(e1rm != null ? { e1rm } : {}) };
+        // Non-weight/reps dimensional fields (cardio/time/interval/carry). These were being
+        // DROPPED — a plank's seconds, a run's distance, a HIIT's rounds all vanished on save.
+        const opt = (v) => {
+          if (v == null || v === '') return null;
+          const n = parseFloat(v);
+          return Number.isFinite(n) ? n : null;
+        };
+        const duration_sec = opt(s.duration_sec);
+        const distance_m = opt(s.distance_m);
+        const rounds = opt(s.rounds);
+        const work_sec = opt(s.work_sec);
+        const rest_sec = opt(s.rest_sec);
+        return {
+          reps, weight_kg,
+          ...(rpe != null ? { rpe } : {}),
+          ...(e1rm != null ? { e1rm } : {}),
+          ...(duration_sec != null ? { duration_sec } : {}),
+          ...(distance_m != null ? { distance_m } : {}),
+          ...(rounds != null ? { rounds } : {}),
+          ...(work_sec != null ? { work_sec } : {}),
+          ...(rest_sec != null ? { rest_sec } : {}),
+        };
       }),
     }));
 
@@ -1809,21 +1839,54 @@ router.post("/log", async (req, res) => {
 
     const workoutRef = workoutsCol(deviceId).doc();
 
-    // ONE write — this is the only thing blocking the response
+    // Optional session duration (minutes) — user-entered or parsed from voice ("trained ~45 min").
+    const durMin = (() => {
+      const n = parseInt(duration_min, 10);
+      return Number.isFinite(n) && n > 0 ? Math.min(600, n) : null;
+    })();
+
+    // ONE write — this is the only thing blocking the response. `logged_at` is the canonical recency
+    // field every workout query orders by; `created_at` is written too for schema parity with the
+    // other collections (chats/templates/body) and the future analysis system.
+    const _now = admin.firestore.FieldValue.serverTimestamp();
     await workoutRef.set({
       date: workoutDate,
       exercises: enriched,
       total_sets: totalSets,
       total_volume_kg: round(totalVolume, 1),
+      ...(durMin != null ? { duration_min: durMin } : {}),
       personal_records: [],          // filled in by background job
-      logged_at: admin.firestore.FieldValue.serverTimestamp(),
+      logged_at: _now,
+      created_at: _now,
     });
 
-    // Respond immediately — client gets confirmation in ~300ms
+    // Auto-save into the weekday's saved workout. Same-day logs APPEND (the whole Friday builds up);
+    // a new weekday that MATCHES refreshes; a new weekday that DIFFERS returns a conflict so the FE
+    // can ask "Add / Replace / Just this once" instead of silently overriding the routine. Only one
+    // fast read blocks the response (the write is fire-and-forget) so logging stays snappy.
+    // Logging now AUTO-APPENDS extra exercises to that weekday's plan (no conflict prompt) and tells the
+    // FE what was added so it can show "Added X to your Friday 💪 (undo)".
+    let appended_to_plan = null;
+    try {
+      const dow = new Date(`${workoutDate}T12:00:00Z`).getUTCDay();
+      if (Number.isInteger(dow)) {
+        const r = await _tpl.applyDayLog(deviceId, dow, enriched, workoutDate);
+        if (r && r.appended && Array.isArray(r.added) && r.added.length) {
+          appended_to_plan = { dow, day_name: r.day_name, added: r.added };
+        }
+      }
+    } catch (_) {}
+
+    // Detect PRs synchronously (one history read) so the client can celebrate immediately.
+    let prs = [];
+    try { prs = await detectPRs(deviceId, enriched); } catch (_) {}
+
     res.json({
       success: true,
       workout_id: workoutRef.id,
       total_volume_kg: round(totalVolume, 1),
+      personal_records: prs,
+      appended_to_plan,
     });
 
     // ── Background work (does NOT block the response) ──────────
@@ -1831,8 +1894,7 @@ router.post("/log", async (req, res) => {
     invalidateAnalysisCache(deviceId);
     setImmediate(async () => {
       try {
-        const [prs, fSnap, streakSnap] = await Promise.all([
-          detectPRs(deviceId, enriched),
+        const [fSnap, streakSnap] = await Promise.all([
           fitnessDoc(deviceId).get(),
           workoutsCol(deviceId).orderBy("logged_at", "desc").limit(60).get(),
         ]);
@@ -1845,15 +1907,35 @@ router.post("/log", async (req, res) => {
 
         const bgBatch = [];
 
-        // Update workout doc with detected PRs
-        if (prs.length > 0) {
-          bgBatch.push(workoutRef.update({ personal_records: prs }));
-        }
+        // Update the workout doc with detected PRs + the quality/intensity fields the analysis
+        // reads (session_quality, rpe_avg). These were only ever written by /session/end, so
+        // builder-logged workouts had neither → analysis fell back to constants (60 / 7) and the
+        // quality dimension was flat. Computed here (not on the blocking write) to keep /log fast;
+        // mirrors the /session/end formula (50 volume vs 7-session avg + 50 effort from RPE).
+        const pastVols = streakSnap.docs
+          .filter((d) => d.id !== workoutRef.id)
+          .map((d) => (d.data().total_volume_kg || 0))
+          .filter((v) => v > 0);
+        const avgPastVol = pastVols.length
+          ? pastVols.reduce((a, b) => a + b, 0) / pastVols.length
+          : Math.max(totalVolume * 0.8, 1);
+        const rpes = [];
+        enriched.forEach((ex) => (ex.sets || []).forEach((st) => { if (st.rpe) rpes.push(st.rpe); }));
+        const avgRpe = rpes.length ? rpes.reduce((a, b) => a + b, 0) / rpes.length : null;
+        const volScore = Math.min(50, Math.round((totalVolume / Math.max(avgPastVol, 1)) * 30));
+        const effortScore = avgRpe != null ? Math.round((avgRpe - 1) * (50 / 9)) : 25;
+        const session_quality = Math.max(0, Math.min(100, volScore + effortScore));
+        const workoutUpdate = { session_quality };
+        if (avgRpe != null) workoutUpdate.rpe_avg = Math.round(avgRpe * 10) / 10;
+        if (prs.length > 0) workoutUpdate.personal_records = prs;
+        bgBatch.push(workoutRef.update(workoutUpdate));
 
         // ── Cross-agent fitness snapshot (readable by Home + Insights) ──
         const muscleGroupsToday = [...new Set(enriched.map(e => e.muscle_group).filter(m => m && m !== 'other'))];
         bgBatch.push(
-          fitnessDoc(deviceId).update({
+          // set+merge (NOT update) — a brand-new user may not have a fitness doc yet, and update()
+          // throws "5 NOT_FOUND: No document to update". set+merge creates it if missing.
+          fitnessDoc(deviceId).set({
             workout_count_since_last_batch: shouldGenerate ? 0 : count,
             fitness_snapshot: {
               last_workout_date: workoutDate,
@@ -1870,7 +1952,7 @@ router.post("/log", async (req, res) => {
               training_level: setup.training_level || 'intermediate',
               snapshot_at: new Date().toISOString(),
             },
-          }),
+          }, { merge: true }),
         );
 
         // ── PROACTIVE GATE — at most ONE chat ping per workout ──
@@ -2046,13 +2128,16 @@ router.post("/session/end", async (req, res) => {
 
       // Session quality score 0-100 (50 volume + 50 effort)
       // Volume: vs user's 7d avg (capped). Effort: RPE 1-10 → 0-50.
+      // Single-field where + in-memory sort (NO composite index — law). Fetch ended sessions, take the 7
+      // most recent by ended_at in JS.
       const recentSessions = await sessionsCol(deviceId)
         .where("status", "==", "ended")
-        .orderBy("ended_at", "desc")
-        .limit(7)
         .get()
         .catch(() => ({ docs: [] }));
-      const past = recentSessions.docs.map(d => d.data());
+      const past = recentSessions.docs
+        .map(d => d.data())
+        .sort((a, b) => getMillis(b.ended_at) - getMillis(a.ended_at))
+        .slice(0, 7);
       const avgPastVol = past.length
         ? past.reduce((a, p) => a + (p.total_volume_kg || 0), 0) / past.length
         : Math.max(totalVolume * 0.8, 1);
@@ -2152,15 +2237,15 @@ router.post('/reflection', async (req, res) => {
     try { target = assertLoggableDate(date, anchor); }
     catch (e) { return sendLogGuardError(res, e); }
 
-    // Attach to latest matching workout doc (best effort)
+    // Attach to latest matching workout doc (best effort). Single-field where + in-memory pick of the
+    // newest by logged_at (NO composite index — law).
     const snap = await workoutsCol(deviceId)
       .where('date', '==', target)
-      .orderBy('logged_at', 'desc')
-      .limit(1)
       .get()
       .catch(() => ({ empty: true, docs: [] }));
-    if (!snap.empty) {
-      await snap.docs[0].ref.update({
+    const latestDoc = (snap.docs || []).slice().sort((a, b) => getMillis(b.data().logged_at) - getMillis(a.data().logged_at))[0];
+    if (latestDoc) {
+      await latestDoc.ref.update({
         reflection: trimmed,
         reflection_at: admin.firestore.FieldValue.serverTimestamp(),
       });
@@ -2189,6 +2274,10 @@ router.post('/reflection', async (req, res) => {
 router.post("/describe", async (req, res) => {
   try {
     const { deviceId, transcript } = req.body || {};
+    // The user's weight unit (kg / lb). Drives how BARE weights ("bench 185", no unit
+    // word) are read — US/Canada lifters say pounds without saying "pounds". Defaults to
+    // kg so older callers that don't pass it behave exactly as before (no regression).
+    const unit = (req.body && req.body.unit) === "lb" ? "lb" : "kg";
     if (!deviceId)               return res.status(400).json({ error: "deviceId required" });
     if (!transcript || typeof transcript !== "string") {
       return res.status(400).json({ error: "transcript required" });
@@ -2282,14 +2371,36 @@ router.post("/describe", async (req, res) => {
       '- "raps" → "reps"',
       '- "bench priest" / "bench breast" → "bench press"',
       '- "dead lift" / "deadlift" → "deadlift"',
-      '- "twenty two five" / "22 5" → "22.5" (decimal weights)',
-      '- Decimal kilos in fitness contexts: 1.25, 2.5, 7.5, 22.5, 27.5, etc.',
+      '- COMPOUND spoken numbers are WHOLE numbers: "two twenty five" → 225,',
+      '  "one thirty five" → 135, "two oh five" → 205, "three fifteen" → 315,',
+      '  "ninety five" → 95, "a hundred"/"one hundred" → 100. A real decimal ONLY',
+      '  when the user says "point" ("two point five" → 2.5) OR it is a micro-plate',
+      '  ("twenty two five" → 22.5, i.e. add weight 22.5). NEVER read a barbell weight',
+      '  as a tiny decimal like 2.25 / 1.35 — that is a misheard 225 / 135.',
       'KEEP user wording intact in `session_notes`; correct only inside the',
       'structured fields. Never invent numbers or exercises that were not said.',
       '',
       'RULES:',
       '- Numbers can be spelled ("three sets") or digits ("3 sets") — handle both.',
-      '- Weight unit defaults to kg unless user says "lbs" or "pounds".',
+      '- WEIGHT UNITS — output `weight_kg` ALWAYS in canonical KILOGRAMS:',
+      `  • The user's preferred unit is "${unit}". A BARE weight with no unit word`,
+      `    (e.g. "bench 185", "squat 2 25") is in ${unit.toUpperCase()} — do NOT assume kg`,
+      '    when the user logs in lb. US/Canada/UK lifters usually say pounds with no word.',
+      '  • Recognise these spoken unit words (and ASR variants) and convert to kg:',
+      '    kilos / kilo / kilogram(s) / kg / kgs / "k" ("80 k") → kg (already kg);',
+      '    pounds / pound / lbs / lb / "#" → multiply by 0.453592;',
+      '    stone / st (UK/Ireland BODYWEIGHT only, "13 stone", "13 st 4 lb"; 1 stone = 14 lb',
+      '    = 6.35029 kg) → convert to kg. Never apply stone to a lift, only bodyweight.',
+      `  • If preferred unit is lb and the weight is bare, treat the number as lb and`,
+      '    convert (e.g. "bench 185" → weight_kg ≈ 83.9). Round kg to 1 decimal.',
+      '  • Bodyweight moves stay weight_kg: 0 (see below) regardless of unit.',
+      '- SANITY-CHECK like a gym trainer: a barbell compound (squat/bench/deadlift/row/',
+      '  overhead press/hip thrust/clean) is loaded on a ~20kg/45lb bar — a working weight',
+      '  is essentially never below the empty bar. If your parse lands implausibly low for',
+      '  such a lift (e.g. 2.3, 1.35, 4.5), you misheard a compound number — fix it before',
+      '  output (2.3 → 225, 1.35 → 135). Dumbbell/cable/accessory moves CAN be light; do not',
+      '  over-correct those.',
+      '- "N sets of M" / "N by M" expands to N sets of M reps each — never one set.',
       '- If user says "felt heavy" / "barely got the last rep" → rir: 0',
       '- "Could have done 2-3 more" → rir: 2 (mid-point)',
       '- "Easy" → rir: 4',
@@ -2636,7 +2747,12 @@ router.get("/today", async (req, res) => {
   const { deviceId } = req.query;
   if (!deviceId) return res.status(400).json({ error: "deviceId required" });
   try {
-    const today = dateStr();
+    // "Today" MUST be the user's LOCAL day — /log writes the user-local date (offset-aware), so reading
+    // with a bare UTC dateStr() showed the wrong/empty day for anyone not on UTC. Mirror the write path.
+    const anchor = await resolveAnchor(deviceId);
+    const off = anchor?.utcOffsetMinutes || 0;
+    const { dateStr: tzDateStr } = require("./lib/range-helpers");
+    const today = tzDateStr(new Date(), off);
     const cutoff29 = new Date();
     cutoff29.setDate(cutoff29.getDate() - 29);
     // Widen to 42 days so the same-day-last-week suggestion has 5-6 prior
@@ -2645,18 +2761,24 @@ router.get("/today", async (req, res) => {
     cutoff42.setDate(cutoff42.getDate() - 41);
 
     // Parallel — all Firestore reads fire simultaneously (no sequential round trips)
-    const [todaySnap, calSnap, dowSnap, lastSnap, fDoc, wHistSnap, crossAgentResults] = await Promise.all([
+    const [todaySnap, calSnap, dowSnap, lastSnap, fDoc, wHistSnap, crossAgentResults, obSnap] = await Promise.all([
       workoutsCol(deviceId).where("date", "==", today).get(),
-      workoutsCol(deviceId).where("date", ">=", dateStr(cutoff29)).get(),
+      workoutsCol(deviceId).where("date", ">=", tzDateStr(cutoff29, off)).get(),
       // Wider pull just for the same-day-last-week feature
-      workoutsCol(deviceId).where("date", ">=", dateStr(cutoff42)).get().catch(() => ({ docs: [] })),
+      workoutsCol(deviceId).where("date", ">=", tzDateStr(cutoff42, off)).get().catch(() => ({ docs: [] })),
       workoutsCol(deviceId).orderBy("logged_at", "desc").limit(5).get(),
       fitnessDoc(deviceId).get(),
       workoutsCol(deviceId).orderBy('logged_at', 'desc').limit(20).get().catch(() => ({ docs: [] })),
       // Cross-agent law: read pre-computed signals from cross_agent/today_signals
       // (single sandbox-safe collection). wellness.cross.js writes the data there.
       userDoc(deviceId).collection('cross_agent').doc('today_signals').get().catch(() => null),
+      // Onboarding body weight — the real load for bodyweight moves in the chat logger.
+      db().collection("wellness_bc_onboarding").doc(deviceId).get().catch(() => null),
     ]);
+    const bodyweight_kg = (() => {
+      const w = obSnap && obSnap.exists ? Number(obSnap.data().weight_kg) : 0;
+      return w > 0 ? Math.round(w) : null;
+    })();
     const todayDocs = todaySnap.docs.slice().sort((a, b) => {
       const ta = getMillis(a.data().logged_at);
       const tb = getMillis(b.data().logged_at);
@@ -2666,12 +2788,26 @@ router.get("/today", async (req, res) => {
       todayDocs.length === 0
         ? null
         : (() => {
-            const d = todayDocs[0].data();
+            // Combine EVERY log from today — people log multiple times a day (cardio now, bench later,
+            // a quick ab set tonight). "What did I do today" must reflect the WHOLE day, not just the
+            // most recent entry. Concatenate all exercises and sum the totals across every today doc.
+            const exercises = [];
+            let total_sets = 0;
+            let total_volume_kg = 0;
+            const personal_records = [];
+            for (const doc of todayDocs) {
+              const d = doc.data();
+              for (const ex of d.exercises || []) exercises.push(ex);
+              total_sets += d.total_sets || 0;
+              total_volume_kg += d.total_volume_kg || 0;
+              for (const pr of d.personal_records || []) personal_records.push(pr);
+            }
             return {
-              exercises: d.exercises || [],
-              total_sets: d.total_sets || 0,
-              total_volume_kg: d.total_volume_kg || 0,
-              personal_records: d.personal_records || [],
+              exercises,
+              total_sets,
+              total_volume_kg: Math.round(total_volume_kg),
+              personal_records,
+              log_count: todayDocs.length, // how many separate times they logged today
             };
           })();
 
@@ -2978,6 +3114,7 @@ router.get("/today", async (req, res) => {
     }
 
     return res.json({
+      health_view: await domainHealthView(deviceId, 'fitness', 7).catch(() => null), // Apple Health Body Signals (today tiles)
       today_workout: todayWorkout,
       calendar_days: calendarDays,
       streak,
@@ -2988,6 +3125,7 @@ router.get("/today", async (req, res) => {
       readiness_score,
       progression_suggestions,
       same_day_suggestion,
+      bodyweight_kg,
     });
   } catch (e) {
     log.error("[fitness] today:", e);
@@ -3159,10 +3297,15 @@ const _VOLUME_LANDMARKS = {
   chest:      { mev: 10, mav: [12, 16], mrv: 20 },
   back:       { mev: 10, mav: [14, 22], mrv: 25 },
   shoulders:  { mev: 8,  mav: [16, 22], mrv: 26 },
-  legs:       { mev: 8,  mav: [12, 18], mrv: 20 },
+  // Lower body is logged per-head (quads/hamstrings/glutes) — matching detectMuscleGroup, never a
+  // generic "legs" (which nothing maps to, so it always read 0 and hid all leg training).
+  quads:      { mev: 8,  mav: [12, 18], mrv: 20 },
+  hamstrings: { mev: 6,  mav: [10, 16], mrv: 20 },
+  glutes:     { mev: 6,  mav: [8, 14],  mrv: 16 },
   biceps:     { mev: 8,  mav: [14, 20], mrv: 26 },
   triceps:    { mev: 8,  mav: [14, 20], mrv: 26 },
   calves:     { mev: 8,  mav: [12, 16], mrv: 20 },
+  abs:        { mev: 6,  mav: [12, 20], mrv: 25 },
 };
 
 function computeMuscleVolume(workouts, rangeDays) {
@@ -3360,37 +3503,34 @@ async function _generateFitnessV2Insights(deviceId, range, ctx) {
     : 'No major skip pattern.';
 
   const systemPrompt = [
-    'You are a sharp fitness coach generating analysis insights for the user.',
+    "You are the user's personal fitness coach, writing the read-out of their training in PLAIN, EVERYDAY ENGLISH — like texting a friend who knows nothing about gym science, not writing a textbook.",
     'Output STRICT JSON only. No prose, no markdown.',
     '',
     'You will receive aggregated training data + cross-agent context (sleep, mind, nutrition, water).',
     'Generate exactly 3 ai_reads + 3 aha_moments + 1 hero_headline.',
     '',
     'AI READS (one each, exactly these kinds):',
-    '  - { kind: "champion", title, body, action }     — biggest signal of working',
-    '  - { kind: "drag",     title, body, action }     — biggest gap / bottleneck',
-    '  - { kind: "pattern",  title, body, action }     — behavioral or cross-agent pattern',
-    '  Title = ≤9 words. Body = ≤40 words, cite real numbers from the data. Action = ≤14 words, imperative.',
+    '  - { kind: "champion", title, body, action }     — the biggest thing they are doing WELL',
+    '  - { kind: "drag",     title, body, action }     — the biggest thing to FIX (their weak spot)',
+    '  - { kind: "pattern",  title, body, action }     — a habit or pattern worth pointing out',
+    '  Title = the PUNCHY HEADLINE shown to the user: ≤6 words, LEADS WITH THE NUMBER, no fluff ("Chest: 4 of 10 sets", "Bench up 12%", "12,500 kg this week", "5-day streak"). This is what they scan. Body = the short why / what it means, ≤18 words plain (shown only when they tap for detail). Action = ≤12 words, a clear next step.',
     '',
-    'AHA MOMENTS (3 observations):',
-    '  - { kpi, body }',
-    '  KPI = short headline ("Volume +18% in 30 days"). Body = ≤30 words explaining.',
+    'AHA MOMENTS (3 short observations): { kpi, body }. KPI = short plain headline ("Volume up 18% this month"). Body = ≤25 words, plain.',
     '',
-    'HERO HEADLINE: One short factual sentence. ≤22 words. Cite real numbers.',
+    'HERO HEADLINE: one plain sentence on how things are going overall, ≤22 words, cite a real number.',
     '',
     'RULES:',
-    '- Use ONLY numbers from the provided data. Never invent values.',
-    '- If muscle is below MEV, that is the most likely "drag".',
-    '- If a strength trend is +5% or more, that is a strong "champion".',
-    '- If sleep < 60/100 avg, that is a top "pattern" candidate (recovery → wobble).',
-    '- If skip_pct ≥ 20% on a specific day, surface as a pattern.',
-    '- Tone: brutal-honest performance coach. No praise filler. No emojis.',
+    '- Use ONLY numbers from the provided data. NEVER invent a value, and NEVER cite a study or author.',
+    '- EVERY title MUST contain at least one SPECIFIC number from the data (sets, kg, %, days, reps) and lead with it — a headline with no number is useless. The body explains; the title is the scannable stat.',
+    '- BAN all jargon and lookalikes: MEV, MAV, MRV, hypertrophy, "progressive overload", "mechanical tension", stimulus, "volume load", adaptation, "working sets", automaticity, volatility, "session quality". Say it like a normal person: "the amount it takes to grow", "you got stronger", "your chest worked hard", "showing up regularly", "your sessions swing a lot in size", "how good your sessions felt".',
+    '- A muscle below the amount needed to grow is usually the "drag". A muscle getting enough work, or a lift that went up, makes a good "champion".',
+    '- Tone: warm, honest, encouraging — a coach who tells the truth kindly. No hype filler, no shaming, no emojis.',
   ].join('\n');
 
   const userPrompt = [
     `RANGE: last ${ctx.rangeDays} days.`,
     `SCORE: ${ctx.score}/100 (${ctx.grade}).`,
-    `STATS: ${ctx.days_logged} sessions, ${(ctx.total_volume_kg / 1000).toFixed(1)}T volume, avg ${ctx.avg_sets} sets/session, avg RPE ${ctx.avg_rpe}, avg quality ${ctx.avg_quality}/100, streak ${ctx.streak} days, volatility ${ctx.volatility_pct}%.`,
+    `STATS: ${ctx.sessions ?? ctx.days_logged} sessions, ${(ctx.total_volume_kg / 1000).toFixed(1)}T volume, avg ${ctx.avg_sets} sets/session, avg RPE ${ctx.avg_rpe}, avg quality ${ctx.avg_quality}/100, streak ${ctx.streak} days, volatility ${ctx.volatility_pct}%.`,
     `MUSCLE COVERAGE: ${muscleSnapshot}`,
     `STRENGTH DELTAS: ${strengthDelta || 'insufficient data'}`,
     `PRS THIS PERIOD: ${(ctx.prs_period || []).length}`,
@@ -3489,34 +3629,50 @@ async function _generateFitnessV2Insights(deviceId, range, ctx) {
 // ─── Fallbacks when LLM is unavailable / no key ─────────────
 function _fallbackAiReads(ctx) {
   const out = [];
-  // Champion: muscle in MAV with most sets
+  const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+  // Champion: a muscle getting enough work, OR a lift that went up.
   const champMuscle = (ctx.muscle_volume || []).find(m => m.status === 'in_mav' || m.status === 'mav_to_mrv');
-  if (champMuscle) {
+  const gainer = (ctx.strength_trend || []).find(t => t.delta_pct >= 3);
+  if (gainer) {
     out.push({
       kind: 'champion',
-      title: `${champMuscle.muscle.charAt(0).toUpperCase() + champMuscle.muscle.slice(1)} is your strongest signal`,
-      body:  `${champMuscle.weekly_sets} sets/wk in MAV range. Sustained volume here drives most of your hypertrophy gains.`,
-      action: `Keep ${champMuscle.muscle} sessions locked in.`,
+      title: `${cap(gainer.exercise)} up ${gainer.delta_pct}%`,
+      body:  `Your ${gainer.exercise.toLowerCase()} has climbed lately — you're genuinely getting stronger here.`,
+      action: `Keep adding a little each time it feels easy.`,
+    });
+  } else if (champMuscle) {
+    out.push({
+      kind: 'champion',
+      title: `${cap(champMuscle.muscle)}: ${champMuscle.weekly_sets} sets/week`,
+      body:  `That's right in the range that builds muscle — nicely on track.`,
+      action: `Keep your ${champMuscle.muscle} sessions going.`,
     });
   }
-  // Drag: muscle below MEV
+  // Drag: a muscle below the amount it takes to grow.
   const dragMuscle = (ctx.muscle_volume || []).find(m => m.status === 'below_mev' || m.status === 'mev_to_mav');
   if (dragMuscle) {
     out.push({
       kind: 'drag',
-      title: `${dragMuscle.muscle.charAt(0).toUpperCase() + dragMuscle.muscle.slice(1)} volume is your bottleneck`,
-      body:  `Only ${dragMuscle.weekly_sets} sets/wk — below MEV (${dragMuscle.mev}). Imbalance compounds over weeks.`,
-      action: `Add 4 sets to a ${dragMuscle.muscle} day.`,
+      title: `${cap(dragMuscle.muscle)}: ${dragMuscle.weekly_sets} of ~${dragMuscle.mev} sets`,
+      body:  `Your ${dragMuscle.muscle} is under the work it takes to grow — the weak spot to close.`,
+      action: `Add a few more ${dragMuscle.muscle} sets next session.`,
     });
   }
-  // Pattern: skip
-  const skipTop = ctx.skip_pattern?.days?.[0];
-  if (skipTop && skipTop.skip_pct >= 20) {
+  // Pattern: consistency — the reliable signal (streak / weekly frequency), not the shaky skip metric.
+  const sess = ctx.sessions ?? ctx.days_logged ?? 0;
+  if (ctx.streak >= 3) {
     out.push({
       kind: 'pattern',
-      title: `${skipTop.label}s are your most-skipped day`,
-      body:  `${skipTop.skip_pct}% miss rate over the period. Pattern compounds — one missed session a week = ~50 fewer sets per quarter.`,
-      action: `Block ${skipTop.label}s on the calendar this week.`,
+      title: `You're on a ${ctx.streak}-day streak`,
+      body:  `Training ${ctx.streak} days in a row — showing up regularly is what actually drives results over time.`,
+      action: `Keep it going today if you can.`,
+    });
+  } else if (sess >= 1) {
+    out.push({
+      kind: 'pattern',
+      title: `${sess} ${sess === 1 ? 'session' : 'sessions'} this stretch`,
+      body:  `Steady beats intense. A regular couple of sessions a week adds up faster than the odd big one.`,
+      action: `Aim to match or beat it next week.`,
     });
   }
   return out;
@@ -3526,21 +3682,21 @@ function _fallbackAhaMoments(ctx) {
   const out = [];
   if (ctx.prs_period?.length >= 1) {
     out.push({
-      kpi:  `${ctx.prs_period.length} PR${ctx.prs_period.length > 1 ? 's' : ''} in ${ctx.rangeDays} days`,
-      body: `Recent personal records show progressive overload is intact. Top: ${ctx.prs_period[0].exercise} at ${ctx.prs_period[0].weight_kg}kg × ${ctx.prs_period[0].reps}.`,
+      kpi:  `${ctx.prs_period.length} personal best${ctx.prs_period.length > 1 ? 's' : ''} in ${ctx.rangeDays} days`,
+      body: `You're setting new records — a clear sign you're getting stronger. Best one: ${ctx.prs_period[0].exercise} at ${ctx.prs_period[0].weight_kg}kg × ${ctx.prs_period[0].reps}.`,
     });
   }
   if (ctx.streak >= 7) {
     out.push({
-      kpi:  `${ctx.streak}-day training streak`,
-      body: `Past 14 days = automaticity threshold (Lally 2010). Habit cost drops; you train without deciding.`,
+      kpi:  `${ctx.streak}-day streak`,
+      body: `Once you pass about two weeks, training stops feeling like a decision and starts being a habit. You're there.`,
     });
   }
   if (ctx.strength_trend?.[0]?.delta_pct > 3) {
     const t = ctx.strength_trend[0];
     out.push({
-      kpi:  `${t.exercise} ${t.delta_pct > 0 ? '+' : ''}${t.delta_pct}% in ${ctx.rangeDays}d`,
-      body: `Linear progression intact. Helms 2019 MASS — ${t.delta_pct >= 1 ? '1%+/wk = elite' : 'closer to plateau'}.`,
+      kpi:  `${t.exercise} up ${t.delta_pct}%`,
+      body: `Your ${t.exercise.toLowerCase()} has climbed ${t.delta_pct}% lately — steady, real progress. Keep nudging it up.`,
     });
   }
   return out;
@@ -3553,7 +3709,7 @@ function _fallbackHeadline(ctx) {
   const champMuscle = (ctx.muscle_volume || []).find(m => m.status === 'in_mav' || m.status === 'mav_to_mrv');
   const parts = [];
   if (prs > 0) parts.push(`${prs} PR${prs > 1 ? 's' : ''}`);
-  parts.push(`${ctx.days_logged} sessions`);
+  parts.push(`${ctx.sessions ?? ctx.days_logged} sessions`);
   parts.push(`${tons}T volume`);
   let tail = '';
   if (champMuscle) tail = `${champMuscle.muscle.charAt(0).toUpperCase() + champMuscle.muscle.slice(1)} firing.`;
@@ -3578,20 +3734,25 @@ router.get("/analysis", async (req, res) => {
     // Fetch wide enough to cover anchor → today for lifetime calc,
     // then filter to the requested window for the chart payload.
     const lifetimeFetchLimit = Math.min(Math.max(win.daysSinceAnchor * 3, rangeDays * 3, 200), 2000);
-    const [fSnap, wSnap] = await Promise.all([
+    const [fSnap, wSnap, obSnap] = await Promise.all([
       fitnessDoc(deviceId).get(),
       workoutsCol(deviceId)
         .orderBy("logged_at", "desc")
         .limit(lifetimeFetchLimit)
         .get()
         .catch(() => ({ docs: [] })),
+      // Onboarding profile carries the user's body weight — the REAL load for bodyweight lifts
+      // (pull-ups/push-ups), so we never show a nonsensical "0 kg" for them.
+      db().collection("wellness_bc_onboarding").doc(deviceId).get().catch(() => null),
     ]);
+    const onboarding = obSnap && obSnap.exists ? (obSnap.data() || {}) : {};
+    const bodyweight_kg = Number(onboarding.weight_kg) > 0 ? Math.round(Number(onboarding.weight_kg)) : null;
 
-    if (!fSnap.exists || !fSnap.data()?.setup_completed) {
-      return res.json({ setup_completed: false });
-    }
-
-    const setup = fSnap.data();
+    // NOTE: big-change users complete onboarding in the wellness_bc_users PARENT doc, not via
+    // the legacy fitness /setup flow — so the fitness agent subdoc never carries `setup_completed`.
+    // NEVER hard-block analysis on it: anyone who logged a workout has data worth analyzing. The
+    // genuine "no data yet" case is handled below by the `workouts.length === 0` empty-state return.
+    const setup = (fSnap.exists ? fSnap.data() : null) || {};
     const allWorkouts = wSnap.docs.map((d) => d.data());
     // Lifetime set = all workouts since anchor (used only for score_lifetime).
     const anchorMsLocal = anchor.anchorMs || 0;
@@ -3602,6 +3763,8 @@ router.get("/analysis", async (req, res) => {
     const workouts = allWorkouts.filter((w) => getMillis(w.logged_at) >= cutoffMs);
 
     if (workouts.length === 0) {
+      const _hkP = domainHealth(deviceId, 'fitness').catch(() => null);
+      const _hkViewP = domainHealthView(deviceId, 'fitness', win.requestedDays).catch(() => null);
       return res.json({
         setup_completed: true,
         range,
@@ -3610,6 +3773,8 @@ router.get("/analysis", async (req, res) => {
         days_since_anchor: win.daysSinceAnchor,
         anchor_date: anchor.anchorDateStr,
         is_clamped: win.isClamped,
+        health: await _hkP,
+        health_view: await _hkViewP, // Apple Health — even on day 0
         score_today: null,
         score_lifetime: null,
         missed_days: 0,
@@ -3631,14 +3796,23 @@ router.get("/analysis", async (req, res) => {
         // hit `undefined.length` on Day 0. (Keeps Day 0 response parallel
         // to non-zero days for safer FE consumption.)
         muscle_volume: [],
-        skip_pattern:  [],
+        skip_pattern:  { days: [], insight: '' },
         prs_period:    [],
         strength_trend: [],
+        effort_mix:      { total_n: 0, hard_n: 0, light_n: 0, allout_n: 0, hard_pct: 0, light_pct: 0, allout_pct: 0 },
+        push_pull_legs:  null,
+        muscle_frequency: [],
+        vs_prior:        null,
+        delta_vol_pct:   null,
+        delta_sets_pct:  null,
+        delta_prs_abs:   null,
+        form:            null,
         peak_hour_session_count: 0,
         hero_insight: { headline: "Log your first session — your score, signal, and AI reads come alive." },
         stats: {
-          days_logged: 0, total_logs: 0, total_volume_kg: 0, total_sets: 0,
-          avg_volume_kg: 0, avg_sets: 0, avg_quality: 0, avg_rpe: 0,
+          days_logged: 0, total_logs: 0, sessions: 0, total_volume_kg: 0, total_sets: 0,
+          avg_volume_kg: 0, avg_sets: 0, avg_quality: 0, avg_rpe: 0, avg_duration_min: null, unique_lifts: 0,
+          lifetime_sessions: 0, lifetime_days_active: 0, lifetime_hours: 0, bodyweight_kg,
           vol_hit_days: 0, sets_hit_days: 0,
         },
         vol_target: 4500,
@@ -3647,38 +3821,55 @@ router.get("/analysis", async (req, res) => {
     }
 
     // ── Aggregate signals ─────────────────────────────────────
+    // One point per LOG (session). When a day holds >1 log, suffix the label so the two sessions read
+    // as distinct points ("Jun 13", "Jun 13 (2)") instead of two dots stacked on the same x-label.
+    const _perDayCount = {};
     const signal_points = workouts
       .slice()
       .sort((a, b) => (a.date || "").localeCompare(b.date || ""))
-      .map((w) => ({
-        date:           w.date,
-        label:          new Date(w.date + "T12:00:00").toLocaleDateString("en", { month: "short", day: "numeric" }),
-        volume_kg:      w.total_volume_kg || 0,
-        sets:           w.total_sets || 0,
-        session_quality:w.session_quality || 60,
-        rpe_avg:        w.rpe_avg || 7,
-      }));
+      .map((w) => {
+        const baseLabel = new Date(w.date + "T12:00:00").toLocaleDateString("en", { month: "short", day: "numeric" });
+        const n = (_perDayCount[w.date] = (_perDayCount[w.date] || 0) + 1);
+        // Heaviest set in this log → the "Top" (strength) series, so the chart can show a strength curve.
+        const top_weight_kg = (w.exercises || []).reduce((mx, ex) => Math.max(mx, (ex.sets || []).reduce((m, st) => Math.max(m, st.weight_kg || 0), 0)), 0);
+        return {
+          date:           w.date,
+          label:          n > 1 ? `${baseLabel} (${n})` : baseLabel,
+          volume_kg:      w.total_volume_kg || 0,
+          sets:           w.total_sets || 0,
+          top_weight_kg,
+          session_quality:w.session_quality || 60,
+          rpe_avg:        w.rpe_avg || 7,
+        };
+      });
 
     const total_volume_kg = workouts.reduce((a, w) => a + (w.total_volume_kg || 0), 0);
     const total_sets      = workouts.reduce((a, w) => a + (w.total_sets || 0), 0);
-    const days_logged     = workouts.length;
-    const avg_volume_kg   = Math.round(total_volume_kg / Math.max(days_logged, 1));
-    const avg_sets        = Math.round(total_sets / Math.max(days_logged, 1));
-    const avg_quality     = Math.round(workouts.reduce((a, w) => a + (w.session_quality || 60), 0) / Math.max(days_logged, 1));
-    const avg_rpe         = +(workouts.reduce((a, w) => a + (w.rpe_avg || 7), 0) / Math.max(days_logged, 1)).toFixed(1);
+    // A "session" = ONE log (one workout doc). Logging bench (4 sets) is ONE session; logging bench,
+    // then logging squat 15 min later, is TWO sessions on the same day. So `sessions` counts logs, and
+    // every per-session average divides by the log count. `days_logged` (distinct calendar days) is kept
+    // separately for the calendar heatmap, journey grid, and streak — those are inherently day-based.
+    const days_logged     = new Set(workouts.map((w) => w.date).filter(Boolean)).size;
+    const sessions        = workouts.length; // one log = one session (the product's session philosophy)
+    const avg_volume_kg   = Math.round(total_volume_kg / Math.max(sessions, 1));
+    const avg_sets        = Math.round(total_sets / Math.max(sessions, 1));
+    const avg_quality     = Math.round(workouts.reduce((a, w) => a + (w.session_quality || 60), 0) / Math.max(sessions, 1));
+    const avg_rpe         = +(workouts.reduce((a, w) => a + (w.rpe_avg || 7), 0) / Math.max(sessions, 1)).toFixed(1);
 
-    // Daily logs map (last 35 days for calendar)
+    // Daily logs map (for calendar/journey day cells). A day can hold MORE THAN ONE log now (one log =
+    // one session), so ACCUMULATE volume/sets across that day's logs and average their quality —
+    // overwriting would under-report the day and contradict the (summed) stats totals.
     const daily_logs = {};
     workouts.forEach((w) => {
       if (!w.date) return;
-      const q = (w.session_quality || 60) >= 75 ? "good" : (w.session_quality || 60) >= 55 ? "ok" : "poor";
-      daily_logs[w.date] = {
-        has_log:         true,
-        quality:         q,
-        total_volume_kg: w.total_volume_kg || 0,
-        total_sets:      w.total_sets || 0,
-        session_quality: w.session_quality || 60,
-      };
+      const e = daily_logs[w.date] || { has_log: true, total_volume_kg: 0, total_sets: 0, _qSum: 0, _qN: 0, session_quality: 60, quality: "ok" };
+      e.total_volume_kg += w.total_volume_kg || 0;
+      e.total_sets      += w.total_sets || 0;
+      e._qSum += (w.session_quality || 60);
+      e._qN   += 1;
+      e.session_quality = Math.round(e._qSum / e._qN);
+      e.quality = e.session_quality >= 75 ? "good" : e.session_quality >= 55 ? "ok" : "poor";
+      daily_logs[w.date] = e;
     });
 
     const sortedByQ = workouts.slice().sort((a, b) => (b.session_quality || 0) - (a.session_quality || 0));
@@ -3710,6 +3901,10 @@ router.get("/analysis", async (req, res) => {
     workouts.forEach((w) => {
       (w.exercises || []).forEach((ex) => {
         if (!ex.name) return;
+        // Skip cardio — it has its OWN analysis section now. "Your lifts" is strength only, so a Run
+        // never shows up as "Heaviest 0 kg".
+        const _sets = ex.sets || [];
+        if (ex.entry_type === "DISTANCE_TIME" || ex.entry_type === "TIME" || _sets.some((s) => s.distance_m > 0 || s.duration_sec > 0)) return;
         const k = ex.name;
         if (!exMap[k]) exMap[k] = { name: k, count: 0, total_weight: 0, top_weight: 0, top_e1rm: 0, last_used: w.date, muscle: ex.muscle_group || "other" };
         exMap[k].count += (ex.sets?.length || 1);
@@ -3831,9 +4026,129 @@ router.get("/analysis", async (req, res) => {
     const prs_period     = computePRReel(workouts);
     const strength_trend = computeStrengthTrend(workouts, rangeDays);
 
+    // ── V4 parity fields (ported to match the old FitnessAnalysisTabV4 contract) ──
+    const weeksInRange = Math.max(1, rangeDays / 7);
+
+    // EFFORT MIX — RPE distribution across every set that carries an RPE. "Hard" = the 7-9
+    // growth window; light = warm-up territory (<7); all-out = 9.5+ (risky, rarely productive).
+    const effort_mix = (() => {
+      let light = 0, hard = 0, allout = 0;
+      workouts.forEach((w) => (w.exercises || []).forEach((ex) => (ex.sets || []).forEach((s) => {
+        const r = s.rpe;
+        if (r == null) return;
+        if (r >= 9.5)      allout++;
+        else if (r >= 7)   hard++;
+        else               light++;
+      })));
+      const total_n = light + hard + allout;
+      const pct = (n) => (total_n ? Math.round((n / total_n) * 100) : 0);
+      return { total_n, hard_n: hard, light_n: light, allout_n: allout, hard_pct: pct(hard), light_pct: pct(light), allout_pct: pct(allout) };
+    })();
+
+    // BALANCE — push/pull/legs split (by set count) + per-muscle weekly frequency. Reuses the
+    // canonical PUSH/PULL/LEG muscle maps so a gap (<20%) flags the same injury-risk warning as old.
+    const push_pull_legs = (() => {
+      const raw = { push: 0, pull: 0, legs: 0 };
+      workouts.forEach((w) => (w.exercises || []).forEach((ex) => {
+        const m = ex.muscle_group || '';
+        const n = ex.sets?.length || 0;
+        if (PUSH_MUSCLES.includes(m))      raw.push += n;
+        else if (PULL_MUSCLES.includes(m)) raw.pull += n;
+        else if (LEG_MUSCLES.includes(m))  raw.legs += n;
+      }));
+      const total = raw.push + raw.pull + raw.legs;
+      if (total === 0) return null;
+      const pct = (n) => Math.round((n / total) * 100);
+      return { push: { sets: raw.push, pct: pct(raw.push) }, pull: { sets: raw.pull, pct: pct(raw.pull) }, legs: { sets: raw.legs, pct: pct(raw.legs) } };
+    })();
+    const muscle_frequency = (() => {
+      const sessionsPerMuscle = {};
+      workouts.forEach((w) => {
+        const seen = new Set();
+        (w.exercises || []).forEach((ex) => { if (ex.muscle_group && _VOLUME_LANDMARKS[ex.muscle_group]) seen.add(ex.muscle_group); });
+        seen.forEach((m) => { sessionsPerMuscle[m] = (sessionsPerMuscle[m] || 0) + 1; });
+      });
+      return Object.entries(sessionsPerMuscle)
+        .map(([muscle, n]) => ({ muscle, per_week: Math.round((n / weeksInRange) * 10) / 10 }))
+        .sort((a, b) => b.per_week - a.per_week);
+    })();
+
+    // VS PRIOR PERIOD — this window vs the equal-length window immediately before it. `priorWorkouts`
+    // was already built above (for PR baselines); we add a prior-prior PR baseline to count prior PRs.
+    const vs_prior = (() => {
+      const priorVol  = priorWorkouts.reduce((a, w) => a + (w.total_volume_kg || 0), 0);
+      const priorSets = priorWorkouts.reduce((a, w) => a + (w.total_sets || 0), 0);
+      const priorSessions = priorWorkouts.length;
+      const priorPriorCutoff = Date.now() - rangeDays * 3 * 86400000;
+      const exPriorPriorMax = {};
+      allWorkouts.filter((w) => { const ms = getMillis(w.logged_at); return ms >= priorPriorCutoff && ms < priorCutoff; })
+        .forEach((w) => (w.exercises || []).forEach((ex) => {
+          if (!ex.name) return;
+          const max = (ex.sets || []).reduce((m, s) => Math.max(m, s.e1rm || 0), 0);
+          if (max > (exPriorPriorMax[ex.name] || 0)) exPriorPriorMax[ex.name] = max;
+        }));
+      let priorPRs = 0;
+      priorWorkouts.forEach((w) => (w.exercises || []).forEach((ex) => {
+        if (!ex.name) return;
+        const max = (ex.sets || []).reduce((m, s) => Math.max(m, s.e1rm || 0), 0);
+        if (max > (exPriorPriorMax[ex.name] || 0) && max > 0) priorPRs++;
+      }));
+      const currentPRs = Object.values(prsByExercise).reduce((a, b) => a + b, 0);
+      const pctDelta = (cur, prev) => (prev > 0 ? Math.round(((cur - prev) / prev) * 100) : null);
+      return {
+        delta_vol_pct:      pctDelta(total_volume_kg, priorVol),
+        delta_sets_pct:     pctDelta(total_sets, priorSets),
+        delta_sessions_pct: pctDelta(sessions, priorSessions),
+        delta_prs_abs:      currentPRs - priorPRs,
+        prior_vol_kg:       Math.round(priorVol),
+        prior_sets:         priorSets,
+        prior_sessions:     priorSessions,
+        prior_prs:          priorPRs,
+      };
+    })();
+
+    // READINESS (form band) — fitness-only training-load model (NO cross-agent reads — sandbox-safe).
+    // Daily load = volume (kg) as a TSS proxy; CTL (chronic, ~28d) and ATL (acute, ~7d) are EWMAs;
+    // TSB = CTL − ATL relative to CTL drives the band, matching the old Banister-style Readiness card.
+    const form = (() => {
+      const dayVol = {};
+      allWorkouts.forEach((w) => { if (w.date) dayVol[w.date] = (dayVol[w.date] || 0) + (w.total_volume_kg || 0); });
+      const today = new Date();
+      let ctl = 0, atl = 0;
+      const kC = 2 / (28 + 1), kA = 2 / (7 + 1);
+      for (let i = 41; i >= 0; i--) {
+        const d = new Date(today); d.setDate(d.getDate() - i);
+        const v = dayVol[dateStr(d)] || 0;
+        ctl += kC * (v - ctl);
+        atl += kA * (v - atl);
+      }
+      if (ctl <= 0 && atl <= 0) return null;
+      const tsb = ctl - atl;
+      const ratio = ctl > 0 ? tsb / ctl : 0;
+      let band = 'steady';
+      if (ratio >= 0.15)       band = 'peaked';
+      else if (ratio >= 0.05)  band = 'fresh';
+      else if (ratio > -0.05)  band = 'steady';
+      else if (ratio > -0.20)  band = 'building';
+      else if (ratio > -0.40)  band = 'overload';
+      else                     band = 'overreached';
+      const readiness = Math.min(100, Math.max(0, Math.round(50 + ratio * 200)));
+      return { band, readiness, chronic: Math.round(ctl), acute: Math.round(atl), tsb: Math.round(tsb) };
+    })();
+
+    // Average session DURATION (minutes) across logs that recorded one — old "DURATION" numbers cell.
+    const _durLogs = workouts.filter((w) => (w.duration_min || 0) > 0);
+    const avg_duration_min = _durLogs.length ? Math.round(_durLogs.reduce((a, w) => a + w.duration_min, 0) / _durLogs.length) : null;
+    // VARIETY — distinct exercises trained in the window (old "VARIETY" cell).
+    const unique_lifts = new Set(workouts.flatMap((w) => (w.exercises || []).map((ex) => ex.name).filter(Boolean))).size;
+    // LIFETIME cumulative (anchor → today, range-independent) — old Verdict line "Xh trained · N sessions · M days active".
+    const lifetime_sessions = lifetimeWorkouts.length;
+    const lifetime_days_active = new Set(lifetimeWorkouts.map((w) => w.date).filter(Boolean)).size;
+    const lifetime_hours = Math.round(lifetimeWorkouts.reduce((a, w) => a + (w.duration_min || 0), 0) / 60);
+
     // ── LLM-driven insights (cached, cross-agent aware) ──
     const insightContext = {
-      score, grade, days_logged, rangeDays,
+      score, grade, days_logged, sessions, rangeDays,
       avg_volume_kg, avg_sets, avg_rpe, avg_quality,
       total_volume_kg, total_sets, streak, volatility_pct,
       muscle_volume, skip_pattern, prs_period, strength_trend,
@@ -3868,6 +4183,11 @@ router.get("/analysis", async (req, res) => {
       }
       return out;
     })();
+    // Apple Health: an active/measured day counts toward the score even without a logged workout (MAX → never lowers a logged day; no HK → no change).
+    try {
+      const hkQ = await domainHealthQualityByDate(deviceId, 'fitness', anchor.anchorDateStr, win.todayDate);
+      for (const [d, q] of Object.entries(hkQ)) { if (dayQualityByDate[d] == null || q > dayQualityByDate[d]) dayQualityByDate[d] = q; }
+    } catch { /* no HK — parity */ }
     const { computeStandardOutputs } = require('./lib/score-lifetime');
     const std = computeStandardOutputs({
       qualityByDate: dayQualityByDate,
@@ -3880,7 +4200,44 @@ router.get("/analysis", async (req, res) => {
     const missed_days = std.missed_days;
     const score_7d_smoothed = std.score_7d_smoothed;
 
+    // ── CARDIO aggregate ──────────────────────────────────────────────────────
+    // The strength frame (volume/PRs/muscle) ignores cardio entirely. People run/cycle daily, so we
+    // give cardio its OWN numbers: total distance & time, average pace, longest session, by-activity —
+    // all derived from the cardio data we already store (any exercise with distance/duration).
+    const cardio = (() => {
+      const byKind = {};
+      let sessions = 0, total_distance_m = 0, total_duration_sec = 0, best = null;
+      for (const w of workouts) {
+        for (const ex of (w.exercises || [])) {
+          const sets = ex.sets || [];
+          const hasDims = sets.some((s) => (s.distance_m > 0) || (s.duration_sec > 0));
+          if (!(hasDims || ex.entry_type === "DISTANCE_TIME" || ex.entry_type === "TIME")) continue;
+          const dist = sets.reduce((a, s) => a + (Number(s.distance_m) || 0), 0);
+          const dur = sets.reduce((a, s) => a + (Number(s.duration_sec) || 0), 0);
+          if (dist <= 0 && dur <= 0) continue;
+          sessions += 1; total_distance_m += dist; total_duration_sec += dur;
+          const kind = ex.name || "Cardio";
+          const k = (byKind[kind] = byKind[kind] || { kind, sessions: 0, distance_m: 0, duration_sec: 0 });
+          k.sessions += 1; k.distance_m += dist; k.duration_sec += dur;
+          const pace = dist > 0 && dur > 0 ? Math.round(dur / (dist / 1000)) : null;
+          if (!best || dist > best.distance_m || (dist === best.distance_m && dur < best.duration_sec)) {
+            best = { kind, date: w.date, distance_m: Math.round(dist), duration_sec: Math.round(dur), pace_s_per_km: pace };
+          }
+        }
+      }
+      if (!sessions) return null;
+      const by_kind = Object.values(byKind)
+        .map((k) => ({ ...k, distance_m: Math.round(k.distance_m), duration_sec: Math.round(k.duration_sec), pace_s_per_km: k.distance_m > 0 && k.duration_sec > 0 ? Math.round(k.duration_sec / (k.distance_m / 1000)) : null }))
+        .sort((a, b) => b.distance_m - a.distance_m || b.duration_sec - a.duration_sec);
+      const avg_pace_s_per_km = total_distance_m > 0 && total_duration_sec > 0 ? Math.round(total_duration_sec / (total_distance_m / 1000)) : null;
+      return { sessions, total_distance_m: Math.round(total_distance_m), total_duration_sec: Math.round(total_duration_sec), avg_pace_s_per_km, by_kind, best };
+    })();
+
+    // Fire both Apple Health reads concurrently (kicked off before either await) — halves HK latency.
+    const _hkP = domainHealth(deviceId, 'fitness').catch(() => null);
+    const _hkViewP = domainHealthView(deviceId, 'fitness', win.requestedDays).catch(() => null);
     res.json({
+      cardio,
       setup_completed: true,
       range,
       effective_start_date: effectiveStartDate,
@@ -3888,6 +4245,8 @@ router.get("/analysis", async (req, res) => {
       days_since_anchor: win.daysSinceAnchor,
       anchor_date: anchor.anchorDateStr,
       is_clamped: win.isClamped,
+      health: await _hkP,
+      health_view: await _hkViewP, // Apple Health recovery/steps/workouts
       score_today,
       score_7d_smoothed,
       score_lifetime,
@@ -3906,6 +4265,14 @@ router.get("/analysis", async (req, res) => {
       skip_pattern,
       prs_period,
       strength_trend,
+      effort_mix,
+      push_pull_legs,
+      muscle_frequency,
+      vs_prior,
+      delta_vol_pct:  vs_prior.delta_vol_pct,
+      delta_sets_pct: vs_prior.delta_sets_pct,
+      delta_prs_abs:  vs_prior.delta_prs_abs,
+      form,
       peak_hour,
       peak_hour_session_count,
       evening_session_pct,
@@ -3917,8 +4284,9 @@ router.get("/analysis", async (req, res) => {
       aha_moments,
       hero_insight: { headline },
       stats: {
-        days_logged, total_logs: days_logged, total_volume_kg, total_sets,
-        avg_volume_kg, avg_sets, avg_quality, avg_rpe,
+        days_logged, total_logs: sessions, sessions, total_volume_kg, total_sets,
+        avg_volume_kg, avg_sets, avg_quality, avg_rpe, avg_duration_min, unique_lifts,
+        lifetime_sessions, lifetime_days_active, lifetime_hours, bodyweight_kg,
         vol_hit_days:  workouts.filter((w) => (w.total_volume_kg || 0) >= VOL_TARGET).length,
         sets_hit_days: workouts.filter((w) => (w.total_sets || 0) >= SETS_TARGET).length,
       },
@@ -4187,9 +4555,9 @@ router.get("/muscle-trends", async (req, res) => {
     let status_label = "Not trained yet";
     let status_accent = "muted";
     if (totalSets > 0 && lm) {
-      if (wkSets < lm.MEV) { status = "below_mev"; status_label = `Below MEV (${lm.MEV} sets/wk)`; status_accent = "red"; }
-      else if (wkSets <= lm.MAV[1]) { status = "in_mav"; status_label = `In MAV (${lm.MAV[0]}-${lm.MAV[1]} sets/wk)`; status_accent = "green"; }
-      else if (wkSets <= lm.MRV) { status = "above_mav"; status_label = `Above MAV`; status_accent = "amber"; }
+      if (wkSets < lm.mev) { status = "below_mev"; status_label = `Below MEV (${lm.mev} sets/wk)`; status_accent = "red"; }
+      else if (wkSets <= lm.mav[1]) { status = "in_mav"; status_label = `In MAV (${lm.mav[0]}-${lm.mav[1]} sets/wk)`; status_accent = "green"; }
+      else if (wkSets <= lm.mrv) { status = "above_mav"; status_label = `Above MAV`; status_accent = "amber"; }
       else { status = "above_mrv"; status_label = `Above MRV (overtraining risk)`; status_accent = "red"; }
     } else if (totalSets > 0) {
       status = "active"; status_label = `${totalSets} sets`; status_accent = "amber";
@@ -4213,10 +4581,10 @@ router.get("/muscle-trends", async (req, res) => {
       status,
       status_label,
       status_accent,
-      mev: lm?.MEV ?? null,
-      mav_low: lm?.MAV?.[0] ?? null,
-      mav_high: lm?.MAV?.[1] ?? null,
-      mrv: lm?.MRV ?? null,
+      mev: lm?.mev ?? null,
+      mav_low: lm?.mav?.[0] ?? null,
+      mav_high: lm?.mav?.[1] ?? null,
+      mrv: lm?.mrv ?? null,
       last_trained: lastDate,
       days_since,
       top_exercises,
@@ -4390,6 +4758,425 @@ router.get('/chat-state', async (req, res) => {
   }
 });
 
+// big-change: the chat-first coach orchestrator (LLM + tools → Block contract).
+router.post("/coach", require("./lib/fitness-coach"));
+
+// big-change: saved-workout templates (see all / reuse / one-tap re-log w/ smart weights).
+const _tpl = require("./lib/fitness-templates");
+router.post("/templates", _tpl.saveTemplate);
+router.get("/templates", _tpl.listTemplates);
+router.post("/templates/delete", _tpl.deleteTemplate);
+router.get("/templates/resolve", _tpl.resolveTemplate);
+
+// big-change: PLAN UPLOAD — the user photographs their gym's weekly program; we parse it into the
+// same day-templates the rest of the app uses. From then on "Monday, what should I do?" reads the
+// plan, they can edit/log any day, and the proactive nudge becomes plan-aware. One source of truth.
+router.post("/plan/upload", async (req, res) => {
+  const { deviceId, images } = req.body || {};
+  if (!deviceId) return res.status(400).json({ error: "deviceId required" });
+  const imgs = Array.isArray(images) ? images.filter(Boolean).slice(0, 4) : [];
+  if (!imgs.length) return res.status(400).json({ error: "images required" });
+  try {
+    const responseSchema = {
+      type: "object",
+      properties: {
+        days: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              day: { type: "string" },
+              exercises: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: { name: { type: "string" }, sets: { type: "number" }, reps: { type: "number" } },
+                  required: ["name"],
+                },
+              },
+            },
+            required: ["day", "exercises"],
+          },
+        },
+      },
+      required: ["days"],
+    };
+    const systemPrompt = [
+      "You are reading a gym WORKOUT PLAN / training program from a photo (printout, whiteboard, app screenshot, or handwritten sheet).",
+      "Extract the weekly plan: for EACH training day, its label and the exercises with target sets and reps.",
+      "RULES:",
+      "- 'day' = the weekday if shown (Monday, Tuesday, …). If the plan uses split names instead (Push, Pull, Legs, Upper, Lower, Full Body, Chest, Back, Arms) or 'Day 1/Day 2', put THAT label in 'day'.",
+      "- Normalize exercise names to standard form (e.g. 'BB Bench'→'Bench Press', 'RDL'→'Romanian Deadlift', 'OHP'→'Overhead Press').",
+      "- 'sets' = number of working sets (integer). 'reps' = target reps; for a range '8-12' use the lower end (8); for AMRAP/failure use 10.",
+      "- BE SMART — COMPLETE PARTIAL PLANS. Keep EXACTLY what the user wrote, then fill the gaps so every training day is usable: if a day shows only a focus/split label (e.g. 'Monday — Chest', 'Push') with NO exercises, or fewer than 4 exercises, ADD appropriate ones (compounds first) to reach 4–6 per day. If sets/reps are missing, use compounds 4×6–8, accessories 3×10–12. Only invent what's missing.",
+      "- Skip warmup rows, cardio-only notes, and rest days.",
+      "- If the image is genuinely NOT a workout plan (blurry, unrelated, blank), return an empty days array — do NOT fabricate a plan from nothing.",
+      "Return ONLY JSON matching the schema.",
+    ].join("\n");
+    const parsed = await callGeminiVision({
+      systemPrompt,
+      userText: "Extract the weekly workout plan from this image.",
+      images: imgs,
+      // Pass the schema — without it Gemini returns free-form JSON that doesn't match `parsed.days`,
+      // so EVERY upload fell through to "no_plan". The schema locks the exact {days:[{day,exercises}]}
+      // shape the parser below expects.
+      responseSchema,
+      // A full week (7 days × many exercises) can exceed a small cap and the JSON gets truncated
+      // → "Unexpected end of JSON input". This is a CEILING (you're only billed for tokens actually
+      // produced), so raising it costs nothing extra and just prevents the cut-off.
+      maxOutputTokens: 8192,
+      model: "gemini-2.5-flash",
+      label: "fitness-plan-upload",
+    });
+    const days = parsed && Array.isArray(parsed.days) ? parsed.days.filter((d) => Array.isArray(d.exercises) && d.exercises.length) : [];
+    if (!days.length) return res.json({ ok: true, created: 0, message: "no_plan" });
+
+    const DOW = { sunday: 0, sun: 0, monday: 1, mon: 1, tuesday: 2, tue: 2, tues: 2, wednesday: 3, wed: 3, thursday: 4, thu: 4, thur: 4, thurs: 4, friday: 5, fri: 5, saturday: 6, sat: 6 };
+    const cap = (s) => (s ? String(s).charAt(0).toUpperCase() + String(s).slice(1) : s);
+    // Pass 1: weekday-named days claim their slot (priority). Pass 2: split/numbered days fill the
+    // remaining weekday slots in order (Mon→Sun) so the user still gets a usable, editable base plan.
+    const used = new Set();
+    const planned = [];
+    for (const d of days) {
+      const dow = DOW[String(d.day || "").trim().toLowerCase()];
+      if (dow != null && !used.has(dow)) { used.add(dow); planned.push({ dow, day: d.day, exercises: d.exercises }); }
+    }
+    const leftover = days.filter((d) => DOW[String(d.day || "").trim().toLowerCase()] == null);
+    const freeSlots = [1, 2, 3, 4, 5, 6, 0].filter((x) => !used.has(x));
+    leftover.forEach((d, i) => { if (i < freeSlots.length) planned.push({ dow: freeSlots[i], day: d.day, exercises: d.exercises }); });
+
+    // We do NOT save yet — return a PREVIEW (clean, weekday-labelled, with exercises) so the user
+    // can review every day and CONFIRM before it becomes their plan. Saving happens in /plan/confirm.
+    const DAY_FULL = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+    const clampInt = (v, d, lo, hi) => { const n = parseInt(v, 10); return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : d; };
+    const preview = planned
+      .map((p) => ({
+        dow: p.dow,
+        day_name: DAY_FULL[p.dow],
+        exercises: (p.exercises || []).slice(0, 30).map((e) => ({
+          name: String(e?.name || "Exercise").slice(0, 60),
+          sets: clampInt(e?.sets, 3, 1, 20),
+          reps: clampInt(e?.reps, 10, 0, 100),
+        })).filter((e) => e.name),
+      }))
+      .filter((p) => p.exercises.length)
+      .sort((a, b) => ([1, 2, 3, 4, 5, 6, 0].indexOf(a.dow) - [1, 2, 3, 4, 5, 6, 0].indexOf(b.dow)));
+    return res.json({ ok: true, days: preview });
+  } catch (e) {
+    (globalThis.log?.error || console.error)("[fitness] /plan/upload:", e?.message || e);
+    return res.status(500).json({ error: "plan upload failed" });
+  }
+});
+
+// Proven push/pull/legs · upper/lower fallback (mirrors the FE generatePlan), used when the model can't.
+// `slots` = the exact weekday numbers the user picked (Mon-first). One workout is placed on each.
+function buildDeterministicPlan(slots, DAY_FULL) {
+  const PUSH = [{ name: "Bench Press", sets: 4, reps: 8 }, { name: "Overhead Press", sets: 3, reps: 10 }, { name: "Incline Dumbbell Press", sets: 3, reps: 10 }, { name: "Tricep Pushdown", sets: 3, reps: 12 }, { name: "Lateral Raise", sets: 3, reps: 15 }];
+  const PULL = [{ name: "Deadlift", sets: 3, reps: 5 }, { name: "Barbell Row", sets: 4, reps: 8 }, { name: "Lat Pulldown", sets: 3, reps: 10 }, { name: "Face Pull", sets: 3, reps: 15 }, { name: "Bicep Curl", sets: 3, reps: 12 }];
+  const LEGS = [{ name: "Squat", sets: 4, reps: 6 }, { name: "Romanian Deadlift", sets: 3, reps: 8 }, { name: "Leg Press", sets: 3, reps: 12 }, { name: "Leg Curl", sets: 3, reps: 12 }, { name: "Calf Raise", sets: 4, reps: 15 }];
+  const UPPER = [{ name: "Bench Press", sets: 4, reps: 8 }, { name: "Barbell Row", sets: 4, reps: 8 }, { name: "Overhead Press", sets: 3, reps: 10 }, { name: "Lat Pulldown", sets: 3, reps: 10 }, { name: "Bicep Curl", sets: 3, reps: 12 }, { name: "Tricep Pushdown", sets: 3, reps: 12 }];
+  const LOWER = [{ name: "Squat", sets: 4, reps: 6 }, { name: "Romanian Deadlift", sets: 3, reps: 8 }, { name: "Leg Press", sets: 3, reps: 12 }, { name: "Leg Curl", sets: 3, reps: 12 }, { name: "Calf Raise", sets: 4, reps: 15 }];
+  const n = slots.length;
+  let split;
+  if (n === 3) split = [PUSH, PULL, LEGS];
+  else if (n === 4) split = [UPPER, LOWER, UPPER, LOWER];
+  else if (n === 5) split = [PUSH, PULL, LEGS, UPPER, LOWER];
+  else if (n === 6) split = [PUSH, PULL, LEGS, PUSH, PULL, LEGS];
+  else { const pool = [PUSH, PULL, LEGS, UPPER, LOWER]; split = Array.from({ length: n }, (_, i) => pool[i % pool.length]); }
+  return split.map((ex, i) => ({ dow: slots[i], day_name: DAY_FULL[slots[i]], exercises: ex.map((e) => ({ ...e })) }));
+}
+
+// ── POST /plan/generate — AI builds a personalised weekly plan from the user's goal + chosen days. ──
+// Returns the SAME preview shape as /plan/upload ({ ok, days:[{dow,day_name,exercises}] }) so it flows
+// through the identical editable planPreview → /plan/confirm → day-templates pipeline. Saves NOTHING here.
+// Body: { deviceId, goal?, train_days?:[0-6], days_per_week?, notes? }. `train_days` = the exact weekdays
+// the user selected (Mon=1 … Sun=0); a workout is placed on EACH. Always returns a usable plan
+// (deterministic fallback if the model errors/empties) so the feature can never dead-end.
+const MON_FIRST = [1, 2, 3, 4, 5, 6, 0];
+router.post("/plan/generate", async (req, res) => {
+  const b = req.body || {};
+  const { deviceId } = b;
+  const DAY_FULL = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+  const TRAIN_SLOTS = { 3: [1, 3, 5], 4: [1, 2, 4, 5], 5: [1, 2, 3, 4, 5], 6: [1, 2, 3, 4, 5, 6] };
+  const clampInt = (v, d, lo, hi) => { const n = parseInt(v, 10); return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : d; };
+  if (!deviceId) return res.status(400).json({ error: "deviceId required" });
+  const goal = String(b.goal || "").trim().slice(0, 300);
+  const notes = String(b.notes || "").trim().slice(0, 300);
+  // Resolve the training weekdays: prefer the user's explicit selection, else a sensible default by count.
+  let slots = null;
+  if (Array.isArray(b.train_days) && b.train_days.length) {
+    const uniq = [...new Set(b.train_days.map((x) => parseInt(x, 10)).filter((x) => Number.isInteger(x) && x >= 0 && x <= 6))];
+    slots = MON_FIRST.filter((d) => uniq.includes(d)); // Mon-first order
+  }
+  if (!slots || !slots.length) slots = TRAIN_SLOTS[clampInt(b.days_per_week, 4, 3, 6)] || TRAIN_SLOTS[4];
+  slots = slots.slice(0, 7);
+  const count = slots.length;
+  const dayNames = slots.map((d) => DAY_FULL[d]);
+  try {
+    // Personalise from the user's saved fitness setup (goal/level/equipment) — silent context, no extra asks.
+    let setup = {};
+    try { const s = await fitnessDoc(deviceId).get(); setup = (s.exists ? s.data().setup : {}) || {}; } catch { /* non-fatal */ }
+    const level = setup.training_level || "beginner";
+    const equipment = setup.equipment || "full_gym";
+    const profileGoal = goal || setup.primary_goal || "general fitness";
+
+    const sys = [
+      "You are an elite strength & conditioning coach building a ONE-WEEK workout plan.",
+      `The user trains on these specific days: ${dayNames.join(", ")} (${count} day(s)/week). Goal: ${profileGoal}. Experience: ${level}. Equipment: ${equipment}.`,
+      notes ? `Extra context from the user: ${notes}` : "",
+      "Design a balanced split (e.g. push/pull/legs or upper/lower) appropriate to the day count, goal and equipment, ordered for recovery across the chosen days.",
+      "Rules: 4–7 exercises per training day; compound lifts first; sensible sets (3–5) and reps (3–15 by goal:",
+      "lower reps for strength, 8–12 for muscle, 12–15 for endurance). Only equipment the user has. NO rest days in output.",
+      'Return STRICT JSON only: {"days":[{"exercises":[{"name":"...","sets":<int>,"reps":<int>}]}]} — one object per training day, in order.',
+      `Output EXACTLY ${count} training day object(s). No prose, no markdown.`,
+    ].filter(Boolean).join("\n");
+
+    let parsed = null;
+    try {
+      const c = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        response_format: { type: "json_object" },
+        max_completion_tokens: 1600,
+        messages: [
+          { role: "system", content: sys },
+          { role: "user", content: `Build my ${count}-day plan for ${dayNames.join(", ")}${goal ? ` — goal: ${goal}` : ""}.` },
+        ],
+      });
+      parsed = JSON.parse(c.choices?.[0]?.message?.content || "{}");
+    } catch (e) { (globalThis.log?.warn || console.warn)("[fitness] /plan/generate model:", e?.message || e); }
+
+    // Sanitise → the canonical preview shape. Assign the chosen weekday slots in order (so the workout
+    // lands on EXACTLY the days the user picked), clamp sets/reps, cap exercises, drop empties.
+    let rawDays = parsed && Array.isArray(parsed.days) ? parsed.days.filter((d) => Array.isArray(d.exercises) && d.exercises.length) : [];
+    rawDays = rawDays.slice(0, count);
+    let preview = rawDays.map((d, i) => ({
+      dow: slots[i],
+      day_name: DAY_FULL[slots[i]],
+      exercises: (d.exercises || []).slice(0, 8).map((e) => ({
+        name: String(e?.name || "Exercise").slice(0, 60),
+        sets: clampInt(e?.sets, 3, 1, 20),
+        reps: clampInt(e?.reps, 10, 0, 100),
+      })).filter((e) => e.name),
+    })).filter((p) => p.exercises.length);
+
+    // Reliability floor: if the model failed or returned too few usable days, fall back to a proven split
+    // so the user ALWAYS gets an editable plan (10/10 — the feature never dead-ends).
+    if (preview.length < count) preview = buildDeterministicPlan(slots, DAY_FULL);
+    preview.sort((a, c) => MON_FIRST.indexOf(a.dow) - MON_FIRST.indexOf(c.dow));
+    return res.json({ ok: true, days: preview });
+  } catch (e) {
+    (globalThis.log?.error || console.error)("[fitness] /plan/generate:", e?.message || e);
+    // Even on a hard error, return a usable plan rather than failing the user.
+    return res.json({ ok: true, days: buildDeterministicPlan(slots, DAY_FULL) });
+  }
+});
+
+// Save the CONFIRMED plan — this REPLACES the whole plan (one plan per user; create/upload/AI all
+// override). replaceAllPlan clears every existing weekday template, then writes the new days, so no
+// stale day from a previous plan lingers. Body: { deviceId, days:[{dow, exercises:[{name,sets,reps}]}] }.
+router.post("/plan/confirm", async (req, res) => {
+  const { deviceId, days } = req.body || {};
+  if (!deviceId) return res.status(400).json({ error: "deviceId required" });
+  const list = Array.isArray(days) ? days : [];
+  try {
+    // An empty list is allowed through — it clears the plan (user removed every exercise). replaceAllPlan
+    // itself refuses to wipe an existing plan on a non-empty-but-all-invalid payload.
+    const created = await _tpl.replaceAllPlan(deviceId, list);
+    invalidateCtx(deviceId);
+    return res.json({ ok: true, created });
+  } catch (e) {
+    (globalThis.log?.error || console.error)("[fitness] /plan/confirm:", e?.message || e);
+    return res.status(500).json({ error: "plan confirm failed" });
+  }
+});
+
+// Remove the whole plan (the ✕ on the plan card). Wipes every weekday template → user is back to the
+// "no plan yet" state. Body: { deviceId }.
+router.post("/plan/clear", async (req, res) => {
+  const { deviceId } = req.body || {};
+  if (!deviceId) return res.status(400).json({ error: "deviceId required" });
+  try {
+    await _tpl.replaceAllPlan(deviceId, []); // explicit empty list = clear (see replaceAllPlan guard)
+    invalidateCtx(deviceId);
+    return res.json({ ok: true });
+  } catch (e) {
+    (globalThis.log?.error || console.error)("[fitness] /plan/clear:", e?.message || e);
+    return res.status(500).json({ error: "plan clear failed" });
+  }
+});
+
+// Undo an auto-append: remove specific exercises (by name) from a weekday's plan. Body: { deviceId, dow, names }.
+router.post("/day-workout/remove", async (req, res) => {
+  const { deviceId, dow, names } = req.body || {};
+  if (!deviceId) return res.status(400).json({ error: "deviceId required" });
+  try {
+    const ok = await _tpl.removeDayExercises(deviceId, parseInt(dow, 10), Array.isArray(names) ? names : []);
+    invalidateCtx(deviceId);
+    return res.json({ ok });
+  } catch (e) {
+    (globalThis.log?.error || console.error)("[fitness] /day-workout/remove:", e?.message || e);
+    return res.status(500).json({ error: "remove failed" });
+  }
+});
+
+// big-change: proactive coach — reach out first (day-aware / PR / overtraining / missed / streak / no-log).
+const _proactive = require("./lib/fitness-proactive");
+router.get("/proactive/check", _proactive.proactiveCheckHandler);
+// Appreciation after a good action (logging) — a warm, contextual coach follow-up.
+router.post("/encourage", _proactive.encourageHandler);
+// Smart time for the client's daily local "haven't logged today" reminder (BE never pushes in prod).
+router.get("/nudge-time", _proactive.nudgeTimeHandler);
+
+// Deterministic backstop: collapse exact-duplicate and false-start (restart) sentences so a
+// repeated clause can NEVER reach the user, regardless of the LLM or which STT engine was used.
+// "I did bench press. I did bench press for 4 sets." → keeps only the complete one.
+function dedupeSpeech(input) {
+  if (!input || typeof input !== "string") return input;
+  // Anti-loop: collapse an immediately repeated short phrase ("la la la la", "ooh ooh ooh") down to a
+  // single instance, so a model that loops on gibberish can never flood the user with garbage.
+  let cleaned = input;
+  for (let win = 1; win <= 4; win++) {
+    cleaned = cleaned.replace(new RegExp(`\\b((?:\\w+\\s+){0,${win - 1}}\\w+)(\\s+\\1\\b){2,}`, "gi"), "$1");
+  }
+  const sentences = cleaned.replace(/\s+/g, " ").split(/(?<=[.!?])\s+/).map((s) => s.trim()).filter(Boolean);
+  // Normalize for COMPARISON only: lowercase, drop trailing punctuation, and peel leading filler /
+  // lead-ins ("so yes,", "then", "after that", "I did a") so a restart matches its fuller version.
+  const LEAD = /^(so yes|so|okay so|ok so|okay|ok|alright|well|um|uh|and then|then|after that|next|and|also|i did some|i did a|i did|i also did|did a|did|i)\b[\s,]*/i;
+  const norm = (s) => {
+    let n = s.toLowerCase().replace(/[.!?,]+$/g, "").trim();
+    let prev;
+    do { prev = n; n = n.replace(LEAD, "").trim(); } while (n !== prev);
+    return n;
+  };
+  const out = [];
+  for (const s of sentences) {
+    const n = norm(s);
+    if (!n) continue;
+    if (out.length) {
+      const p = norm(out[out.length - 1]);
+      if (n === p) continue;                            // exact duplicate → drop
+      if (p && n.startsWith(p)) { out[out.length - 1] = s; continue; } // restart that extends → replace
+      if (n && p.startsWith(n)) continue;               // earlier was the full version → drop this
+    }
+    out.push(s);
+  }
+  return out.join(" ");
+}
+
+// big-change: VOICE POLISH — voice is the primary input, so after speech ends we run a focused LLM
+// pass that fixes on-device-ASR errors (homophones, smashed numbers, fitness terms) and returns the
+// user's most-likely sentence. The FE shows THIS (not the messy live partials) for review before send.
+router.post("/polish-transcript", async (req, res) => {
+  const { deviceId, transcript } = req.body || {};
+  const raw = typeof transcript === "string" ? transcript.trim() : "";
+  if (!raw) return res.json({ text: "" });
+  // Too short to be worth a round-trip (a word or two rarely has fixable structure).
+  if (raw.length < 3) return res.json({ text: raw });
+  // Already-structured, short, non-repeating input doesn't need an LLM rewrite — and rewriting it only
+  // risks dropping a token the regex parser needs. Return it verbatim (instant, zero data-loss).
+  const looksStructured =
+    /\b\d+\s*(?:x|×|sets?|reps?)\b/i.test(raw) ||            // "4x8", "4 sets", "12 reps"
+    /^\s*\d+(?:\.\d+)?\s*(?:ml|l|oz|kg|lbs?)\b/i.test(raw) || // "500ml", "80 kg"
+    /\b\d{1,2}\s*:\s*\d{1,2}\b/.test(raw);                    // "16:8", "11:30"
+  if (looksStructured && raw.length < 70 && !/\b(\w+)\s+\1\b/i.test(raw)) {
+    return res.json({ text: raw });
+  }
+  try {
+    // The user's OWN recent exercises — so a mishear snaps to a lift they actually do (e.g. they
+    // train "Romanian Deadlift", so "roman ian dead" → that, not "Conventional Deadlift").
+    let usual = [];
+    if (deviceId) {
+      try {
+        const wSnap = await workoutsCol(deviceId).orderBy("logged_at", "desc").limit(25).get();
+        const seen = new Set();
+        wSnap.docs.forEach((d) => (d.data().exercises || []).forEach((ex) => {
+          const n = String(ex?.name || "").trim();
+          if (n && !seen.has(n.toLowerCase())) { seen.add(n.toLowerCase()); usual.push(n); }
+        }));
+        usual = usual.slice(0, 30);
+      } catch (_) {}
+    }
+    const sys = [
+      "ROLE: You are a transcript cleaner for a health & wellness app — the user may be logging a WORKOUT, a MEAL/food, SLEEP, MOOD, WATER, or a FAST. A user just SPOKE into their phone; a speech-recognition engine turned it into raw, MESSY text that commonly repeats words, restarts phrases mid-sentence, mishears words, and adds filler. The text is a noisy machine transcription of what they SAID — not what they typed.",
+      "YOUR JOB: output the ONE clean sentence the user actually meant. Fix recognition errors and grammar, and remove ONLY true repetition and filler. This text is shown back to the user AND then PARSED by an agent, so EVERY piece of information must survive.",
+      "PRESERVE EVERYTHING — THE #1 RULE: keep every number, time, TIME RANGE (both endpoints + am/pm), duration, quantity, UNIT (kg, lbs, ml, L, oz, km, miles, min, hours), food/drink item, exercise, set/rep/weight, and feeling word EXACTLY as said. ALSO keep every NEGATION and zero-signal word — 'didn't', 'did not', 'no', 'none', 'never', 'skipped', 'slept through', 'nothing' — these carry meaning (a skipped workout, zero wakeups) and must NEVER be removed as filler. If they said 'from 11am to 8pm', the output MUST still contain '11am to 8pm'. If they said '8 momos, a coke and ice cream', keep all three items. If they said 'slept 7 hours and feel rested', keep '7 hours' AND 'rested'. NEVER drop, round, or summarize information — the agent needs all of it to log correctly. Correcting English does NOT mean shortening the facts.",
+      "HOW TO THINK: read the whole thing, find the real intent, and write that one clean, grammatical sentence with ALL the details intact. Treat ONLY obvious repetition/restarts and filler as noise.",
+      "RULES:",
+      "1. DE-REPEAT: if words or phrases repeat or the sentence restarts, keep the single most complete version ONCE ('I did I did a bench press for 8 at 80' → 'I did bench press for 8 at 80.'). But de-repeating must NEVER remove DISTINCT information (two different exercises, two foods, a start AND an end time all stay).",
+      "2. DROP FILLER ONLY — the ONLY removable tokens are these exact discourse fillers: 'um', 'uh', 'er', 'you know', 'I mean', 'okay so', 'basically', and 'like' ONLY when it is a verbal hedge (not 'I like X'). NOTHING ELSE is filler. If you are unsure whether a word carries information, KEEP it. Never drop a number, unit, time, negation, food, feeling, exercise, or quantity.",
+      "3. FIX MISHEARS / numbers where clearly meant: 'ate'→'8', 'for'/'fore'→'4', 'to'/'too'→'2', 'won'→'1'; 'raps'→'reps', 'are pee'→'RPE', 'am rap'→'AMRAP'. Gym terms: 'bench priest'/'bench breast'→'bench press', 'roman ian'→'Romanian', 'dead lift'→'deadlift', 'cheat day'/'chest day'→'chest', 'in crime'→'incline', 'dumb bell'→'dumbbell', 'squad'→'squat', 'lat pull down'→'lat pulldown'. Fix obvious homophones in any domain, but keep the meaning and all details.",
+      "4. NORMALIZE, DON'T RESTRUCTURE: convert spoken number-words to digits ('four sets of twelve at thirty' → '4 sets of 12 at 30') and normalize units to canonical short forms ('kilos'/'kilograms' → 'kg', 'pounds' → 'lbs', 'litres'/'liters' → 'L', 'minutes' → 'min'). Do NOT reorder the sentence, do NOT merge two items into one, do NOT turn a workout into a template. A downstream regex parser reads these EXACT tokens, so keep the user's word order and clause separators (commas, 'then', 'and then', 'after that') intact. Keep the user's natural sentence — corrected and digitized, never compressed.",
+      "5b. WHAT THE PARSER NEEDS (preserve these helpfully): WORKOUT → number + 'sets'/'reps'/'x' + 'at N kg' + exercise name + cardio distance ('5 km') and time ('30 min'). FOOD → each item name + its count/portion + the connectors between them. SLEEP → bedtime & wake time (BOTH ends, am/pm), duration, quality word, 'woke N times' or 'slept through', minutes to fall asleep. MOOD → every feeling word + intensity. WATER → number + volume unit ('500 ml', '1.5 L') or container ('glass'). FASTING → protocol ('16:8', 'OMAD') and hour count ('18 hours').",
+      usual.length ? `5. This user usually does these exercises — snap an obvious mishear to one when it clearly matches: ${usual.join(", ")}.` : "",
+      "6. NONSENSE: pure gibberish / repeated nonsense syllables ('ooh la la la', 'asdf') with no real intent → return it short and unchanged (or empty). Never invent a sentence and never produce long looping text.",
+      "HARD LIMITS: NEVER invent AND NEVER drop numbers, times, ranges, durations, quantities, units, foods, feelings, or exercises that were said. NEVER answer a question or add commentary. Correct the sentence; do not shorten its information.",
+      "OUTPUT: only the one cleaned sentence as plain text — no quotes, no JSON, no preamble.",
+    ].filter(Boolean).join("\n");
+    const r = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      // 240 was too tight — a long multi-exercise/multi-food utterance can exceed it once normalized,
+      // forcing the model to compress (i.e. drop) to fit. Give it room so "keep everything" is possible.
+      max_completion_tokens: 400,
+      messages: [
+        { role: "system", content: sys },
+        { role: "user", content: raw },
+      ],
+    });
+    let text = (r.choices?.[0]?.message?.content || "").trim().replace(/^["']|["']$/g, "");
+    // Guard: never return empty or a refusal — fall back to the raw transcript.
+    if (!text || /^(i (can'?t|cannot|am )|sorry)/i.test(text)) text = raw;
+    // Deterministic no-duplication guarantee (belt-and-suspenders over the LLM).
+    text = dedupeSpeech(text);
+    return res.json({ text: text.slice(0, 600) });
+  } catch (e) {
+    (globalThis.log?.warn || console.warn)("[fitness] /polish-transcript:", e?.message || e);
+    return res.json({ text: dedupeSpeech(raw) }); // never block the user — raw (de-duped) still works
+  }
+});
+
+// big-change: bodyweight (7-day moving average) + goal progress.
+const _body = require("./lib/fitness-body");
+router.post("/bodyweight", _body.logBodyweight);
+router.get("/bodyweight", _body.getBodyweightTrend);
+router.post("/goal", _body.setGoal);
+router.get("/goal", _body.getGoal);
+
+// big-change: persist ANY chat message (incl. FE-generated turns) so BE↔FE stay perfectly in
+// sync — the chat history is the single source of truth.
+router.post("/chat/append", async (req, res) => {
+  const { deviceId, role, content, blocks } = req.body || {};
+  if (!deviceId || !role) return res.status(400).json({ error: "deviceId + role required" });
+  try {
+    await chatsCol(deviceId).add({
+      role: role === "user" ? "user" : "assistant",
+      content: content || "",
+      ...(Array.isArray(blocks) ? { blocks } : {}),
+      is_proactive: false,
+      is_read: true,
+      created_at: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    return res.json({ success: true });
+  } catch (e) {
+    log.error("[fitness] chat/append:", e);
+    return res.status(500).json({ error: "append failed" });
+  }
+});
+
+// big-change: undo a just-logged workout.
+router.post("/log/delete", async (req, res) => {
+  const { deviceId, workout_id } = req.body || {};
+  if (!deviceId || !workout_id) return res.status(400).json({ error: "deviceId + workout_id required" });
+  try {
+    await workoutsCol(deviceId).doc(workout_id).delete();
+    invalidateCtx(deviceId);
+    invalidateAnalysisCache(deviceId);
+    return res.json({ success: true });
+  } catch (e) {
+    log.error("[fitness] log/delete:", e);
+    return res.status(500).json({ error: "delete failed" });
+  }
+});
+
 router.post("/chat", async (req, res) => {
   const { deviceId, message, proactive_context } = req.body;
   if (!deviceId || !message)
@@ -4532,24 +5319,31 @@ _mountChatStreamFitness(router, {
       `Use MEV/MAV/MRV landmarks when discussing volume. Reference progressive overload, periodization, deload needs when relevant.`,
       `Keep replies concise (2-4 sentences max, or a numbered list when steps are needed). No generic advice. No filler.`,
     ].join("\n");
-    return { systemPrompt, history };
+    return { systemPrompt: systemPrompt + (await domainHealthText(deviceId, 'fitness').catch(() => '')), history };
   },
 });
 
 // GET /chat (message history)
+// The chat is a "today" surface: the user cares about the last couple of weeks, not their whole
+// history. We return only the last CHAT_WINDOW_DAYS (research: health-coaching apps run weekly review
+// cycles, so 14d = two cycles → enough for the coach to say "vs last week" while the thread stays light
+// and fast to load). NOTE: we fetch DESC + in-memory window + reverse — the old `asc + limit(100)`
+// returned a long-time user's OLDEST 100 messages (so they never saw recent chat). Single orderBy only
+// (no composite index — house rule).
+const CHAT_WINDOW_DAYS = 14;
 router.get("/chat", async (req, res) => {
   const { deviceId } = req.query;
   if (!deviceId) return res.status(400).json({ error: "deviceId required" });
   try {
+    const cutoff = Date.now() - CHAT_WINDOW_DAYS * 24 * 60 * 60 * 1000;
     const snap = await chatsCol(deviceId)
-      .orderBy("created_at", "asc")
-      .limit(100)
+      .orderBy("created_at", "desc")
+      .limit(400) // safety cap; a 14-day window is well under this for any real user
       .get();
-    const messages = snap.docs.map((d) => ({
-      id: d.id,
-      ...d.data(),
-      created_at: toIso(d.data().created_at),
-    }));
+    const messages = snap.docs
+      .map((d) => ({ id: d.id, ...d.data(), created_at: toIso(d.data().created_at) }))
+      .filter((m) => getMillis(m.created_at) >= cutoff)
+      .reverse(); // back to chronological (oldest → newest) for the thread
     return res.json({ messages });
   } catch (e) {
     log.error("[fitness] chat GET:", e);
@@ -4562,15 +5356,16 @@ router.get("/chat/unread", async (req, res) => {
   const { deviceId } = req.query;
   if (!deviceId) return res.status(400).json({ error: "deviceId required" });
   try {
+    // Single-field where only (NO composite index — law). Filter is_read + sort in memory.
     const snap = await chatsCol(deviceId)
       .where("is_proactive", "==", true)
-      .where("is_read", "==", false)
-      .limit(30)
+      .limit(50)
       .get();
-    snap.docs.sort(
+    const unread = snap.docs.filter((d) => d.data().is_read !== true);
+    unread.sort(
       (a, b) => getMillis(b.data().created_at) - getMillis(a.data().created_at),
     );
-    const messages = snap.docs.map((d) => ({
+    const messages = unread.slice(0, 30).map((d) => ({
       id: d.id,
       ...d.data(),
       created_at: toIso(d.data().created_at),
@@ -4607,7 +5402,7 @@ router.post("/chat/read", async (req, res) => {
 // Hourly proactive cron
 // ----------------------------------------------------------------
 const _fitnessCronTick = async () => {
-    const snap = await db().collection("wellness_users").limit(200).get();
+    const snap = await db().collection(bcNs("users")).limit(200).get();
     for (const userDoc2 of snap.docs) {
       const deviceId = userDoc2.id;
       try {
