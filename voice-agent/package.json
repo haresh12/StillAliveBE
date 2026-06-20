@@ -1,0 +1,7 @@
+{
+  "name": "wellnessos-voice-agent",
+  "private": true,
+  "type": "module",
+  "description": "LiveKit voice-agent worker for the big-change AI call coach. Run from the backend root: npm run voice-agent",
+  "//": "ESM module (the @livekit/agents framework is ESM-only). Deps are declared in the backend root package.json and resolved from ../node_modules."
+}
