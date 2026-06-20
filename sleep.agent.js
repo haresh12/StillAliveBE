@@ -650,7 +650,10 @@ router.post('/log', async (req, res) => {
         const pName    = profileSnap.exists ? (profileSnap.data().name || '') : '';
         const recent   = recentLogsSnap.docs.map(d => d.data());
         const targetHours = sleepDataBefore.target_hours || 7.5;
-        const debt        = calcSleepDebt([...recent].reverse(), targetHours);
+        let debt          = calcSleepDebt([...recent].reverse(), targetHours);
+        // Apple Health: device-measured sleep debt can be worse than what they logged → wind-down nudge
+        // fires on the real debt (MAX). No HK → unchanged (parity).
+        try { const hk = await getHealthSignals(deviceId); if (hk && hk.sleep && hk.sleep.debt7 != null) debt = Math.max(debt, hk.sleep.debt7); } catch { /* no HK — parity */ }
 
         let proactiveMsg = null;
         let proactiveType = null;
@@ -1149,6 +1152,8 @@ router.post('/chat', async (req, res) => {
 // POST /chat/stream — SSE streaming
 // ─────────────────────────────────────────────────────────────────
 const { mountChatStream: _mountChatStreamSleep } = require('./lib/chat-stream');
+const { domainHealthText } = require('./lib/hk-domain'); // Apple Health coach context (empty if no HK)
+const { getHealthSignals } = require('./lib/hk-signals'); // Apple Health measured sleep debt (null if no HK)
 _mountChatStreamSleep(router, {
   agentName: 'sleep',
   openai, admin, chatsCol,
@@ -1169,7 +1174,7 @@ _mountChatStreamSleep(router, {
       .map(d => d.data())
       .filter(m => (m.role === 'assistant' || m.role === 'user') && m.content && m.content.trim())
       .map(m => ({ role: m.role, content: m.content }));
-    return { systemPrompt, history };
+    return { systemPrompt: systemPrompt + (await domainHealthText(deviceId, 'sleep').catch(() => '')), history };
   },
 });
 

@@ -2788,6 +2788,7 @@ router.post('/chat', async (req, res) => {
 // POST /chat/stream — SSE streaming
 // ─────────────────────────────────────────────────────────────────
 const { mountChatStream: _mountChatStreamWater } = require('./lib/chat-stream');
+const { domainHealthText } = require('./lib/hk-domain'); // Apple Health coach context (empty if no HK)
 _mountChatStreamWater(router, {
   agentName: 'water',
   openai, admin, chatsCol,
@@ -2810,7 +2811,7 @@ _mountChatStreamWater(router, {
         ];
       })
       .filter(m => m.content);
-    return { systemPrompt, history };
+    return { systemPrompt: systemPrompt + (await domainHealthText(deviceId, 'water').catch(() => '')), history };
   },
 });
 

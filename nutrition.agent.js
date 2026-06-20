@@ -889,6 +889,29 @@ router.post('/setup', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
+// GET /db-status — is the food-grounding pipeline actually hitting REAL databases in THIS environment?
+// Read-only. Reports which sources are keyed + a live "apple" lookup, so production can never silently
+// degrade to AI estimates without anyone noticing. Hit it after deploy: grounding_active MUST be true.
+// ═══════════════════════════════════════════════════════════════
+router.get('/db-status', async (req, res) => {
+  const keys = {
+    usda: !!process.env.USDA_API_KEY,
+    fatsecret: !!(process.env.FATSECRET_CLIENT_ID && process.env.FATSECRET_CLIENT_SECRET),
+    open_food_facts: true, // no key required
+  };
+  const live = {};
+  try { const r = await searchUSDA('apple'); live.usda = Array.isArray(r) ? r.length : 0; }
+  catch (e) { live.usda = `error: ${e.message}`; }
+  try { live.fatsecret = keys.fatsecret ? (await searchFatSecret('apple')).length : 'no_key'; }
+  catch (e) { live.fatsecret = `error: ${e.message}`; }
+  try { const r = await searchOpenFoodFacts('apple'); live.open_food_facts = Array.isArray(r) ? r.length : 0; }
+  catch (e) { live.open_food_facts = `error: ${e.message}`; }
+  const grounding_active = (typeof live.usda === 'number' && live.usda > 0)
+    || (typeof live.fatsecret === 'number' && live.fatsecret > 0);
+  res.json({ env: process.env.NODE_ENV || 'unknown', keys, live_test_query: 'apple', live_results: live, grounding_active });
+});
+
+// ═══════════════════════════════════════════════════════════════
 // GET /setup-status
 // ═══════════════════════════════════════════════════════════════
 router.get('/setup-status', async (req, res) => {
@@ -1531,6 +1554,7 @@ Empty corrections array means everything looks accurate.`;
       // — max ~30 tokens per correction, capped at 10 items. 400 is plenty;
       // 1500 was overweight and added ~200ms per vision request.
       max_completion_tokens: 400,
+      seed: 7, // reproducibility: the same items audit to the same corrections each time
       messages: [{ role: 'user', content: prompt }],
       response_format: { type: 'json_object' },
     });
@@ -1668,6 +1692,38 @@ async function _resolveItemAgainstDB(item) {
   }
 }
 
+// Convert the identifier's (quantity, unit) into GRAMS so a DB per-serving value scales correctly. This is
+// the portion-math step: without it, "5 pieces" was being divided by a gram serving (5/50g) and silently
+// wrong. For piece/slice/serving we treat ONE of them as ONE DB serving, so N pieces = N× the serving.
+function _portionToGrams(quantity, unit, dbServingG) {
+  const q = Number(quantity) > 0 ? Number(quantity) : 1;
+  const u = String(unit || 'g').toLowerCase();
+  if (u === 'g' || u === 'gram' || u === 'grams') return q;
+  if (u === 'ml' || u === 'milliliter' || u === 'milliliters') return q; // ~1 g/ml for foods & most drinks
+  if (u === 'oz' || u === 'ounce' || u === 'ounces') return q * 28.35;
+  if (u === 'lb' || u === 'pound' || u === 'pounds') return q * 453.6;
+  if (u === 'cup' || u === 'cups') return q * 240;
+  if (u === 'tbsp' || u === 'tablespoon') return q * 15;
+  if (u === 'tsp' || u === 'teaspoon') return q * 5;
+  // piece / slice / serving / unit / large / medium / small → one of them ≈ one DB serving
+  const per = dbServingG > 0 ? dbServingG : 100;
+  return q * per;
+}
+
+// Word-overlap match score (0–1) between the identified food and a DB entry. Robust where a raw 6-char
+// prefix failed: "scrambled eggs" vs "Egg, whole, cooked, scrambled" shares {egg, scrambled} → 1.0. Crude
+// singularization + stop-word strip so "eggs"≈"egg" and filler ("whole", "raw", "ns") doesn't dilute it.
+const _MATCH_STOP = new Set(['the', 'a', 'an', 'of', 'with', 'and', 'in', 'raw', 'cooked', 'fresh', 'whole', 'ns', 'prepared', 'plain', 'large', 'medium', 'small', 'serving']);
+function _nameMatchScore(aiName, dbName) {
+  const toks = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9 ]/g, ' ').split(/\s+/)
+    .map((w) => w.replace(/s$/, '')) // crude singularize
+    .filter((w) => w.length >= 3 && !_MATCH_STOP.has(w));
+  const a = new Set(toks(aiName)), b = new Set(toks(dbName));
+  if (!a.size || !b.size) return 0;
+  let inter = 0; for (const w of a) if (b.has(w)) inter += 1;
+  return inter / Math.min(a.size, b.size); // fraction of the smaller (more specific) name that overlaps
+}
+
 // Apply a cached/fresh DB candidate to an item with confidence gating.
 function _applyDbMatch(item, candidate, fromCache) {
   if (!candidate || !candidate.top) {
@@ -1682,11 +1738,15 @@ function _applyDbMatch(item, candidate, fromCache) {
   const aiName = (item.name || '').toLowerCase();
 
   const brandMatches = aiBrand && dbBrand && (dbBrand.includes(aiBrand) || aiBrand.includes(dbBrand));
+  // Token overlap is the primary gate now (a database hit should WIN whenever it genuinely refers to the
+  // same food). ≥0.5 = at least half the more-specific name's content words match. Prefix kept as a cheap
+  // extra. This is the change that flips most common foods from an AI estimate to a real, consistent DB value.
+  const matchScore = _nameMatchScore(aiName, dbName);
   const namePrefixMatch = aiName.length >= 4 && (
     dbName.includes(aiName.slice(0, 6)) || aiName.includes(dbName.slice(0, 6))
   );
   const goodServing = dbServingG > 0;
-  const isHighConfidence = goodServing && (brandMatches || namePrefixMatch);
+  const isHighConfidence = goodServing && (brandMatches || matchScore >= 0.5 || namePrefixMatch);
 
   if (!isHighConfidence) {
     return {
@@ -1700,8 +1760,10 @@ function _applyDbMatch(item, candidate, fromCache) {
     };
   }
 
-  const rawRatio = (item.quantity || 100) / dbServingG;
-  const ratio = Math.max(0.2, Math.min(5, rawRatio));
+  // Portion math: convert the stated quantity/unit to grams, then scale the DB per-serving value.
+  const grams = _portionToGrams(item.quantity, item.unit, dbServingG);
+  const rawRatio = grams / dbServingG;
+  const ratio = Math.max(0.1, Math.min(12, rawRatio)); // allow up to ~12 servings (e.g. "5 pieces")
   const sourceLabel = candidate.sourceKey === 'fatsecret' ? 'FatSecret (RD-verified)'
     : candidate.sourceKey === 'usda' ? 'USDA Foundation Foods'
     : 'Open Food Facts';
@@ -1824,6 +1886,14 @@ const _SYSTEM_PROMPT_CACHED = `You are an elite nutritionist analyzing meal phot
    - "medium" = food clear, portion estimated from plate context
    - "low"    = partially obscured / ambiguous / mixed / unfamiliar
 
+6b. SCALE ANCHORS — USE WHAT'S IN THE FRAME to size portions accurately:
+   - A standard dinner plate is ~26-27 cm wide; a salad/side plate ~20 cm.
+   - A dinner fork is ~18-20 cm long; a tablespoon head ~5 cm. Use these to gauge real grams.
+   - A mound of meat the size of a deck of cards ≈ 85 g; a fist of starch ≈ 150 g.
+   - Typical Western dinner-plate components: cooked meat/roast entree 150-220 g; mashed potato/rice/pasta
+     side 150-220 g; gravy/sauce 40-80 g; cooked vegetable medley 80-120 g. A full plate like this is
+     commonly 600-850 kcal — do NOT report 400-560 for a loaded dinner plate.
+
 7. CALORIC MATH SANITY: calories ≈ protein×4 + carbs×4 + fat×9 within ±10%. Self-audit before returning.
 
 8. DECISIVENESS — same food, same numbers, every time. A medium banana = 105 kcal. Period.
@@ -1832,10 +1902,13 @@ const _SYSTEM_PROMPT_CACHED = `You are an elite nutritionist analyzing meal phot
 - NEVER return cooked-weight grams for instant-noodle/ramen/cup-soup. Use packet-equivalent.
 - NEVER use "count" as a unit — use "piece".
 - NEVER produce calories that violate the 4/4/9 macro math.
-- NEVER guess wildly when fiducial is absent — set confidence:"low" and use conservative portion.
+- When no fiducial is present — set confidence:"low" and estimate a REALISTIC typical portion (not a timid one).
 - NEVER merge a multi-item plate into one row.
 - NEVER omit a brand field for visible packaged products.
-- NEVER over-estimate (300g rice when actually 150g) — bias to under.
+- AIM FOR THE TRUE PORTION — do NOT systematically bias low OR high. Undercounting a calorie tracker is just
+  as harmful as overcounting: it makes users think they ate less than they did and destroys their trust when
+  it doesn't match reality. A fatty braised/roast meat + starch + sauce dinner plate is genuinely 600-850 kcal;
+  report that, not a cautious 500. Use the plate/fork scale anchors and the cooking-method multiplier honestly.
 - NEVER set protein/carbs/fat to 0 unless the food is genuinely fat-free (water, black coffee).
 
 ═══════════════ FEW-SHOT EXAMPLES (study these patterns — primary market USA/UK/CA/AU) ═══════════════
@@ -1999,6 +2072,10 @@ async function _multiShotVision(shotsBase64, userCtx, hasDepth, hasFiducial) {
   try {
     completion = await openai.chat.completions.create({
       model: modelUsed,
+      // Determinism: the SAME photo must give the SAME items/portions every run. Without a fixed seed the
+      // model re-reads the plate slightly differently each time (4 items vs 3, 549 vs 423 kcal). seed pins it
+      // as far as the API allows; the image-hash cache covers exact re-scans on top of this.
+      seed: 7,
       // Schema caps items at 10 per the prompt rules. ~50 tokens/item +
       // meal_type/is_label/is_restaurant overhead → ~600 tokens worst case.
       // 1200 leaves comfortable headroom; 5000 was wildly overweight and
@@ -2582,6 +2659,7 @@ router.post('/chat', async (req, res) => {
 // POST /chat/stream — SSE streaming (text-only; image upload uses POST /chat)
 // ─────────────────────────────────────────────────────────────────
 const { mountChatStream: _mountChatStreamNutrition } = require('./lib/chat-stream');
+const { domainHealthText } = require('./lib/hk-domain'); // Apple Health coach context (empty if no HK)
 _mountChatStreamNutrition(router, {
   agentName: 'nutrition',
   openai, admin, chatsCol,
@@ -2592,7 +2670,7 @@ _mountChatStreamNutrition(router, {
       .map(d => d.data())
       .filter(m => m.role === 'assistant' || m.role === 'user')
       .map(m => ({ role: m.role, content: m.content }));
-    return { systemPrompt, history };
+    return { systemPrompt: systemPrompt + (await domainHealthText(deviceId, 'nutrition').catch(() => '')), history };
   },
 });
 
@@ -2871,6 +2949,13 @@ CORE RULES:
    - beer → 355ml | wine → 150ml | water → 0 kcal
    - fish/salmon/cod (no weight) → 150g | tuna can → 85g
    - banana medium → 118g | apple medium → 182g
+5b. EXPLICIT COUNT OVERRIDES DEFAULTS — this is critical: when the user states a NUMBER of items ("5 bittora",
+   "2 katori chola", "3 rotis", "half a paratha"), set quantity to that EXACT number and make calories +
+   protein + carbs + fat the TOTAL for the whole stated amount (5 bittora = 5x one bittora, NOT one). Never
+   collapse a stated count down to 1. A "katori" is a small Indian serving bowl about 150 ml / ~120-150 g of
+   the dish ("2 katori dal" = 2 servings of dal). "plate"/"bowl" = 1 standard serving unless a size is given.
+   For a regional dish you don't have an exact default for (e.g. bittora, dhokla, thepla), estimate ONE
+   serving honestly from similar foods, then multiply by the stated count — and keep the unit as "piece".
 6. BRANDED DRINKS — common ones to recognize without ambiguity:
    - "Coca-Cola" / "Coke" → 1 can (355ml) = 140 kcal C39 | "Diet Coke" → 0 kcal
    - "Pepsi" → 355ml = 150 kcal | "Sprite" → 355ml = 140 kcal
@@ -3050,6 +3135,7 @@ async function _runDescribePipeline({ deviceId, transcript, onProgress = null })
     completion = await openai.chat.completions.create({
       model: MODELS.fast,
       max_completion_tokens: 450,
+      seed: 7, // reproducibility: the SAME description should parse to the SAME items/macros every time
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user',   content: `Parse: "${transcript}"` },
@@ -3066,11 +3152,13 @@ async function _runDescribePipeline({ deviceId, transcript, onProgress = null })
   const parsed = safeJSON(completion.choices[0].message.content, { meal_name: '', items: [] });
   const sanity = _checkMacroSanity(parsed.items || []);
 
-  // ── AI self-verification + macro sanity (dynamic) ──
-  // Verifier audits each item's macros against world knowledge of food
-  // composition (USDA FNDDS, IFCT, FatSecret). Then sanity guard clips
-  // impossible values + enforces 4/4/9 calorie reconciliation.
-  const verifiedRaw = await _verifyMacros(parsed.items || []);
+  // ── DB-FIRST GROUNDING (the Golden Rule) ──
+  // The LLM only IDENTIFIED food + quantity. The NUMBERS now come from real databases — FatSecret → USDA
+  // FoodData Central → Open Food Facts, picked by fixed priority, scaled by the portion, and cached — so the
+  // SAME meal yields the SAME macros every time (a database is deterministic; a model is not). The LLM's own
+  // estimate survives ONLY as a fallback for the rare item with no confident DB match. Then the sanity guard
+  // clips anything impossible. This is what turns ~75% inconsistent estimates into trustworthy numbers.
+  const verifiedRaw = await Promise.all((parsed.items || []).map(_resolveItemAgainstDB));
   const itemsRaw = verifiedRaw.map(_sanitizeMacros);
 
   const items = itemsRaw.map((it, idx) => ({
@@ -4255,7 +4343,7 @@ router.get('/analysis', async (req, res) => {
 
     const payload = await _nutritionAnalytics.buildAnalysisPayload(
       deviceId, range, openai, MODELS,
-      { clampStartDate: win.effectiveStartDate, effectiveDays: win.effectiveDays },
+      { clampStartDate: win.effectiveStartDate, effectiveDays: win.effectiveDays, todayStr: win.todayDate },
     );
 
     // Lifetime fetch: pull all food logs since anchor for a per-day quality map.
@@ -4405,19 +4493,11 @@ const _nutritionPreWarmTick = async () => {
   const t0 = Date.now();
   let users = 0, ok = 0, failed = 0;
   try {
-    const recent = admin.firestore.Timestamp.fromMillis(Date.now() - 7 * 86400000);
-    const snap = await admin.firestore()
-      .collectionGroup('food_logs')
-      .where('logged_at', '>=', recent)
-      .select('date_str')
-      .limit(2000)
-      .get();
-    const deviceIds = new Set();
-    snap.docs.forEach(d => {
-      const m = d.ref.path.match(/wellness_users\/([^/]+)/);
-      if (m) deviceIds.add(m[1]);
-    });
-    users = deviceIds.size;
+    // Index-free: NO collectionGroup('food_logs').where(...) — that needs a banned manual
+    // COLLECTION_GROUP index. Enumerate recently-active users via the indexless helper instead.
+    const cutoffDateStr = dateStr(new Date(Date.now() - 7 * 86400000));
+    const deviceIds = await _nutritionCohort.listRecentlyActiveDeviceIds(cutoffDateStr);
+    users = deviceIds.length;
     for (const deviceId of deviceIds) {
       try {
         await _nutritionAnalytics.buildAnalysisPayload(deviceId, '7',  openai, MODELS);
@@ -4447,19 +4527,11 @@ const _nutritionActionRxTick = async () => {
   const t0 = Date.now();
   let users = 0, generated = 0, skipped = 0, failed = 0;
   try {
-    const recent = admin.firestore.Timestamp.fromMillis(Date.now() - 7 * 86400000);
-    const snap = await admin.firestore()
-      .collectionGroup('food_logs')
-      .where('logged_at', '>=', recent)
-      .select('date_str')
-      .limit(3000)
-      .get();
-    const deviceIds = new Set();
-    snap.docs.forEach(d => {
-      const m = d.ref.path.match(/wellness_users\/([^/]+)/);
-      if (m) deviceIds.add(m[1]);
-    });
-    users = deviceIds.size;
+    // Index-free: NO collectionGroup('food_logs').where(...) — that needs a banned manual
+    // COLLECTION_GROUP index. Enumerate recently-active users via the indexless helper instead.
+    const cutoffDateStr = dateStr(new Date(Date.now() - 7 * 86400000));
+    const deviceIds = await _nutritionCohort.listRecentlyActiveDeviceIds(cutoffDateStr);
+    users = deviceIds.length;
 
     for (const deviceId of deviceIds) {
       try {
