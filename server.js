@@ -100,18 +100,50 @@ app.use((req, res, next) => {
 // REMOVED: Referral routes — referral feature removed
 // app.use('/api/referrals', referralRoutes);
 app.use('/api/alive-check', aliveCheckRoutes);
+// CheckWriter (separate app, no backend of its own) — write-only support inbox.
+app.use('/api/checkwriter/support', require('./checkwriter-support.route'));
+app.use('/api/mind',      require('./mind.bc.agent')); // bc owns log/today/analysis/describe/reframe
 app.use('/api/mind',      require('./mind.agent'));
+// Big-change sleep owns log/today/analysis (bc namespace); mounted FIRST so it wins those routes.
+// The legacy sleep router (next line) falls through for describe/logs/setup/chat.
+app.use('/api/sleep',     require('./sleep.bc.agent'));
 app.use('/api/sleep',     require('./sleep.agent'));
+// Multi-agent ROUTER — the first decision point: classifies each chat message → {domain, intent}
+// so the app dispatches to exactly one agent (no cross-agent cascade). Add agents in router.agent.js.
+app.use('/api/route',     require('./router.agent'));
+// Big-change nutrition owns log/today/analysis (bc namespace); mounted FIRST so it wins those routes.
+// The legacy nutrition router (next line) falls through for vision/describe compute + everything else.
+app.use('/api/nutrition', require('./nutrition.bc.agent'));
 app.use('/api/nutrition', require('./nutrition.agent'));
+app.use('/api/water',     require('./water.bc.agent')); // bc owns log/today/analysis/goal/containers
 app.use('/api/water',     require('./water.agent'));
+app.use('/api/fasting',   require('./fasting.bc.agent')); // bc owns session/today/analysis
 app.use('/api/fasting',   require('./fasting.agent'));
 app.use('/api/fitness',   require('./fitness.agent'));
 app.use('/api/personalize', require('./personalize.agent'));
 app.use('/api/community', require('./community'));
 app.use('/api/wellness',  require('./wellness.cross'));
+// big-change: the Combined (cross-agent) analysis — score-free, dynamic, on wellness_bc_*.
+app.use('/api/wellness-combined', require('./wellness-combined.bc.agent'));
 app.use('/api/wellness/v2', require('./wellness-cross-v2'));
 app.use('/webhooks/revenuecat', require('./lib/revenuecat-webhook'));
 app.use('/api/analytics', require('./lib/analytics-api'));
+// big-change: onboarding persistence into the parallel wellness_bc_* namespace.
+app.use('/api/bc/onboarding', require('./bc-onboarding'));
+// big-change: unified Plans + daily-task store (Plans tab daily driver).
+app.use('/api/bc-plans', require('./plans.bc.agent'));
+// big-change: the rebuilt goal-plans engine (legacy /api/goal-plans contract) on the wellness_bc_* namespace.
+app.use('/api/goal-plans', require('./goal-plans.bc.agent'));
+// big-change: voice-CALL coach control plane (LiveKit token + context briefing). The live audio
+// pipeline runs separately in voice-agent/agent.js (npm run voice-agent).
+app.use('/api/voice', require('./voice.bc.agent'));
+// big-change: notification control plane — coach-voice copy composer + engagement telemetry. The
+// notification intelligence (scheduling, caps, quiet hours) lives on-device in src/bigchange/notify.
+app.use('/api/notifications', require('./notifications.bc.agent'));
+
+// big-change P0: Apple Health / Health Connect INGEST + STORE. The app already syncs HK data here;
+// this is where it finally LANDS (wellness_bc_users/{id}/health_samples). See APPLE_HEALTH_BIGCHANGE_PLAN.md.
+app.use('/api/v2/healthkit', require('./healthkit.bc.agent'));
 
 // ============================================
 // V2 CROSS-AGENT NIGHTLY BATCH CRON
@@ -3071,6 +3103,35 @@ app.post('/api/wellness/register', async (req, res) => {
 // START SERVER
 // ============================================
 app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🟢 [voice] call brain = OpenAI Realtime (${process.env.VOICE_REALTIME_MODEL || 'gpt-realtime-mini'}). 'npm start' hits OpenAI directly — no worker.`);
+  startVoiceAgent();
 });
+
+// DORMANT (2026-06-20): the cascaded LiveKit/Deepgram/Cartesia worker. The ACTIVE call brain is now
+// OpenAI Realtime (no worker needed) — `npm start` alone hits OpenAI directly. This auto-spawn is OFF
+// by default so the old stack never launches. REVERT: set VOICE_AGENT_INLINE=true (and the app must
+// call /token instead of /realtime-session). See StillAlive/VOICE_CALL_REALTIME.md.
+function startVoiceAgent() {
+  const inline = process.env.VOICE_AGENT_INLINE === 'true'; // dormant unless explicitly re-enabled
+  if (!inline) return;
+  console.warn('🔴 [voice] VOICE_AGENT_INLINE=true — spawning the LEGACY LiveKit worker (revert mode).');
+  if (!process.env.LIVEKIT_URL || !process.env.LIVEKIT_API_KEY) {
+    log.warn?.('[voice] LIVEKIT_* not set — skipping inline voice agent.');
+    return;
+  }
+  try {
+    const { spawn } = require('child_process');
+    const child = spawn(process.execPath, ['voice-agent/agent.js', 'dev'], {
+      cwd: __dirname,
+      stdio: 'inherit',
+      env: process.env,
+    });
+    child.on('exit', (code) => log.warn?.(`[voice] voice-agent exited (code ${code}). Restart the server to relaunch it.`));
+    child.on('error', (e) => log.error?.('[voice] failed to spawn voice-agent:', e.message));
+    process.on('exit', () => { try { child.kill(); } catch {} });
+  } catch (e) {
+    log.error?.('[voice] could not start inline voice-agent:', e.message);
+  }
+}
 
 module.exports = app;
