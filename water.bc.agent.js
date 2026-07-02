@@ -73,7 +73,10 @@ function dailyTotals(logs) {
 function avgCurve(logs, target_ml, utcOffsetMin = 0) {
   const days = new Set(logs.map((l) => l.date)).size || 1;
   const byHour = new Array(24).fill(0);
-  for (const l of logs) { const ms = getMillis(l.logged_at); if (!ms) continue; const h = new Date(ms - utcOffsetMin * 60000).getHours(); byHour[h] += num(l.effective_ml); }
+  // User-LOCAL hour: shift UTC ms by the user's offset (east-positive), then read UTC fields — matches
+  // the rest of the codebase (range-helpers, mind.bc). Was "ms - offset" + getHours(), which skewed the
+  // whole hydration-timing curve by 2× the offset for any non-UTC user.
+  for (const l of logs) { const ms = getMillis(l.logged_at); if (!ms) continue; const h = new Date(ms + utcOffsetMin * 60000).getUTCHours(); byHour[h] += num(l.effective_ml); }
   let cum = 0; const out = [];
   for (let h = 0; h < 24; h++) {
     cum += byHour[h] / days;

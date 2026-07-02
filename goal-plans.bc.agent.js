@@ -19,6 +19,7 @@ const { OpenAI } = require("openai");
 const { MODELS } = require("./lib/model-router");
 const { resolveAnchor } = require("./lib/user-anchor");
 const { userDoc: bcUserDoc } = require("./lib/collections");
+const { resolveLanguage, appendLanguageInstruction } = require("./lib/i18n-prompt");
 
 const router = express.Router();
 // Lazy OpenAI clients — so the module loads (and unit-tests) even before OPENAI_API_KEY is set at boot.
@@ -41,7 +42,7 @@ const err = (res, code, status = 400) => res.status(status).json({ ok: false, er
 // ── POST /draft — LLM turns a free-text goal into routed coaches + a few good questions ──
 const DRAFT_SYS = `You are a wellness planner. Given a user's goal, return STRICT JSON to set up a short, friendly question flow (NOT a long form).
 Output: {"area": one of ["weight","energy","sleep","calm","fasting","habits"], "coaches_involved": subset of ["fitness","nutrition","mind","sleep","water","fasting"], "questions": [ {"id": short_snake_key, "kind": "chip_single"|"chip_multi"|"duration"|"text", "q": "the question, friendly, <=70 chars", "coach": one coach id, "choices": ["..."] (3-5 options for chip kinds; omit for text)} ], "headline_metric": {"label": "short", "unit": "optional", "direction": "down"|"up"} }
-RULES: 4 to 6 questions, NEVER more. Make them specific to the goal (days/week, level, equipment, constraints, preferences). Exactly one question MUST have kind "duration" with choices ["3","7","14","28"]. NEVER offer a duration longer than 28 days. Plain English. No medical advice.`;
+RULES: 4 to 6 questions, NEVER more. Make them specific to the goal (days/week, level, equipment, constraints, preferences). Exactly one question MUST have kind "duration" with choices ["3","7","14","28"]. NEVER offer a duration longer than 28 days. No medical advice. Write every question in the users language.`;
 
 router.post("/draft", async (req, res) => {
   const { device_id, goal_text } = req.body || {};
@@ -52,7 +53,7 @@ router.post("/draft", async (req, res) => {
     try {
       const c = await openai().chat.completions.create({
         model: MODELS?.mini || "gpt-4o-mini", response_format: { type: "json_object" }, max_completion_tokens: 900,
-        messages: [{ role: "system", content: DRAFT_SYS }, { role: "user", content: String(goal_text).slice(0, 400) }],
+        messages: [{ role: "system", content: appendLanguageInstruction(DRAFT_SYS, resolveLanguage(req)) }, { role: "user", content: String(goal_text).slice(0, 400) }],
       });
       parsed = JSON.parse(c.choices?.[0]?.message?.content || "{}");
     } catch { return err(res, "LLM_UNAVAILABLE", 503); }
@@ -111,7 +112,7 @@ USE REAL PROTOCOLS, by coach:
 - fasting: protocols 12:12 → 14:10 → 16:8; give the eating-window clock (e.g. 12-8 PM); window ends 2h before bed; water/black coffee allowed while fasting.
 - mind: box breathing 5 min for anxiety; 3-min brain-dump for a racing mind; one-line gratitude at night; a morning mood check.
 
-RULES: 2-4 daily_items per phase (quality over quantity). Use weekly_items for training/session days, respecting the user's days-per-week answer. Realistic, specific, plain English. NO medical claims.`;
+RULES: 2-4 daily_items per phase (quality over quantity). Use weekly_items for training/session days, respecting the user's days-per-week answer. Realistic and specific, written in the users own language. NO medical claims.`;
 
 // Pick the phase covering a given 1-based day (phases carry their OWN items, so targets ramp over time).
 function phaseForDay(phases, dayNum) {
@@ -159,7 +160,7 @@ router.post("/draft/finalize", async (req, res) => {
     try {
       const c = await openaiLong().chat.completions.create({
         model: MODELS?.mini || "gpt-4o-mini", response_format: { type: "json_object" }, max_completion_tokens: 1400,
-        messages: [{ role: "system", content: FINAL_SYS }, { role: "user", content: ctx.slice(0, 1600) }],
+        messages: [{ role: "system", content: appendLanguageInstruction(FINAL_SYS, resolveLanguage(req)) }, { role: "user", content: ctx.slice(0, 1600) }],
       });
       p = JSON.parse(c.choices?.[0]?.message?.content || "{}");
     } catch { return err(res, "LLM_UNAVAILABLE", 503); }
