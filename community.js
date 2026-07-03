@@ -1,7 +1,7 @@
 'use strict';
 
 // ═══════════════════════════════════════════════════════════════
-// COMMUNITY — Pulse Backend
+// COMMUNITY — Wellness OS Backend
 // Public wellness rooms, community rules acceptance, messages.
 // Mounted at /api/community in server.js
 // ═══════════════════════════════════════════════════════════════
@@ -102,7 +102,7 @@ const cleanText = value =>
 
 const cleanName = value => {
   const name = String(value || '').replace(/\s+/g, ' ').trim();
-  if (!name || name.toLowerCase() === 'user') return 'Pulse member';
+  if (!name || name.toLowerCase() === 'user') return 'Wellness OS member';
   return name.slice(0, 40);
 };
 
@@ -190,7 +190,7 @@ const mapMessage = doc => {
     id: doc.id,
     groupId: data.groupId,
     deviceId: data.deviceId,
-    displayName: data.displayName || 'Pulse member',
+    displayName: data.displayName || 'Wellness OS member',
     text: data.text || '',
     createdAt: toIso(data.createdAt),
     editedAt: toIso(data.editedAt),

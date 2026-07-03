@@ -1,6 +1,6 @@
 'use strict';
 // ═══════════════════════════════════════════════════════════════
-// PERSONALIZE AGENT — unified Pulse personalization endpoint
+// PERSONALIZE AGENT — unified Wellness OS personalization endpoint
 //
 // Mounted at /api/personalize. Replaces 6 individual /setup endpoints
 // (one per agent) with a single atomic save that:
