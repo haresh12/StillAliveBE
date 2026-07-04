@@ -5,7 +5,7 @@
  *   - resolveLanguage priority: body.language > X-User-Language > Accept-Language > 'en'
  *   - normalizeLanguage: case-insensitive, validates against supported set
  *   - appendLanguageInstruction: English no-op; non-en appends suffix; cache-friendly
- *   - Brand glossary preserved in every non-en directive (Pulse, Coach,
+ *   - Brand glossary preserved in every non-en directive (Wellness OS, Coach,
  *     Hydration Score, Wellness Score, Did You Know, Same Day Last Week)
  *   - Voice notes per language (du / tu / ты / tú / você)
  *   - resolveUserLanguage(db, deviceId): reads aliveChecks/{id}.profile.language,
@@ -77,7 +77,7 @@ assert('Header > Accept-Language',
 
 // ── appendLanguageInstruction ────────────────────────────────────────
 console.log('\nappendLanguageInstruction');
-const base = 'You are the Nutrition Coach in Pulse.';
+const base = 'You are the Nutrition Coach in Wellness OS.';
 const enOut = appendLanguageInstruction(base, 'en');
 assert('English = no-op (returns input unchanged)', enOut === base);
 assert('null language = no-op', appendLanguageInstruction(base, null) === base);
@@ -103,7 +103,7 @@ const ptOut = appendLanguageInstruction(base, 'pt');
 assert('Portuguese: Brazilian / você',              ptOut.includes('você') || ptOut.includes('Brazilian'));
 
 // Brand glossary preserved in every non-en directive
-const BRAND = ['Pulse','Coach','Hydration Score','Wellness Score','Did You Know','Same Day Last Week','Aha'];
+const BRAND = ['Wellness OS','Coach','Hydration Score','Wellness Score','Did You Know','Same Day Last Week','Aha'];
 for (const lang of ['de','es','fr','pt','ru']) {
   const dir = buildLanguageDirective(lang);
   let allPresent = true;
