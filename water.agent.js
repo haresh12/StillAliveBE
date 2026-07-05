@@ -1,7 +1,7 @@
 'use strict';
 
 // ═══════════════════════════════════════════════════════════════
-// WATER AGENT — Pulse Backend
+// WATER AGENT — Wellness OS Backend
 // Mounted at /api/water in server.js
 //
 // 10/10 upgrade goals:
@@ -99,7 +99,10 @@ function invalidateCtx(deviceId) {
 }
 
 // ─── Firestore paths ──────────────────────────────────────────
-const userDoc    = (id) => db().collection('wellness_users').doc(id);
+// bc-aware: resolves wellness_bc_users/{id} (was legacy wellness_users) so the
+// proactive cron + fall-through handlers operate on big-change users. Same
+// subcollection names → all downstream helpers "just work" on bc.
+const userDoc    = (id) => require('./lib/collections').userDoc(id);
 const waterDoc   = (id) => userDoc(id).collection('agents').doc('water');
 const logsCol    = (id) => waterDoc(id).collection('water_logs');
 const chatsCol   = (id) => waterDoc(id).collection('water_chats');
@@ -2736,7 +2739,7 @@ router.post('/chat', async (req, res) => {
     };
 
     const systemPrompt = appendLanguageInstruction([
-      'You are the Water Coach inside Pulse — a precision wellness app.',
+      'You are the Water Coach inside Wellness OS — a precision wellness app.',
       'You coach behavior change using the user\'s actual numbers. You know IOM weight-based goals, beverage hydration multipliers, cortisol-window front-loading, taper timing, pace-gap math, sweat-rate recovery, and cross-agent links with sleep and mood.',
       '',
       'RULES:',
@@ -2796,7 +2799,7 @@ _mountChatStreamWater(router, {
   model: 'gpt-4.1-mini', maxTokens: 175,
   buildPrompt: async (deviceId /* , message */) => {
     const context = await getCachedContext(deviceId);
-    const systemPrompt = `You are the Water Coach inside Pulse. Use exact numbers from context. Under 100 words. Sharp performance coach. Banned openings: praise/validation.\n\nUSER DATA:\n${context}`;
+    const systemPrompt = `You are the Water Coach inside Wellness OS. Use exact numbers from context. Under 100 words. Sharp performance coach. Banned openings: praise/validation.\n\nUSER DATA:\n${context}`;
     const histSnap = await chatsCol(deviceId).orderBy('created_at', 'desc').limit(24).get();
     const history = histSnap.docs.map(d => d.data())
       .filter(m => !m.is_proactive)
@@ -2956,10 +2959,15 @@ function dateStrLocal(localNow) {
 }
 
 const _waterCronTick = async () => {
-    const usersSnap = await db().collection('wellness_users').get();
+    // bc users (wellness_bc_users). Enumerate all; per-user gates below filter by
+    // waterDoc.setup_completed + focus (only users who UNLOCKED water are reached).
+    const usersSnap = await db().collection(require('./lib/collections').ns('users')).get();
 
     for (const user of usersSnap.docs) {
       const deviceId = user.id;
+      // Only reach out about agents the user actually unlocked at onboarding.
+      const _focus = user.data()?.focus_domains;
+      if (Array.isArray(_focus) && _focus.length && !_focus.includes('water')) continue;
 
       try {
         const waterSnap = await waterDoc(deviceId).get();

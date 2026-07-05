@@ -1,7 +1,7 @@
 'use strict';
 
 // ═══════════════════════════════════════════════════════════════
-// MIND AGENT — Pulse Backend
+// MIND AGENT — Wellness OS Backend
 // All routes, AI logic, action generation, chat, proactive cron.
 // Mounted at /api/mind in server.js
 // ═══════════════════════════════════════════════════════════════
@@ -14,6 +14,7 @@ const cron    = require('node-cron');
 const { fetchAgentSnapshot } = require('./lib/cross-agent-context');
 const { resolveLanguage, appendLanguageInstruction } = require('./lib/i18n-prompt');
 const { withCron, shouldRunCron } = require('./lib/cron-helper');
+const { getUserNotifContext } = require('./lib/cron-user-context');
 const { resolveAnchor } = require('./lib/user-anchor');
 const { assertLoggableDate, sendLogGuardError } = require('./lib/log-guard');
 const { computeMindScore: _computeMindScore } = require('./lib/agent-scores');
@@ -24,7 +25,10 @@ const openai  = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const db      = () => admin.firestore();
 
 // ─── Firestore path helpers ───────────────────────────────────
-const userDoc  = (id) => db().collection('wellness_users').doc(id);
+// bc-aware: resolves wellness_bc_users/{id} (was legacy wellness_users) so the
+// proactive cron + fall-through handlers operate on big-change users. Same
+// subcollection names → all downstream helpers "just work" on bc.
+const userDoc  = (id) => require('./lib/collections').userDoc(id);
 const mindDoc  = (id) => userDoc(id).collection('agents').doc('mind');
 const checkinsCol = (id) => mindDoc(id).collection('mind_checkins');
 const actionsCol  = (id) => mindDoc(id).collection('mind_actions');
@@ -1181,7 +1185,7 @@ ${chatSnippet || 'nothing yet'}`;
   const count = isBonus ? '2' : '2-3';
   const crossSection = crossAgentCtx ? `\n━━━ CROSS-AGENT CONTEXT ━━━\n${crossAgentCtx}\nUse this data to make at least one action directly address a cross-agent pattern.\n` : '';
 
-  const prompt = `Generate ${count} daily actions for ${name}'s Mind Coach in the Pulse wellness app.
+  const prompt = `Generate ${count} daily actions for ${name}'s Mind Coach in the Wellness OS app.
 
 USER PROFILE:
 Name: ${name}
@@ -1469,7 +1473,7 @@ async function buildContext(deviceId) {
   } catch (_e) { /* non-fatal — skip cross-agent block */ }
   // ──────────────────────────────────────────────────────────────
 
-  return `You are the Mind Coach in Pulse — a deeply personal AI mental health coach. You are NOT a generic AI assistant. You are not ChatGPT. You have been privately observing ${name} for ${daysLogged > 0 ? `${daysLogged} days` : 'the start of their journey'} across ${totalCount} total check-ins. You know them in ways no generic AI ever could.
+  return `You are the Mind Coach in Wellness OS — a deeply personal AI mental health coach. You are NOT a generic AI assistant. You are not ChatGPT. You have been privately observing ${name} for ${daysLogged > 0 ? `${daysLogged} days` : 'the start of their journey'} across ${totalCount} total check-ins. You know them in ways no generic AI ever could.
 
 Your rule: if you say something a stranger could have said, you have failed. Every sentence must reflect their specific data, their specific words, their specific patterns.
 
@@ -1929,7 +1933,7 @@ async function generateAnalysisInsight(setup, stats) {
     taskLine = `Early signal — only ${total_checkins} check-in${total_checkins === 1 ? '' : 's'}. Most common emotion: ${topEmotion}${topTrigger ? `. First trigger appearing: "${topTrigger}"` : ''}. Mood avg: ${overall_avg != null ? `${overall_avg.toFixed(1)}/4` : '—'}. Anxiety avg: ${overall_anxiety != null ? `${overall_anxiety.toFixed(1)}/5` : '—'}${anxiety_peak_time ? `. Anxiety hitting hardest in the ${anxiety_peak_time}` : ''}. Write 2 sharp sentences: what's already visible in the data, and what pattern to watch for next. Reference their stated challenge if it matches.`;
   }
 
-  const prompt = `You are the Mind Coach insight engine for Pulse — a premium mental health tracking app.
+  const prompt = `You are the Mind Coach insight engine for Wellness OS — a premium mental health tracking app.
 
 User profile:
 - Primary challenge: ${primaryChallenge}
@@ -1998,19 +2002,34 @@ function buildOpeningMessage(name, primary_challenge, triggers) {
 
 async function runProactiveChecks() {
   try {
+    // bc users have no user-doc mind_setup_complete flag; enumerate all bc users
+    // and rely on the per-user mindDoc.setup_completed + focus gates below.
     const usersSnap = await db()
-      .collection('wellness_users')
-      .where('mind_setup_complete', '==', true)
+      .collection(require('./lib/collections').ns('users'))
       .get();
 
     if (usersSnap.empty) return;
 
-    const today = dateStr();
-    const hour  = new Date().getHours();
+    // Cron now runs hourly; each user is gated to their OWN local morning (~8am). Users we can't localize
+    // (no stored timezone) fall back to the historical 10:00 UTC slot, so their behaviour is unchanged.
+    const serverHour = new Date().getUTCHours();
+    const MORNING_LOCAL_HOUR = 8;
 
     for (const uDoc of usersSnap.docs) {
       const deviceId = uDoc.id;
       const userData = uDoc.data();
+      // Only reach out about agents the user actually unlocked at onboarding.
+      if (Array.isArray(userData.focus_domains) && userData.focus_domains.length &&
+          !userData.focus_domains.includes('mind')) continue;
+
+      const ctx = await getUserNotifContext(db(), deviceId).catch(() => null);
+      const fireNow = ctx && ctx.hasUserTimezone ? ctx.localHour === MORNING_LOCAL_HOUR : serverHour === 10;
+      if (!fireNow) continue;
+      // Per-user local "today" for the once-a-day dedupe + same-day-log filter, and local hour/day for any
+      // time-of-day copy decisions (falls back to server UTC when the user has no timezone).
+      const today = ctx && ctx.hasUserTimezone ? ctx.localDateStr : dateStr();
+      const hour = ctx && ctx.hasUserTimezone ? ctx.localHour : serverHour;
+      const localDow = ctx && ctx.hasUserTimezone ? ctx.localNow.getUTCDay() : new Date().getUTCDay();
 
       if (userData.last_mind_proactive_date === today) continue;
 
@@ -2062,8 +2081,8 @@ async function runProactiveChecks() {
           }
         }
 
-        // ── Sunday evening weekly summary ──
-        if (!msg && new Date().getDay() === 0 && hour >= 19) {
+        // ── Sunday evening weekly summary ── (uses the user's LOCAL day + hour)
+        if (!msg && localDow === 0 && hour >= 19) {
           const weekLogs = recent.filter(c => (Date.now() - new Date(c.logged_at).getTime()) < 7 * 86400000);
           if (weekLogs.length >= 3) {
             const avgMood    = (weekLogs.reduce((s, c) => s + c.mood_score, 0) / weekLogs.length).toFixed(1);
@@ -2111,7 +2130,7 @@ async function runProactiveChecks() {
             is_read:        false,
             created_at:     admin.firestore.FieldValue.serverTimestamp(),
           });
-          await db().collection('wellness_users').doc(deviceId).update({
+          await userDoc(deviceId).update({
             last_mind_proactive_date: today,
           });
         }
@@ -2136,7 +2155,7 @@ async function buildAnxietyProactive(name, anxiety, emotions, triggers, note, re
     (c.note ? ` note="${c.note}"` : '')
   ).join('\n');
 
-  const prompt = `You are a personal Mind Coach in the Pulse wellness app. ${name} just logged anxiety ${anxiety}/5 — that's high. Reach out right now.
+  const prompt = `You are a personal Mind Coach in the Wellness OS app. ${name} just logged anxiety ${anxiety}/5 — that's high. Reach out right now.
 
 WHAT THEY JUST LOGGED:
 Anxiety: ${anxiety}/5
@@ -2174,7 +2193,7 @@ Write ONE short message (2-3 sentences max). Rules:
 async function buildStreakProactive(name, streakDays, mindData) {
   const greeting  = name ? `${name}, ` : '';
   const challenge = mindData.primary_challenge || 'mental wellness';
-  const prompt = `You are a personal Mind Coach in the Pulse wellness app. ${name} just hit a ${streakDays}-day logging streak — that's a real milestone worth acknowledging.
+  const prompt = `You are a personal Mind Coach in the Wellness OS app. ${name} just hit a ${streakDays}-day logging streak — that's a real milestone worth acknowledging.
 
 Primary challenge they're working on: ${challenge}
 
@@ -2287,18 +2306,30 @@ function getWeekKey(d = new Date()) {
 // ═══════════════════════════════════════════════════════════════
 async function runStreakReminders() {
   try {
+    // bc users have no user-doc mind_setup_complete flag; enumerate all bc users
+    // and rely on the per-user mindDoc.setup_completed + focus gates below.
     const usersSnap = await db()
-      .collection('wellness_users')
-      .where('mind_setup_complete', '==', true)
+      .collection(require('./lib/collections').ns('users'))
       .get();
 
     if (usersSnap.empty) return;
 
-    const today = dateStr();
+    // Hourly cron; each user gated to their OWN local evening (~8pm). No-timezone users fall back to the
+    // historical 20:00 UTC slot so their behaviour is unchanged.
+    const serverHour = new Date().getUTCHours();
+    const EVENING_LOCAL_HOUR = 20;
 
     for (const uDoc of usersSnap.docs) {
       const deviceId = uDoc.id;
       const userData = uDoc.data();
+      // Only reach out about agents the user actually unlocked at onboarding.
+      if (Array.isArray(userData.focus_domains) && userData.focus_domains.length &&
+          !userData.focus_domains.includes('mind')) continue;
+
+      const ctx = await getUserNotifContext(db(), deviceId).catch(() => null);
+      const fireNow = ctx && ctx.hasUserTimezone ? ctx.localHour === EVENING_LOCAL_HOUR : serverHour === 20;
+      if (!fireNow) continue;
+      const today = ctx && ctx.hasUserTimezone ? ctx.localDateStr : dateStr();
 
       if (userData.last_streak_reminder_date === today) continue;
 
@@ -2331,7 +2362,7 @@ async function runStreakReminders() {
             is_read:        false,
             created_at:     admin.firestore.FieldValue.serverTimestamp(),
           });
-          await db().collection('wellness_users').doc(deviceId).update({
+          await userDoc(deviceId).update({
             last_streak_reminder_date: today,
           });
         }
@@ -2350,10 +2381,12 @@ async function runStreakReminders() {
 // Evening: streak-at-risk only (behaviour-triggered, highest value)
 // ═══════════════════════════════════════════════════════════════
 if (shouldRunCron()) {
-  cron.schedule('0 10 * * *', withCron('mind:morning-proactive', async () => {
+  // Hourly — the handlers gate each user to their own local morning (8am) / evening (8pm); users without a
+  // stored timezone fall back to the original 10:00 / 20:00 UTC slots (byte-identical to before).
+  cron.schedule('0 * * * *', withCron('mind:morning-proactive', async () => {
     await runProactiveChecks();
   }, { ttlMs: 20 * 60_000 }), { timezone: 'UTC' });
-  cron.schedule('0 20 * * *', withCron('mind:evening-streak', async () => {
+  cron.schedule('0 * * * *', withCron('mind:evening-streak', async () => {
     await runStreakReminders();
   }, { ttlMs: 20 * 60_000 }), { timezone: 'UTC' });
 }

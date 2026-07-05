@@ -693,30 +693,42 @@ if (shouldRunCron()) {
 // ────────────────────────────────────────────────────────────────────
 async function fireCrossAgentProactives() {
   const db = admin.firestore();
-  const today = new Date().toISOString().slice(0, 10);
+  const { ns } = require('./lib/collections');
+  const bcUser = (id) => db.collection(ns('users')).doc(id);
   try {
-    const usersSnap = await db.collection('wellness_users').limit(2000).get();
+    // bc users (wellness_bc_users). Cron runs hourly; each user is gated to their
+    // OWN local 8am/2pm below, so reach-outs land at the right local time worldwide.
+    const usersSnap = await db.collection(ns('users')).limit(2000).get();
     let fired = 0;
     for (const doc of usersSnap.docs) {
       const deviceId = doc.id;
       try {
         const userData = doc.data();
-        // Skip if already sent a cross proactive today
-        if (userData.last_cross_proactive_date === today) continue;
 
         // Honour the user's notif + DND + timezone preferences. allowsProactive
         // is `notif_enabled && !inDND` — covers global off-switch + quiet hours.
         const notifCtx = await getUserNotifContext(db, deviceId);
         if (!notifCtx.allowsProactive) continue;
 
-        // Derive which agents are set up from the per-agent flags written at setup time
+        // Per-user LOCAL day + local-hour gate. The cron runs hourly; fire only at
+        // the user's local 8am / 2pm (falls back to server-UTC hour when we can't
+        // localize — the same instants the old fixed 08:00/14:00 UTC schedule hit).
+        const today = notifCtx.localDateStr || new Date().toISOString().slice(0, 10);
+        if (![8, 14].includes(notifCtx.localHour)) continue;
+        // Skip if already sent a cross proactive today (user-local day)
+        if (userData.last_cross_proactive_date === today) continue;
+
+        // Which agents to consider: the ones the user UNLOCKED at onboarding
+        // (focus_domains). Fall back to legacy per-agent setup flags for old users.
+        const focus = Array.isArray(userData.focus_domains) ? userData.focus_domains : null;
+        const isUp = (a) => focus ? focus.includes(a) : !!userData[`${a}_setup_complete`];
         const agentSetupFlags = {
-          mind:      userData.mind_setup_complete,
-          sleep:     userData.sleep_setup_complete,
-          fitness:   userData.fitness_setup_complete,
-          nutrition: userData.nutrition_setup_complete,
-          water:     userData.water_setup_complete,
-          fasting:   userData.fasting_setup_complete,
+          mind:      isUp('mind'),
+          sleep:     isUp('sleep'),
+          fitness:   isUp('fitness'),
+          nutrition: isUp('nutrition'),
+          water:     isUp('water'),
+          fasting:   isUp('fasting'),
         };
         const setupAgents = Object.entries(agentSetupFlags).filter(([,v]) => v).map(([k]) => k);
         if (setupAgents.length < 2) continue;
@@ -759,12 +771,12 @@ async function fireCrossAgentProactives() {
 
         // Generate message with gpt-4.1-mini
         const agentChat = {
-          mind:      db.collection('wellness_users').doc(deviceId).collection('agents').doc('mind').collection('mind_chats'),
-          sleep:     db.collection('wellness_users').doc(deviceId).collection('agents').doc('sleep').collection('sleep_chats'),
-          fitness:   db.collection('wellness_users').doc(deviceId).collection('agents').doc('fitness').collection('fitness_chats'),
-          water:     db.collection('wellness_users').doc(deviceId).collection('agents').doc('water').collection('water_chats'),
-          nutrition: db.collection('wellness_users').doc(deviceId).collection('agents').doc('nutrition').collection('nutrition_chats'),
-          fasting:   db.collection('wellness_users').doc(deviceId).collection('agents').doc('fasting').collection('fasting_chats'),
+          mind:      bcUser(deviceId).collection('agents').doc('mind').collection('mind_chats'),
+          sleep:     bcUser(deviceId).collection('agents').doc('sleep').collection('sleep_chats'),
+          fitness:   bcUser(deviceId).collection('agents').doc('fitness').collection('fitness_chats'),
+          water:     bcUser(deviceId).collection('agents').doc('water').collection('water_chats'),
+          nutrition: bcUser(deviceId).collection('agents').doc('nutrition').collection('nutrition_chats'),
+          fasting:   bcUser(deviceId).collection('agents').doc('fasting').collection('fasting_chats'),
         };
         if (!agentChat[targetAgent]) continue;
 
@@ -785,7 +797,7 @@ async function fireCrossAgentProactives() {
         if (!msg) continue;
 
         const chatRef = agentChat[targetAgent].doc();
-        const userRef = db.collection('wellness_users').doc(deviceId);
+        const userRef = bcUser(deviceId);
         await db.runTransaction(async (tx) => {
           tx.set(chatRef, {
             role:           'assistant',
@@ -811,7 +823,9 @@ async function fireCrossAgentProactives() {
 }
 
 if (shouldRunCron()) {
-  cron.schedule('0 8,14 * * *', withCron('cross:proactives', fireCrossAgentProactives, {
+  // Hourly so the per-user local 8am/2pm gate inside fireCrossAgentProactives can
+  // fire at each user's real local time (was fixed UTC 08:00/14:00 → wrong worldwide).
+  cron.schedule('0 * * * *', withCron('cross:proactives', fireCrossAgentProactives, {
     ttlMs: 20 * 60_000,
   }), { timezone: 'UTC' });
 }
@@ -980,6 +994,25 @@ async function recomputeTodaySignals(deviceId) {
         out.fasting_active_hours = null;
       }
     } catch { /* non-fatal */ }
+
+    // Breath: is the user actively managing stress with breathwork this week? Context the coach can use
+    // (recovery framing + honest, personalised nudges). Single-field ordered read → no composite index.
+    try {
+      const bSnap = await userDoc(deviceId).collection('agents').doc('breath')
+        .collection('breath_sessions').orderBy('logged_at', 'desc').limit(60).get().catch(() => ({ docs: [] }));
+      const weekAgo = Date.now() - 7 * 86400000;
+      const sess = bSnap.docs.map(d => d.data());
+      const week = sess.filter(s => (s.logged_at?.toMillis ? s.logged_at.toMillis() : 0) >= weekAgo);
+      out.breath_sessions_week = week.length;
+      out.breath_minutes_week  = Math.round(week.reduce((a, s) => a + (s.seconds || 0), 0) / 60);
+      out.breath_last_moment   = sess[0]?.moment || null;
+      // Breath-hold records — the coach can honestly celebrate a new personal best (CO2-tolerance practice,
+      // never a health metric). Read the agent doc's rolled-up best rather than scanning the holds subcol.
+      try {
+        const bDoc = await userDoc(deviceId).collection('agents').doc('breath').get().catch(() => null);
+        out.breath_hold_best_seconds = bDoc?.exists ? Math.round(Number(bDoc.data().best_hold_seconds) || 0) : 0;
+      } catch { out.breath_hold_best_seconds = null; }
+    } catch { out.breath_sessions_week = null; }
   } catch { /* non-fatal — fitness will degrade gracefully */ }
 
   await userDoc(deviceId).collection('cross_agent').doc('today_signals')

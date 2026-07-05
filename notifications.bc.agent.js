@@ -21,9 +21,11 @@ router.post('/copy', async (req, res) => {
   try {
     const deviceId = String(req.body.deviceId || req.body.device_id || '').trim();
     const lang = (req.body.lang || '').toString().slice(0, 8);
+    // Subscription tier drives the coach's slant: entitled users (trial/premium) are NEVER upsold.
+    const tier = String(req.body.tier || '').toLowerCase();
     const moments = Array.isArray(req.body.moments) ? req.body.moments.slice(0, 12) : [];
     if (!deviceId || !moments.length) return res.json({ items: [] });
-    const items = await composeCopy(deviceId, moments, lang).catch(() => null);
+    const items = await composeCopy(deviceId, moments, lang, tier).catch(() => null);
     res.json({ items: items || [] });
   } catch (e) {
     console.error('[notifications] /copy error:', e.message);

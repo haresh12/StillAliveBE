@@ -28,6 +28,13 @@ const AGENTS = [
   { id: "nutrition", label: "Nutrition", emoji: "🥗", col: "food_logs", date: (d) => d.date_str, value: (d, ctx) => clamp(Math.round((num(d.protein || d.p) / (num(ctx && ctx.proteinTarget) || 150)) * 100) || 50, 10, 100) },
   { id: "sleep", label: "Sleep", emoji: "😴", col: "sleep_logs", date: (d) => d.date_str, value: (d) => clamp(Math.round((num(d.sleep_quality || 3) / 5) * 100), 10, 100) },
   { id: "mind", label: "Mood", emoji: "🧠", col: "mind_checkins", date: (d) => d.date_str, value: (d) => clamp(Math.round((num(d.mood_score || 3) / 5) * 100), 10, 100) },
+  // Breathwork is now its own agent (agents/breath/breath_sessions) — surfaced here so it can correlate
+  // with mood/sleep. Value = 0-100 "session quality" scaled by minutes practised (the 5-min evidence
+  // dose tops out). Legacy agents/mind/mind_breathing is left in place, ignored (pre-launch, no migration).
+  { id: "breath", label: "Breathwork", emoji: "🫁", col: "breath_sessions", date: (d) => d.date_str, value: (d) => clamp(Math.round((num(d.seconds) / 60 / 5) * 100) || 40, 20, 100) },
+  // Breath-hold challenge (agents/breath/breath_holds via the `doc` override) — surfaced as its own signal
+  // so CO2-tolerance practice can correlate with sleep/mood. Value = best-hold vs a 2-min reference.
+  { id: "breath_hold", doc: "breath", label: "Breath-hold", emoji: "🫁", col: "breath_holds", date: (d) => d.date_str, value: (d) => clamp(Math.round((num(d.seconds) / 120) * 100) || 30, 20, 100) },
   { id: "water", label: "Hydration", emoji: "💧", col: "water_logs", date: (d) => d.date_str, value: (d) => clamp(Math.round((num(d.ml) / 2500) * 100), 5, 100) },
   // Only ENDED fasts carry a real actual_hours; an in-progress fast has actual_hours=null → skip it so it
   // can't contribute a misleading near-zero value to the day's correlation.
@@ -38,7 +45,7 @@ const AGENTS = [
 async function seriesFor(deviceId, agent, startDate, ctx) {
   const out = {};
   try {
-    const snap = await AGENT_DOC(deviceId, agent.id).collection(agent.col).orderBy("logged_at", "desc").limit(400).get().catch(() => ({ docs: [] }));
+    const snap = await AGENT_DOC(deviceId, agent.doc || agent.id).collection(agent.col).orderBy("logged_at", "desc").limit(400).get().catch(() => ({ docs: [] }));
     const buckets = {};
     for (const doc of snap.docs) {
       const d = doc.data(); const ds = agent.date(d);
@@ -59,7 +66,13 @@ function pearson(xs, ys) {
   const den = Math.sqrt(dx * dy); return den ? clamp(num2 / den, -1, 1) : 0;
 }
 
-// Plain-language connection text (deterministic — explainable, no LLM needed).
+// Plain-language connection text. Deterministic + LOCALIZABLE: the FE renders `text_key` with the
+// two agent ids (a/b), resolving domain labels per-locale. `text` stays as an English fallback.
+function connectionKey(r) {
+  const strong = Math.abs(r) >= 0.6;
+  if (r > 0) return strong ? "connPosStrong" : "connPosWeak";
+  return strong ? "connNegStrong" : "connNegWeak";
+}
 function connectionText(A, B, r) {
   const strong = Math.abs(r) >= 0.6;
   const verb = strong ? "strongly" : "tends to";
@@ -72,22 +85,29 @@ router.get("/", async (req, res) => {
   if (!deviceId) return res.status(400).json({ error: "deviceId required" });
   const range = String(req.query.range || "30");
   try {
-    const anchor = await resolveAnchor(deviceId);
+    // PERF: the anchor resolve and the nutrition-target read are independent — fetch them together.
+    const [anchor, nutDoc] = await Promise.all([
+      resolveAnchor(deviceId),
+      AGENT_DOC(deviceId, "nutrition").get().catch(() => null),
+    ]);
     const win = computeAnalysisWindow(range, anchor.anchorMs, Date.now(), anchor.utcOffsetMinutes);
     const start = win.effectiveStartDate;
     const today = win.todayDate || dateStr();
     const elapsed = Math.max(1, win.effectiveDays);
 
     // The nutrition cross-value scales protein against the user's real target (not a hardcoded 150).
-    const nutDoc = await AGENT_DOC(deviceId, "nutrition").get().catch(() => null);
+    // PERF: fan out EVERY agent's series read in PARALLEL. This loop used to be sequential — 6 agents ×
+    // a remote Firestore round-trip each, one after another = the 6–10s this endpoint was taking.
+    // Promise.all collapses it to ~1 trip.
     const ctx = { proteinTarget: (nutDoc && nutDoc.exists && num(nutDoc.data().protein_target)) || 150 };
-    // Build every agent's series, then keep only ACTIVE agents (≥3 logged days).
+    // Build every agent's series (concurrently), then keep only ACTIVE agents (≥3 logged days).
     const series = {};
-    for (const a of AGENTS) series[a.id] = await seriesFor(deviceId, a, start, ctx);
+    const seriesResults = await Promise.all(AGENTS.map((a) => seriesFor(deviceId, a, start, ctx)));
+    AGENTS.forEach((a, i) => { series[a.id] = seriesResults[i]; });
     const active = AGENTS.filter((a) => Object.keys(series[a.id]).length >= 3);
 
     if (active.length === 0) {
-      return res.json({ ok: true, range, effective_days: elapsed, has_data: false, active_agents: [], days: [], connections: [], momentum: null, balance: [], vs_prior: [], coach_read: [], hero: "Log a few areas and this is where they connect." });
+      return res.json({ ok: true, range, effective_days: elapsed, has_data: false, active_agents: [], days: [], connections: [], momentum: null, balance: [], vs_prior: [], coach_read: [], hero: "Log a few areas and this is where they connect.", hero_key: "heroEmpty" });
     }
 
     // Consistency per active agent.
@@ -116,7 +136,7 @@ router.get("/", async (req, res) => {
       if (xs.length < 7) continue;
       const r = pearson(xs, ys);
       if (Math.abs(r) < 0.3) continue;
-      conns.push({ a: A.id, b: B.id, a_label: A.label, b_label: B.label, r: Math.round(r * 100) / 100, n: xs.length, strength: Math.abs(r) >= 0.6 ? "strong" : "moderate", text: connectionText(A, B, r) });
+      conns.push({ a: A.id, b: B.id, a_label: A.label, b_label: B.label, r: Math.round(r * 100) / 100, n: xs.length, strength: Math.abs(r) >= 0.6 ? "strong" : "moderate", text: connectionText(A, B, r), text_key: connectionKey(r) });
     }
     conns.sort((p, q) => Math.abs(q.r) * q.n - Math.abs(p.r) * p.n);
     const strongest = conns[0] || null;
@@ -126,8 +146,8 @@ router.get("/", async (req, res) => {
     const recentAvg = (a) => { const vals = Object.entries(series[a.id]).filter(([d]) => d > addDays(today, -7)).map(([, e]) => e.value); return vals.length ? mean(vals) : null; };
     const scored = active.map((a) => ({ a, v: recentAvg(a) })).filter((x) => x.v != null).sort((p, q) => q.v - p.v);
     const momentum = scored.length ? {
-      best: { id: scored[0].a.id, label: scored[0].a.label, emoji: scored[0].a.emoji, text: `${scored[0].a.label} is your engine right now — the habit carrying the rest.` },
-      worst: scored.length > 1 ? { id: scored[scored.length - 1].a.id, label: scored[scored.length - 1].a.label, emoji: scored[scored.length - 1].a.emoji, text: `${scored[scored.length - 1].a.label} is the one slipping — small wins here lift everything.` } : null,
+      best: { id: scored[0].a.id, label: scored[0].a.label, emoji: scored[0].a.emoji, text: `${scored[0].a.label} is your engine right now — the habit carrying the rest.`, text_key: "momentumBest" },
+      worst: scored.length > 1 ? { id: scored[scored.length - 1].a.id, label: scored[scored.length - 1].a.label, emoji: scored[scored.length - 1].a.emoji, text: `${scored[scored.length - 1].a.label} is the one slipping — small wins here lift everything.`, text_key: "momentumWorst" } : null,
     } : null;
 
     // Balance — logging consistency per active agent (spot the neglected one).
@@ -144,17 +164,22 @@ router.get("/", async (req, res) => {
 
     // Coach read — cross-cutting WORKING / FOCUS.
     const coach_read = [];
-    if (momentum?.best) coach_read.push({ kind: "champion", text: momentum.best.text });
-    if (strongest && strongest.r > 0) coach_read.push({ kind: "champion", text: `Your ${strongest.a_label.toLowerCase()} and ${strongest.b_label.toLowerCase()} are feeding each other — keep both going.` });
-    if (momentum?.worst) coach_read.push({ kind: "drag", text: momentum.worst.text });
+    if (momentum?.best) coach_read.push({ kind: "champion", text: momentum.best.text, text_key: "momentumBest", id: momentum.best.id });
+    if (strongest && strongest.r > 0) coach_read.push({ kind: "champion", text: `Your ${strongest.a_label.toLowerCase()} and ${strongest.b_label.toLowerCase()} are feeding each other — keep both going.`, text_key: "feedingEachOther", a: strongest.a, b: strongest.b });
+    if (momentum?.worst) coach_read.push({ kind: "drag", text: momentum.worst.text, text_key: "momentumWorst", id: momentum.worst.id });
 
     // Hero — one plain sentence, no number.
     const upCount = vs_prior.filter((v) => v.dir === "up").length;
     const hero = strongest
       ? `${active.length} areas active. ${strongest.a_label} and ${strongest.b_label} are your strongest link this ${range === "7" ? "week" : "period"}.`
       : `${active.length} areas active — keep logging to surface how they connect.`;
+    // FE renders hero from hero_key + these vars (localized) — `hero` is the English fallback.
+    const hero_key = strongest ? "heroLink" : "heroNoLink";
+    const hero_vars = strongest
+      ? { n: active.length, a: strongest.a, b: strongest.b, period_key: range === "7" ? "periodWeek" : "periodPeriod" }
+      : { n: active.length };
 
-    return res.json({ ok: true, range, effective_days: elapsed, has_data: true, active_agents, days, strongest, connections, momentum, balance, vs_prior, coach_read, hero });
+    return res.json({ ok: true, range, effective_days: elapsed, has_data: true, active_agents, days, strongest, connections, momentum, balance, vs_prior, coach_read, hero, hero_key, hero_vars });
   } catch (e) {
     return res.status(500).json({ error: e?.message || "combined failed" });
   }
@@ -162,3 +187,6 @@ router.get("/", async (req, res) => {
 
 module.exports = router;
 module.exports._test = { pearson, connectionText };
+// Shared cross-agent reader — reused by the Health Fusion module (the other half of the cross-agent
+// layer) so first-party daily series are read in exactly ONE place. Additive; does not change routing.
+module.exports._shared = { AGENTS, seriesFor, pearson, AGENT_DOC, dateStr, addDays };
