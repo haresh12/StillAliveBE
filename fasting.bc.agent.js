@@ -22,6 +22,7 @@ const { computeFastingScore } = require("./lib/agent-scores");
 const fa = require("./lib/fasting-analytics");
 const { userDoc: bcUserDoc } = require("./lib/collections");
 const { domainHealth, domainHealthView } = require("./lib/hk-domain"); // Apple Health recovery/activity (null if no HK)
+const { maybeFinalizeStale, HARD_MAX_H } = require("./lib/fasting-lifecycle"); // auto-close a forgotten fast (kills the "64h" bug)
 
 const router = express.Router();
 const db = () => admin.firestore();
@@ -166,7 +167,7 @@ router.post("/session/start", async (req, res) => {
     };
     const batch = db().batch();
     batch.set(ref, session);
-    batch.set(fastingDoc(deviceId), { active_session_id: ref.id, protocol, target_fast_hours: target, updated_at: ts() }, { merge: true });
+    batch.set(fastingDoc(deviceId), { active_session_id: ref.id, active_last_seen_ms: Date.now(), protocol, target_fast_hours: target, updated_at: ts() }, { merge: true });
     await batch.commit();
 
     return res.json({ success: true, session_id: ref.id, started_at: toIso(startedAt), target_hours: target, protocol });
@@ -293,19 +294,25 @@ router.post("/session/end", async (req, res) => {
       return res.json({ success: true, already_ended: true, current_streak: num(data.current_streak), actual_hours: num(sess.actual_hours), stage_reached: sess.metabolic_stage_reached });
     }
 
-    const elapsed = getElapsedHours(sess.started_at);
+    const rawElapsed = getElapsedHours(sess.started_at);
     const t = num(sess.target_hours, target);
-    const completed = !broken_reason && elapsed >= t;
+    // Trust a present user's manual end — EXCEPT a clearly-forgotten runaway fast (elapsed far
+    // past target, or over the absolute ceiling). Recording 64h would poison streaks/averages,
+    // so credit the target and end it at the target time instead.
+    const isRunaway = rawElapsed > t + 24 || rawElapsed >= HARD_MAX_H;
+    const elapsed = isRunaway ? t : rawElapsed;
+    const completed = isRunaway ? true : !broken_reason && elapsed >= t;
     const stage = getStage(elapsed);
 
     await ref.update({
-      ended_at: ts(),
+      ended_at: isRunaway ? admin.firestore.Timestamp.fromMillis(Math.round(getMillis(sess.started_at) + t * 3.6e6)) : ts(),
       actual_hours: round(elapsed, 2),
       completed,
       broken_early: !completed,
-      broken_reason: broken_reason || null,
+      broken_reason: isRunaway ? null : broken_reason || null,
       metabolic_stage_reached: stage.id,
       notes: typeof b.notes === "string" ? b.notes.slice(0, 300) : sess.notes || "",
+      ...(isRunaway ? { auto_closed: true } : {}),
     });
 
     // Recompute stats from the recent sessions.
@@ -398,17 +405,88 @@ router.post("/session/backfill", async (req, res) => {
   }
 });
 
+// ── POST /session/adjust-hours — correct the recorded length of a FINISHED fast ─
+// The "modify option" for an auto-closed (forgotten) fast: we credited the target, but the
+// user may have actually fasted longer (or broken earlier). Lets them set the true hours;
+// we recompute ended_at, stage, completed + rollups. Clamped 0–72h. Only for ended sessions.
+router.post("/session/adjust-hours", async (req, res) => {
+  const b = req.body || {};
+  const { deviceId } = b;
+  if (!deviceId) return res.status(400).json({ error: "deviceId required" });
+  try {
+    const [fSnap, anchor] = await Promise.all([fastingDoc(deviceId).get(), resolveAnchor(deviceId)]);
+    const tzOff = anchor.utcOffsetMinutes || 0;
+    const data = fSnap.exists ? fSnap.data() : {};
+    const sessId = b.session_id;
+    if (!sessId) return res.status(400).json({ error: "session_id required" });
+    const hours = num(b.actual_hours, NaN);
+    if (!Number.isFinite(hours) || hours <= 0 || hours > 72) return res.status(400).json({ error: "actual_hours must be 0–72" });
+
+    const ref = sessionsCol(deviceId).doc(sessId);
+    const snap = await ref.get();
+    if (!snap.exists) return res.status(404).json({ error: "session_not_found" });
+    const sess = snap.data();
+    if (sess.ended_at == null) return res.status(409).json({ error: "session_still_running" });
+
+    const startMs = getMillis(sess.started_at);
+    const t = num(sess.target_hours, getTarget(data));
+    const completed = hours >= t;
+    const stage = getStage(hours);
+    await ref.update({
+      actual_hours: round(hours, 2),
+      ended_at: admin.firestore.Timestamp.fromMillis(Math.round(startMs + hours * 3.6e6)),
+      completed,
+      broken_early: !completed,
+      broken_reason: completed ? null : sess.broken_reason || "adjusted",
+      metabolic_stage_reached: stage.id,
+      auto_closed: false, // the user has confirmed the real length — it's no longer an unverified auto-close
+      hours_adjusted: true,
+      updated_at: ts(),
+    });
+
+    const recent = (await sessionsCol(deviceId).orderBy("started_at", "desc").limit(120).get()).docs.map(mapSession);
+    const stats = computeStats(recent, tzOff);
+    await fastingDoc(deviceId).update({
+      current_streak: stats.current_streak,
+      longest_streak: Math.max(num(data.longest_streak), stats.current_streak),
+      longest_fast: Math.max(num(data.longest_fast, 0), round(hours, 2)),
+      total_sessions_completed: stats.total_completed,
+      completion_rate_7d: stats.completion_rate_7d,
+      avg_fast_hours_7d: stats.avg_fast_hours_7d,
+      updated_at: ts(),
+    });
+
+    return res.json({ success: true, actual_hours: round(hours, 2), completed, stage_reached: stage.id, stage_label: stage.label, current_streak: stats.current_streak });
+  } catch (e) {
+    log.error("[fasting.bc] /session/adjust-hours:", e?.message || e);
+    return res.status(500).json({ error: "server error" });
+  }
+});
+
 // ── GET /today — active session + today + week + streak + targets ─────────────
 router.get("/today", async (req, res) => {
   const { deviceId } = req.query;
   if (!deviceId) return res.status(400).json({ error: "deviceId required" });
   try {
-    const [fSnap, recentSnap, anchor] = await Promise.all([
+    const [fSnap, anchor] = await Promise.all([
       fastingDoc(deviceId).get(),
-      sessionsCol(deviceId).orderBy("started_at", "desc").limit(40).get().catch(() => ({ docs: [] })),
       resolveAnchor(deviceId),
     ]);
     const data = fSnap.exists ? fSnap.data() : {};
+    const off0 = anchor?.utcOffsetMinutes || 0;
+
+    // Kill the "64h fast" the instant the app re-opens: if the running fast was abandoned
+    // (past target + no heartbeat for hours), finalize it at the target BEFORE building the
+    // payload. The FE reads `just_auto_closed` and shows a completion summary + "adjust
+    // hours" instead of a runaway timer. maybeFinalizeStale reads the OLD heartbeat, so the
+    // decision is made before we stamp a fresh one below.
+    let just_auto_closed = null;
+    try {
+      just_auto_closed = await maybeFinalizeStale(deviceId, { tzOff: off0, agentData: data });
+      if (just_auto_closed) data.active_session_id = null; // no longer running
+    } catch (e) { log.error("[fasting.bc] /today auto-close:", e?.message || e); }
+
+    const recentSnap = await sessionsCol(deviceId).orderBy("started_at", "desc").limit(40).get().catch(() => ({ docs: [] }));
     const target = getTarget(data);
     const recent = recentSnap.docs.map(mapSession);
 
@@ -417,7 +495,11 @@ router.get("/today", async (req, res) => {
       const a = recent.find((s) => s.id === data.active_session_id && s.ended_at_ms === 0);
       if (a) {
         const elapsed = getElapsedHours(a.started_at);
-        active_session = { id: a.id, started_at: toIso(a.started_at), started_at_ms: a.started_at_ms, target_hours: num(a.target_hours, target), elapsed_hours: round(elapsed, 2), stage: getStage(elapsed).id, stage_label: getStage(elapsed).label, water_glasses: num(a.water_glasses, 0) };
+        const tgt = num(a.target_hours, target);
+        active_session = { id: a.id, started_at: toIso(a.started_at), started_at_ms: a.started_at_ms, target_hours: tgt, elapsed_hours: round(elapsed, 2), over_target: elapsed >= tgt, overtime_hours: round(Math.max(0, elapsed - tgt), 2), stage: getStage(elapsed).id, stage_label: getStage(elapsed).label, water_glasses: num(a.water_glasses, 0) };
+        // Heartbeat: mark that the app is watching this fast RIGHT NOW so it can't be
+        // mistaken for abandoned by the next stale-check (lazy or cron). Fire-and-forget.
+        fastingDoc(deviceId).set({ active_last_seen_ms: Date.now(), updated_at: ts() }, { merge: true }).catch(() => {});
       }
     }
 
@@ -465,6 +547,7 @@ router.get("/today", async (req, res) => {
       health_view: await domainHealthView(deviceId, 'fasting', 7).catch(() => null), // Apple Health Body Signals (today tiles)
       date: todayKey,
       active_session,
+      just_auto_closed, // set when /today auto-finalized a forgotten fast this call (FE shows summary + "adjust hours")
       today_session,
       today_completed: todayCompleted,
       week: { fasts: week.length, completed: week.filter((s) => s.completed).length, avg_hours: week.length ? round(week.reduce((a, s) => a + num(s.actual_hours), 0) / week.length, 1) : 0 },
@@ -494,7 +577,10 @@ router.get("/analysis", async (req, res) => {
 
     const anchor = await resolveAnchor(deviceId);
     const win = computeAnalysisWindow(days || 30, anchor.anchorMs, Date.now(), anchor.utcOffsetMinutes);
-    const effectiveDays = days ? win.effectiveDays : null;
+    // Always a NUMBER (default 30-day window) so effective_days / elapsed_days never falls to null —
+    // matches the other agents. (Was null when the range param was omitted, which pushed the score onto
+    // the legacy d/14 denominator for day-1 users.)
+    const effectiveDays = win.effectiveDays;
 
     const allSnap = await sessionsCol(deviceId).orderBy("started_at", "desc").limit(400).get();
     let all = allSnap.docs.map(mapSession).filter((s) => s.ended_at_ms); // only finished fasts count

@@ -1,7 +1,7 @@
 "use strict";
 
 // ================================================================
-// FITNESS AGENT -- Pulse Backend
+// FITNESS AGENT -- Wellness OS Backend
 // Mounted at /api/fitness in server.js
 //
 // Science basis:
@@ -14,6 +14,7 @@
 
 const express = require("express");
 const router = express.Router();
+const requireAccess = require("./lib/require-access"); // server-side premium gate for LLM endpoints
 const admin = require("firebase-admin");
 const { OpenAI } = require("openai");
 const cron = require("node-cron");
@@ -164,6 +165,12 @@ const _v2Hooks = mountActionRoutes(router, {
       // Fasting state
       if (x.fasting_active_hours && x.fasting_active_hours >= 14) {
         parts.push(`Currently ${Math.round(x.fasting_active_hours)}h into fast — light session only.`);
+      }
+
+      // Breathwork — the user actively manages stress with breathing; useful recovery context and a
+      // personalised hook ("you've leaned on breathwork this week"). Never medical claims.
+      if (x.breath_sessions_week != null && x.breath_sessions_week > 0) {
+        parts.push(`Breathwork ${x.breath_sessions_week}× this week (${x.breath_minutes_week || 0} min)${x.breath_last_moment ? `, last for "${x.breath_last_moment}"` : ''} — actively managing stress; supports recovery.`);
       }
 
       return parts.join(' ');
@@ -2401,6 +2408,12 @@ router.post("/describe", async (req, res) => {
       '  output (2.3 → 225, 1.35 → 135). Dumbbell/cable/accessory moves CAN be light; do not',
       '  over-correct those.',
       '- "N sets of M" / "N by M" expands to N sets of M reps each — never one set.',
+      '- PER-SET LISTS: when the user lists a value PER SET, pair them position-by-position into',
+      '  individual sets — do NOT average or collapse them. "12, 13, 14, 15 reps at 10, 20, 30, 40 kg"',
+      '  → 4 sets: {reps:12,weight_kg:10}, {reps:13,weight_kg:20}, {reps:14,weight_kg:30},',
+      '  {reps:15,weight_kg:40}. If one list is shorter, reuse its last value for the remaining sets',
+      '  ("3 sets of 10 at 60, 70, 80" → reps 10 each; weights 60/70/80). A rising weight across sets',
+      '  ("ramped up to 100") is normal — keep each set distinct.',
       '- If user says "felt heavy" / "barely got the last rep" → rir: 0',
       '- "Could have done 2-3 more" → rir: 2 (mid-point)',
       '- "Easy" → rir: 4',
@@ -2442,6 +2455,8 @@ router.post("/describe", async (req, res) => {
       '- User says "bench, 4 sets of 8" → sets: [4 sets with reps:8, weight_kg:0],',
       '  missing: ["weight"]',
       '- User says "bench 4 sets of 8 at 80" → sets fully filled, missing: []',
+      '- User says "bench, 4 sets — 12, 13, 14, 15 reps at 10, 20, 30, 40 kg" → 4 distinct sets',
+      '  paired position-by-position ({reps:12,weight_kg:10} … {reps:15,weight_kg:40}), missing: []',
       '- Bodyweight exercises (pull-ups, dips, push-ups, planks): weight_kg=0 is',
       '  CORRECT — DO NOT add "weight" to missing. They\'re bodyweight by design.',
       '',
@@ -4759,7 +4774,7 @@ router.get('/chat-state', async (req, res) => {
 });
 
 // big-change: the chat-first coach orchestrator (LLM + tools → Block contract).
-router.post("/coach", require("./lib/fitness-coach"));
+router.post("/coach", requireAccess, require("./lib/fitness-coach"));
 
 // big-change: saved-workout templates (see all / reuse / one-tap re-log w/ smart weights).
 const _tpl = require("./lib/fitness-templates");
@@ -4893,7 +4908,7 @@ function buildDeterministicPlan(slots, DAY_FULL) {
 // the user selected (Mon=1 … Sun=0); a workout is placed on EACH. Always returns a usable plan
 // (deterministic fallback if the model errors/empties) so the feature can never dead-end.
 const MON_FIRST = [1, 2, 3, 4, 5, 6, 0];
-router.post("/plan/generate", async (req, res) => {
+router.post("/plan/generate", requireAccess, async (req, res) => {
   const b = req.body || {};
   const { deviceId } = b;
   const DAY_FULL = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
@@ -5063,6 +5078,19 @@ function dedupeSpeech(input) {
   return out.join(" ");
 }
 
+// Trim to a max length WITHOUT ever splitting a word. Prefer a sentence end, else the last space,
+// before the limit; only hard-cut if a single "word" somehow exceeds the whole budget. This keeps
+// the user's last word whole ("…protein shake", never "…prote") on the rare runaway rewrite.
+function clampAtWord(s, max) {
+  const str = String(s || "");
+  if (str.length <= max) return str;
+  const head = str.slice(0, max);
+  const lastSentence = Math.max(head.lastIndexOf(". "), head.lastIndexOf("! "), head.lastIndexOf("? "));
+  if (lastSentence >= max * 0.6) return head.slice(0, lastSentence + 1).trim();
+  const lastSpace = head.lastIndexOf(" ");
+  return (lastSpace > 0 ? head.slice(0, lastSpace) : head).trim();
+}
+
 // big-change: VOICE POLISH — voice is the primary input, so after speech ends we run a focused LLM
 // pass that fixes on-device-ASR errors (homophones, smashed numbers, fitness terms) and returns the
 // user's most-likely sentence. The FE shows THIS (not the messy live partials) for review before send.
@@ -5074,13 +5102,25 @@ router.post("/polish-transcript", async (req, res) => {
   if (raw.length < 3) return res.json({ text: raw });
   // Already-structured, short, non-repeating input doesn't need an LLM rewrite — and rewriting it only
   // risks dropping a token the regex parser needs. Return it verbatim (instant, zero data-loss).
+  // The data tokens (number+unit, sets/reps, times) may appear ANYWHERE in the sentence — e.g.
+  // "I had 1 glass of water, 200ml" has "200ml" mid-string — so we match unanchored, not just at start.
   const looksStructured =
-    /\b\d+\s*(?:x|×|sets?|reps?)\b/i.test(raw) ||            // "4x8", "4 sets", "12 reps"
-    /^\s*\d+(?:\.\d+)?\s*(?:ml|l|oz|kg|lbs?)\b/i.test(raw) || // "500ml", "80 kg"
-    /\b\d{1,2}\s*:\s*\d{1,2}\b/.test(raw);                    // "16:8", "11:30"
+    /\b\d+\s*(?:x|×|sets?|reps?)\b/i.test(raw) ||                              // "4x8", "4 sets", "12 reps"
+    /\b\d+(?:\.\d+)?\s*(?:ml|l|oz|kg|kgs|lbs?|g|km|mi|miles?|min|mins?|minutes?|hrs?|hours?)\b/i.test(raw) || // "500ml", "80 kg", "25 min", "5 km" — ANYWHERE
+    /\b\d{1,2}\s*:\s*\d{1,2}\b/.test(raw);                                     // "16:8", "11:30"
   if (looksStructured && raw.length < 70 && !/\b(\w+)\s+\1\b/i.test(raw)) {
     return res.json({ text: raw });
   }
+
+  // Every "number (+ optional unit)" token in a piece of text — the facts the parser needs. Used below
+  // to GUARANTEE the LLM's cleaned output never silently drops a quantity the user actually said.
+  const numTokens = (s) => {
+    const out = [];
+    const re = /\b\d+(?:\.\d+)?\s*(?:ml|l|oz|kg|kgs|lbs?|g|km|mi|miles?|min|mins?|minutes?|hrs?|hours?|x|sets?|reps?)?\b/gi;
+    let m;
+    while ((m = re.exec(s))) { const tok = m[0].replace(/\s+/g, '').toLowerCase(); if (/\d/.test(tok)) out.push(tok); }
+    return out;
+  };
   try {
     // The user's OWN recent exercises — so a mishear snaps to a lift they actually do (e.g. they
     // train "Romanian Deadlift", so "roman ian dead" → that, not "Conventional Deadlift").
@@ -5096,17 +5136,25 @@ router.post("/polish-transcript", async (req, res) => {
         usual = usual.slice(0, 30);
       } catch (_) {}
     }
+    // Localize (#8): the user may speak any of the 6 supported languages. Resolve their language so the
+    // cleaned sentence comes back in THAT language (never translated to English) and the mishear/number
+    // corrections are applied in-language — not with an English-only homophone cleaner.
+    const language = (() => { try { return resolveLanguage(req); } catch { return "en"; } })();
     const sys = [
       "ROLE: You are a transcript cleaner for a health & wellness app — the user may be logging a WORKOUT, a MEAL/food, SLEEP, MOOD, WATER, or a FAST. A user just SPOKE into their phone; a speech-recognition engine turned it into raw, MESSY text that commonly repeats words, restarts phrases mid-sentence, mishears words, and adds filler. The text is a noisy machine transcription of what they SAID — not what they typed.",
       "YOUR JOB: output the ONE clean sentence the user actually meant. Fix recognition errors and grammar, and remove ONLY true repetition and filler. This text is shown back to the user AND then PARSED by an agent, so EVERY piece of information must survive.",
+      (language && language !== "en") ? `LANGUAGE: The user spoke in ${language.toUpperCase()} and the raw transcript is in that language. Output the ONE cleaned sentence in the SAME language — NEVER translate it to English. Apply every rule below IN ${language.toUpperCase()}: fix that language's common speech-to-text homophones and spoken-number words, and normalize units to canonical short forms (kg, L, ml, km, min). The PRESERVE-EVERYTHING and negation rules apply identically.` : "",
       "PRESERVE EVERYTHING — THE #1 RULE: keep every number, time, TIME RANGE (both endpoints + am/pm), duration, quantity, UNIT (kg, lbs, ml, L, oz, km, miles, min, hours), food/drink item, exercise, set/rep/weight, and feeling word EXACTLY as said. ALSO keep every NEGATION and zero-signal word — 'didn't', 'did not', 'no', 'none', 'never', 'skipped', 'slept through', 'nothing' — these carry meaning (a skipped workout, zero wakeups) and must NEVER be removed as filler. If they said 'from 11am to 8pm', the output MUST still contain '11am to 8pm'. If they said '8 momos, a coke and ice cream', keep all three items. If they said 'slept 7 hours and feel rested', keep '7 hours' AND 'rested'. NEVER drop, round, or summarize information — the agent needs all of it to log correctly. Correcting English does NOT mean shortening the facts.",
       "HOW TO THINK: read the whole thing, find the real intent, and write that one clean, grammatical sentence with ALL the details intact. Treat ONLY obvious repetition/restarts and filler as noise.",
       "RULES:",
       "1. DE-REPEAT: if words or phrases repeat or the sentence restarts, keep the single most complete version ONCE ('I did I did a bench press for 8 at 80' → 'I did bench press for 8 at 80.'). But de-repeating must NEVER remove DISTINCT information (two different exercises, two foods, a start AND an end time all stay).",
       "2. DROP FILLER ONLY — the ONLY removable tokens are these exact discourse fillers: 'um', 'uh', 'er', 'you know', 'I mean', 'okay so', 'basically', and 'like' ONLY when it is a verbal hedge (not 'I like X'). NOTHING ELSE is filler. If you are unsure whether a word carries information, KEEP it. Never drop a number, unit, time, negation, food, feeling, exercise, or quantity.",
+      "2b. INTENSITY WORDS ARE NOT FILLER — keep every degree word that changes HOW MUCH: 'a bit', 'a little', 'slightly', 'kinda', 'somewhat', 'really', 'very', 'so', 'super', 'pretty', 'extremely', 'totally'. 'a little sad' is NOT 'sad'; 'really heavy' is NOT 'heavy'; 'felt a bit tired' keeps 'a bit'. These set mood intensity and effort — dropping them changes the log.",
       "3. FIX MISHEARS / numbers where clearly meant: 'ate'→'8', 'for'/'fore'→'4', 'to'/'too'→'2', 'won'→'1'; 'raps'→'reps', 'are pee'→'RPE', 'am rap'→'AMRAP'. Gym terms: 'bench priest'/'bench breast'→'bench press', 'roman ian'→'Romanian', 'dead lift'→'deadlift', 'cheat day'/'chest day'→'chest', 'in crime'→'incline', 'dumb bell'→'dumbbell', 'squad'→'squat', 'lat pull down'→'lat pulldown'. Fix obvious homophones in any domain, but keep the meaning and all details.",
       "4. NORMALIZE, DON'T RESTRUCTURE: convert spoken number-words to digits ('four sets of twelve at thirty' → '4 sets of 12 at 30') and normalize units to canonical short forms ('kilos'/'kilograms' → 'kg', 'pounds' → 'lbs', 'litres'/'liters' → 'L', 'minutes' → 'min'). Do NOT reorder the sentence, do NOT merge two items into one, do NOT turn a workout into a template. A downstream regex parser reads these EXACT tokens, so keep the user's word order and clause separators (commas, 'then', 'and then', 'after that') intact. Keep the user's natural sentence — corrected and digitized, never compressed.",
       "5b. WHAT THE PARSER NEEDS (preserve these helpfully): WORKOUT → number + 'sets'/'reps'/'x' + 'at N kg' + exercise name + cardio distance ('5 km') and time ('30 min'). FOOD → each item name + its count/portion + the connectors between them. SLEEP → bedtime & wake time (BOTH ends, am/pm), duration, quality word, 'woke N times' or 'slept through', minutes to fall asleep. MOOD → every feeling word + intensity. WATER → number + volume unit ('500 ml', '1.5 L') or container ('glass'). FASTING → protocol ('16:8', 'OMAD') and hour count ('18 hours').",
+      "5c. WORD-QUANTITIES ARE FACTS: keep portion words like 'half', 'quarter', 'a couple', 'a few', 'a dozen', 'a handful', 'a splash', 'a sip'. You MAY turn them into digits when unambiguous ('half a litre' → '0.5 L', 'a dozen eggs' → '12 eggs', 'a couple' → '2') — but NEVER just delete them ('half a litre of milk' must stay 'half a litre' or '0.5 L', never 'a litre' or 'milk').",
+      "5d. SLEEP TIMES WITHOUT AM/PM = OVERNIGHT: if a sleep time range has no am/pm ('slept 11 to 7', '11 to 6:30'), assume an overnight night's sleep — the first time is PM (bedtime), the second is AM (wake): '11 to 7' → '11pm to 7am'. Never flip them or read both as morning.",
       usual.length ? `5. This user usually does these exercises — snap an obvious mishear to one when it clearly matches: ${usual.join(", ")}.` : "",
       "6. NONSENSE: pure gibberish / repeated nonsense syllables ('ooh la la la', 'asdf') with no real intent → return it short and unchanged (or empty). Never invent a sentence and never produce long looping text.",
       "HARD LIMITS: NEVER invent AND NEVER drop numbers, times, ranges, durations, quantities, units, foods, feelings, or exercises that were said. NEVER answer a question or add commentary. Correct the sentence; do not shorten its information.",
@@ -5125,9 +5173,53 @@ router.post("/polish-transcript", async (req, res) => {
     let text = (r.choices?.[0]?.message?.content || "").trim().replace(/^["']|["']$/g, "");
     // Guard: never return empty or a refusal — fall back to the raw transcript.
     if (!text || /^(i (can'?t|cannot|am )|sorry)/i.test(text)) text = raw;
+    // DATA-LOSS GUARD (the #1 polish bug): the LLM sometimes drops a quantity it was told to keep
+    // ("1 glass of water, 200ml" → "1 glass of water"). If ANY number/quantity token the user said is
+    // missing from the cleaned text, the rewrite lost information the parser needs — so discard it and
+    // return the raw transcript (de-duped) instead. Preserving the user's facts beats prettier grammar.
+    const before = numTokens(raw);
+    const after = new Set(numTokens(text));
+    const dropped = before.filter((t) => !after.has(t));
+    if (dropped.length) {
+      (globalThis.log?.warn || console.warn)(`[fitness] /polish-transcript dropped ${JSON.stringify(dropped)} — using raw`);
+      text = raw;
+    }
+    // NEGATION GUARD (the #2 polish bug): the digit guard above can't see meaning-flipping WORDS. A
+    // dropped negation silently inverts the log — "I didn't sleep at all, woke 10 times" → "I slept,
+    // woke 10 times" still has "10", so the digit guard passes while the meaning is now the opposite.
+    // A negation can NEVER be legitimately normalised into a digit, so if the user said one and the
+    // clean text lost it, the rewrite changed the meaning — revert to raw. Whole-word, case-insensitive.
+    const NEG_RE = /\b(?:didn'?t|did\s+not|don'?t|doesn'?t|won'?t|can'?t|cannot|couldn'?t|wasn'?t|weren'?t|isn'?t|haven'?t|hadn'?t|never|none|nothing|without|skipped?|no\s+(?:more|longer))\b/gi;
+    const negOf = (s) => { const set = new Set(); let m; const re = new RegExp(NEG_RE.source, "gi"); while ((m = re.exec(s))) set.add(m[0].replace(/\s+/g, " ").toLowerCase()); return set; };
+    const rawNeg = negOf(raw);
+    if (rawNeg.size) {
+      const keptNeg = negOf(text);
+      const lostNeg = [...rawNeg].filter((w) => !keptNeg.has(w));
+      if (lostNeg.length) {
+        (globalThis.log?.warn || console.warn)(`[fitness] /polish-transcript dropped negation ${JSON.stringify(lostNeg)} — using raw`);
+        text = raw;
+      }
+    }
+    // WORD-QUANTITY GUARD: "half a litre", "a dozen", "a couple" are FACTS the digit guard can't see.
+    // The prompt MAY convert them to a number ("half a litre" → "0.5 L") — that's fine — but it must
+    // never just delete them ("half a litre of milk" → "milk"). So only flag a loss when the word
+    // vanished AND no extra number token appeared to stand in for it; otherwise revert to raw.
+    const WQ_RE = /\b(?:half|quarter|third|dozen|couple|few|several|handful|pinch|splash)\b/gi;
+    const wqRaw = [...new Set((raw.match(WQ_RE) || []).map((w) => w.toLowerCase()))];
+    if (wqRaw.length && text !== raw) {
+      const wqKept = new Set((text.match(WQ_RE) || []).map((w) => w.toLowerCase()));
+      const lostWq = wqRaw.filter((w) => !wqKept.has(w));
+      if (lostWq.length && numTokens(text).length <= numTokens(raw).length) {
+        (globalThis.log?.warn || console.warn)(`[fitness] /polish-transcript dropped quantity ${JSON.stringify(lostWq)} — using raw`);
+        text = raw;
+      }
+    }
     // Deterministic no-duplication guarantee (belt-and-suspenders over the LLM).
     text = dedupeSpeech(text);
-    return res.json({ text: text.slice(0, 600) });
+    // Safety cap — but NEVER cut a word in half. If we must trim, fall back to the last full word
+    // (or sentence) boundary before the limit so the last thing the user said stays a whole word,
+    // not "…prote". Real logs are far under 600; this only ever fires on a runaway rewrite.
+    return res.json({ text: clampAtWord(text, 600) });
   } catch (e) {
     (globalThis.log?.warn || console.warn)("[fitness] /polish-transcript:", e?.message || e);
     return res.json({ text: dedupeSpeech(raw) }); // never block the user — raw (de-duped) still works

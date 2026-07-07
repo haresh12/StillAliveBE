@@ -1,7 +1,7 @@
 'use strict';
 
 // ═══════════════════════════════════════════════════════════════
-// SLEEP AGENT — Pulse Backend
+// SLEEP AGENT — Wellness OS Backend
 // All routes, AI logic, action generation, chat, proactive cron.
 // Mounted at /api/sleep in server.js
 //
@@ -15,6 +15,7 @@
 
 const express = require('express');
 const router  = express.Router();
+const requireAccess = require('./lib/require-access'); // server-side premium gate for LLM endpoints
 const admin   = require('firebase-admin');
 const { OpenAI } = require('openai');
 const cron    = require('node-cron');
@@ -50,7 +51,10 @@ function invalidateContextCache(deviceId) {
 }
 
 // ─── Firestore path helpers ───────────────────────────────────
-const userDoc     = (id) => db().collection('wellness_users').doc(id);
+// bc-aware: resolves wellness_bc_users/{id} (was legacy wellness_users) so the
+// proactive cron + fall-through handlers operate on big-change users. Same
+// subcollection names → all downstream helpers "just work" on bc.
+const userDoc     = (id) => require('./lib/collections').userDoc(id);
 const sleepDoc    = (id) => userDoc(id).collection('agents').doc('sleep');
 const logsCol     = (id) => sleepDoc(id).collection('sleep_logs');
 const actionsCol  = (id) => sleepDoc(id).collection('sleep_actions');
@@ -1393,7 +1397,7 @@ PRE-COMPUTED ANALYSIS (accurate — do not recalculate):
 
   const crossSection = crossAgentCtx ? `\n━━━ CROSS-AGENT CONTEXT ━━━\n${crossAgentCtx}\nNote: Use this to check if cross-agent factors (mood, exercise, hydration) are disrupting sleep — reference in the action's "why" if relevant.\n` : '';
 
-  const prompt = `You are a clinical-grade sleep coach AI for ${name} in the Pulse wellness app.
+  const prompt = `You are a clinical-grade sleep coach AI for ${name} in the Wellness OS app.
 Generate exactly 3 personalised sleep actions grounded in CBT-I science and this user's actual data.
 
 USER PROFILE:
@@ -1532,7 +1536,7 @@ Example tone: "You logged even after a rough night — that discipline matters. 
 The challenge must be concrete and doable tonight.`,
   };
 
-  const prompt = `You are a Sleep Coach in the Pulse wellness app using motivational interviewing technique.
+  const prompt = `You are a Sleep Coach in the Wellness OS app using motivational interviewing technique.
 ${name || 'The user'} just logged a sleep quality of ${quality}/5.
 ${disruptors?.length ? `Disruptors logged: ${disruptors.join(', ')}.` : ''}
 ${note ? `Their note: "${note}"` : ''}
@@ -1570,7 +1574,7 @@ async function buildDebtProactive(name, debtHours, targetHours, recentLogs, setu
     : null;
 
   // Data mirror format — most effective for debt (research: make numbers feel concrete)
-  const prompt = `You are a Sleep Coach in the Pulse wellness app.
+  const prompt = `You are a Sleep Coach in the Wellness OS app.
 ${name || 'The user'} has accumulated ${debtHours} hours of sleep debt in the past 7 days (target: ${targetHours}h/night).
 ${avgQuality ? `Average quality this week: ${avgQuality}/5.` : ''}
 ${avgEff ? `Average efficiency: ${avgEff}%.` : ''}
@@ -1597,7 +1601,7 @@ ${severity === 'urgent' ? 'Urgency: be direct — this is a real problem affecti
 }
 
 async function buildStreakProactive(name, streakDays, setupData) {
-  const prompt = `You are a Sleep Coach in the Pulse app. ${name || 'The user'} just hit a ${streakDays}-night tracking streak.
+  const prompt = `You are a Sleep Coach in the Wellness OS app. ${name || 'The user'} just hit a ${streakDays}-night tracking streak.
 
 Use AFFIRMATION + CHALLENGE format:
 1. Acknowledge the streak genuinely — connect it to why the data matters (not just praise).
@@ -1830,7 +1834,7 @@ async function buildContext(deviceId) {
 
   // First-time user: zero logs → different goal entirely
   if (totalCount === 0) {
-    return `You are the Sleep Coach in Pulse. This is ${name || 'this person'}'s very first message — they have not logged a single night yet.
+    return `You are the Sleep Coach in Wellness OS. This is ${name || 'this person'}'s very first message — they have not logged a single night yet.
 
 YOUR ONLY GOAL: Show them that this coach understands sleep science deeply and is worth talking to. Make them want to log tonight.
 
@@ -1846,7 +1850,7 @@ Target sleep: ${setup.target_hours || 7.5}h/night
 Self-reported disruptors: ${(setup.disruptors || []).join(', ') || 'not specified'}`;
   }
 
-  return `You are the Sleep Coach in Pulse. You are a deeply personal AI coach — not a wellness chatbot, not a generic AI. You have been privately studying ${name}'s sleep data for ${daysLogged > 0 ? `${daysLogged} nights` : 'the beginning of their journey'} across ${totalCount} total logs. You know their sleep patterns in specific, numerical detail.
+  return `You are the Sleep Coach in Wellness OS. You are a deeply personal AI coach — not a wellness chatbot, not a generic AI. You have been privately studying ${name}'s sleep data for ${daysLogged > 0 ? `${daysLogged} nights` : 'the beginning of their journey'} across ${totalCount} total logs. You know their sleep patterns in specific, numerical detail.
 
 THE TEST: if your response could have been sent to any stranger who never logged a single night, you have failed. Every sentence must reflect their specific numbers, their specific patterns, their specific history.
 
@@ -2326,14 +2330,18 @@ Return ONLY valid JSON, no markdown:
 //   3. Mid-day insight     (11:00 AM)           — debt/pattern flag
 // ═══════════════════════════════════════════════════════════════
 const _sleepCronTick = async () => {
-    const usersSnap = await db().collection('wellness_users')
-      .where('sleep_setup_complete', '==', true).get();
+    // bc users have no user-doc sleep_setup_complete flag; enumerate all bc users
+    // and rely on the per-user sleepDoc.setup_completed + focus gates below.
+    const usersSnap = await db().collection(require('./lib/collections').ns('users')).get();
 
     for (const userSnap of usersSnap.docs) {
       try {
         const deviceId  = userSnap.id;
         const uData     = userSnap.data();
         const pName     = uData.name || '';
+        // Only reach out about agents the user actually unlocked at onboarding.
+        const _focus = uData.focus_domains;
+        if (Array.isArray(_focus) && _focus.length && !_focus.includes('sleep')) continue;
 
         // Per-user notif context: language, utc_offset, notif_enabled, DND.
         // Reading here means every downstream decision uses the user's LOCAL
@@ -2349,6 +2357,8 @@ const _sleepCronTick = async () => {
           userDoc(deviceId).get(),
         ]);
         const sData = sleepSnap.data() || {};
+        // bc seeds all agent docs; only proceed if sleep was actually set up.
+        if (!sleepSnap.exists || !sData.setup_completed) continue;
 
         // Max 2 proactive messages per day across all types
         const todayCount = sData.proactive_count_today || 0;
@@ -2356,9 +2366,11 @@ const _sleepCronTick = async () => {
         const effectiveCount = lastCountDate === today ? todayCount : 0;
         if (effectiveCount >= 2) continue;
 
-        const targetBed  = sData.target_bedtime   || '23:00';
-        const targetWake = sData.target_wake_time  || '07:00';
-        const targetHrs  = sData.target_hours      || 7.5;
+        // bc stores these at top-level (target_wake / target_sleep_hours) and under
+        // setup.* — read all shapes so nudges land at the user's REAL bedtime/wake.
+        const targetBed  = sData.target_bedtime   || sData.setup?.target_bedtime || '23:00';
+        const targetWake = sData.target_wake_time || sData.target_wake || sData.setup?.target_wake || '07:00';
+        const targetHrs  = sData.target_hours     || sData.target_sleep_hours || sData.setup?.target_hours || 7.5;
 
         // Compute current-hour window in user's local time
         const currentMins = hour * 60 + minute;
@@ -2549,7 +2561,7 @@ router.post('/describe/transcribe', async (req, res) => {
 });
 
 // POST /describe — audio OR transcript → parsed sleep object with confidence.
-router.post('/describe', async (req, res) => {
+router.post('/describe', requireAccess, async (req, res) => {
   const { deviceId } = req.body || {};
   if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
   if (!_acquireSleepDescribeLock(deviceId)) {

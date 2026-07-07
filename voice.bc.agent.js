@@ -34,9 +34,9 @@ try {
   console.warn('[voice] livekit-server-sdk not installed — /api/voice/token disabled. Run: npm install livekit-server-sdk');
 }
 const { buildBriefing } = require('./lib/voice-briefing');
-const { saveCall, listCalls, getCall, dailyStatus } = require('./lib/voice-calls');
+const { saveCall, listCalls, getCall, dailyStatus, subFlags } = require('./lib/voice-calls');
 // ACTIVE brain: OpenAI Realtime session minter + server-side tool runner.
-const { mintSession, runTool } = require('./lib/voice-realtime');
+const { mintSession, runTool, prewarmBriefing } = require('./lib/voice-realtime');
 const { getCoach } = require('./lib/coach-roster');
 const { userDoc } = require('./lib/collections');
 const { evaluateProactiveCall } = require('./lib/voice-outreach');
@@ -74,6 +74,7 @@ router.post('/realtime-session', async (req, res) => {
     const name = (req.body.name || '').toString().slice(0, 60);
     const topic = (req.body.topic || '').toString().slice(0, 80);
     const focus = (req.body.focus || '').toString().slice(0, 24);
+    const utc_offset_minutes = Number(req.body.utc_offset_minutes); // device's real local offset → time-aware coach
     if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
     console.log(`🟢 [voice] /realtime-session HIT (OpenAI Realtime path) device=${deviceId} mode=${mode} topic=${topic || '-'}`);
 
@@ -99,12 +100,25 @@ router.post('/realtime-session', async (req, res) => {
       remainingSec = status.monthly_remaining_sec;
     }
 
-    const session = await mintSession(deviceId, { mode, name, topic, focus, maxCallSec: remainingSec });
+    const session = await mintSession(deviceId, { mode, name, topic, focus, maxCallSec: remainingSec, utc_offset_minutes });
     res.json({ ...session, mode });
   } catch (e) {
     console.error('[voice] /realtime-session error:', e.message);
     res.status(503).json({ error: 'realtime_unavailable', message: e.message });
   }
+});
+
+// POST /api/voice/prewarm  { deviceId, focus?, utc_offset_minutes? }
+// Builds + caches the call briefing in the BACKGROUND (fire-and-forget) so that when the user taps
+// Call moments later, /realtime-session finds it ready and picks up in ~1-2s instead of paying the
+// full briefing build on the critical path. The app fires this when the Talk tab opens / topic changes.
+router.post('/prewarm', (req, res) => {
+  const deviceId = String(req.body.deviceId || req.body.device_id || '').trim();
+  if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+  const focus = (req.body.focus || '').toString().slice(0, 24) || null;
+  const utc = Number(req.body.utc_offset_minutes);
+  prewarmBriefing(deviceId, focus, Number.isFinite(utc) ? utc : null);
+  res.json({ ok: true }); // respond immediately — the build continues in the background
 });
 
 // GET /api/voice/coach?deviceId  — current coach + proactive opt-in (for Settings).
@@ -173,6 +187,10 @@ router.post('/tool', async (req, res) => {
 // here for a quick revert (re-point startCall → /token + run `npm run voice-agent`).
 // POST /api/voice/token  { deviceId, mode?, name? }
 router.post('/token', async (req, res) => {
+  // Legacy LiveKit path is disabled by default. Set ENABLE_LEGACY_LIVEKIT=1 to re-enable (revert path).
+  if (process.env.ENABLE_LEGACY_LIVEKIT !== '1') {
+    return res.status(410).json({ error: 'gone', message: 'LiveKit voice is disabled; realtime voice is used instead.' });
+  }
   try {
     console.warn('🔴 [voice] /token HIT — LEGACY LiveKit/Deepgram/Cartesia path. The app JS is STALE (still calling /token); reload it to use OpenAI Realtime.');
     const deviceId = String(req.body.deviceId || req.body.device_id || '').trim();
@@ -197,13 +215,11 @@ router.post('/token', async (req, res) => {
     }
 
     // One room per call. The agent worker reads this metadata to know who it's talking to.
-    // premium (account-level, synced to wellness_users) drives the call-length cap in the worker.
+    // premium here = the BUDGET tier (paid, non-trial): trial users get the free 5-min taste, so the
+    // metadata label matches the real monthly cap (which dailyStatus enforces via remaining seconds).
     let premium = false;
     try {
-      const admin = require('firebase-admin');
-      const ss = await admin.firestore().collection('wellness_users').doc(deviceId).get();
-      const sub = ss.exists ? (ss.data().subscription || {}) : {};
-      premium = !!(sub.isPremium || sub.isTrial);
+      premium = (await subFlags(deviceId)).isPaid;
     } catch { /* default free */ }
     const roomName = `coach-${deviceId}-${Date.now().toString(36)}`;
     const metadata = JSON.stringify({ deviceId, mode, name, topic, focus, premium });
@@ -290,7 +306,9 @@ router.get('/calls', async (req, res) => {
       monthly_used_sec: status.monthly_used_sec, // seconds used this month
       monthly_limit_sec: status.monthly_limit_sec, // monthly budget (free 300 / premium 3000)
       monthly_remaining_sec: status.monthly_remaining_sec, // seconds left this month → drives the UI
-      is_premium: status.is_premium,
+      is_premium: status.is_premium, // access-level (trial counts)
+      is_trial: status.is_trial,     // trial → 5-min taste + "upgrade for 50 min" when empty
+      is_paid: status.is_paid,       // converted subscriber → full 50-min budget
     });
   } catch (e) {
     console.error('[voice] /calls error:', e);

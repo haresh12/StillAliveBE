@@ -1,7 +1,7 @@
 'use strict';
 
 // ================================================================
-// FASTING AGENT -- Pulse Backend
+// FASTING AGENT -- Wellness OS Backend
 // Mounted at /api/fasting in server.js
 //
 // Science basis:
@@ -60,7 +60,10 @@ function checkChatRate(deviceId) {
 // ----------------------------------------------------------------
 // Firestore paths
 // ----------------------------------------------------------------
-const userDoc      = (id) => db().collection('wellness_users').doc(id);
+// bc-aware: resolves wellness_bc_users/{id} (was legacy wellness_users) so the
+// proactive cron + fall-through handlers (and the inline cross-agent water read)
+// operate on big-change users. Same subcollection names → downstream helpers unchanged.
+const userDoc      = (id) => require('./lib/collections').userDoc(id);
 const fastingDoc   = (id) => userDoc(id).collection('agents').doc('fasting');
 const sessionsCol  = (id) => fastingDoc(id).collection('fasting_sessions');
 const chatsCol     = (id) => fastingDoc(id).collection('fasting_chats');
@@ -77,6 +80,7 @@ const { resolveLanguage, appendLanguageInstruction } = require('./lib/i18n-promp
 const { fetchAgentSnapshot } = require('./lib/cross-agent-context');
 const { withCron, shouldRunCron } = require('./lib/cron-helper');
 const { getUserNotifContext } = require('./lib/cron-user-context');
+const { maybeFinalizeStale } = require('./lib/fasting-lifecycle'); // auto-close forgotten fasts from the cron
 const { resolveAnchor } = require('./lib/user-anchor');
 const { assertLoggableDate, sendLogGuardError } = require('./lib/log-guard');
 assertNoCrossAgent('fasting', computeFastingCandidates);
@@ -2655,7 +2659,7 @@ router.post('/chat', async (req, res) => {
     };
 
     const systemPrompt = [
-      'You are the Pulse Fasting Coach — a precision metabolic health coach inside a science-backed wellness app.',
+      'You are the Fasting Coach — a precision metabolic health coach inside a science-backed wellness app.',
       '',
       'SCIENCE BASE (cite only when directly relevant, never gratuitously):',
       '- Metabolic switching: Mattson et al. 2018 (Cell Metabolism) — 12-16h fasting switches fuel from glucose to fat/ketones.',
@@ -2769,7 +2773,7 @@ _mountChatStreamFasting(router, {
   model: 'gpt-4.1', maxTokens: 220,
   buildPrompt: async (deviceId, message, { proactive_context } = {}) => {
     const context = await getCachedContext(deviceId);
-    let systemPrompt = `CONTEXT:\n${context}\n\nYou are the Pulse Fasting Coach. Tight, precise, max 140 words. Reference exact hours/streak/water/sleep numbers. Sound human, never robotic.`;
+    let systemPrompt = `CONTEXT:\n${context}\n\nYou are the Fasting Coach. Tight, precise, max 140 words. Reference exact hours/streak/water/sleep numbers. Sound human, never robotic.`;
     if (proactive_context) {
       systemPrompt += `\n\n[THREAD CONTEXT] User is following up on a coach message of type: ${proactive_context}. Acknowledge briefly then focus on what they asked.`;
     }
@@ -2857,14 +2861,53 @@ router.post('/chat/read', async (req, res) => {
 });
 
 // ================================================================
+// FAST-COMPLETE coach copy (body impact + personal history)
+// ================================================================
+// Body-impact one-liners keyed by the metabolic stage the fast reached — this is the
+// "here's how it impacted your body" the coach voices on completion.
+const STAGE_IMPACT = {
+  fed:              'Digestion wrapped up and insulin started to fall.',
+  post_absorptive:  'Insulin dropped and your body began tapping stored energy.',
+  glycogen:         'Glycogen stores drained down — the switch toward fat is underway.',
+  fat_burning:      'Glycogen is spent and you crossed into fat-burning as your primary fuel.',
+  ketosis_entry:    'Ketones climbed — your brain and muscles started running on fat.',
+  autophagy:        'Autophagy ramped up: cells recycling their worn-out parts — the deep-repair window.',
+  deep_fast:        'Deep fast — growth hormone elevated and autophagy running strong.',
+};
+const ordinal = (n) => { const s = ['th', 'st', 'nd', 'rd'], v = n % 100; return `${n}${s[(v - 20) % 10] || s[v] || s[0]}`; };
+
+// Coach check-in for a fast the cron AUTO-CLOSED (user forgot to end it). Celebrates the
+// completion, names the body impact, and lands the personal "Nth fast / streak" feel — plus
+// tells them how to correct the hours if they actually broke it at a different time.
+function buildAutoCompleteCoachMessage(closed) {
+  const hrs = Math.round(closed.actual_hours);
+  const impact = STAGE_IMPACT[closed.stage_reached] || STAGE_IMPACT.fat_burning;
+  const nth = closed.total_completed > 0 ? ` That's your ${ordinal(closed.total_completed)} completed fast` : '';
+  const streak = closed.current_streak >= 2 ? ` — ${closed.current_streak}-day streak 🔥` : '';
+  return `Nice work — I noticed you hit your ${hrs}h goal and closed the fast out for you. ${impact}${nth}${streak}. If you actually broke it at a different time, tap the fast to adjust the hours.`;
+}
+
+// Coach check-in the MOMENT a running fast reaches its goal (still fasting — keep-going is fine).
+function buildGoalReachedCoachMessage(targetHours, elapsedHours, currentStreak) {
+  const stage = getStage(elapsedHours);
+  const impact = STAGE_IMPACT[stage.id] || STAGE_IMPACT.fat_burning;
+  const streak = currentStreak >= 2 ? ` You're on a ${currentStreak}-day streak.` : '';
+  return `🎉 ${targetHours}h — goal reached. ${impact}${streak} Break it gently with protein + fat first, or keep going if you feel strong.`;
+}
+
+// ================================================================
 // PROACTIVE CRON -- every hour
 // Fires personalized messages based on fast state + thresholds
 // ================================================================
 const _fastingCronTick = async () => {
-    const usersSnap = await db().collection('wellness_users').limit(300).get();
+    // bc users (wellness_bc_users). Per-user gates below filter by setup + focus.
+    const usersSnap = await db().collection(require('./lib/collections').ns('users')).limit(300).get();
 
     for (const userSnap of usersSnap.docs) {
       const deviceId = userSnap.id;
+      // Only reach out about agents the user actually unlocked at onboarding.
+      const _focus = userSnap.data()?.focus_domains;
+      if (Array.isArray(_focus) && _focus.length && !_focus.includes('fasting')) continue;
       try {
         const fSnap = await fastingDoc(deviceId).get();
         if (!fSnap.exists || !fSnap.data()?.setup_completed) continue;
@@ -2905,6 +2948,44 @@ const _fastingCronTick = async () => {
           if (sessSnap.exists) {
             sessData     = sessSnap.data();
             elapsedHours = getElapsedHours(sessData.started_at);
+          }
+        }
+
+        // ── AUTO-CLOSE a forgotten fast (past target + no app heartbeat for hours) ──
+        // This is the server-side backstop that kills the "64h fast" even when the app is
+        // never opened. Finalize at the target, then the coach reaches out that it's done
+        // + the body impact + their personal history. Then skip the rest of the nudges.
+        if (activeId && sessData) {
+          let closed = null;
+          try { closed = await maybeFinalizeStale(deviceId, { tzOff: notifCtx.utcOffsetMinutes || 0, agentData: data }); }
+          catch (e) { log.error(`[fasting] auto-close ${deviceId}:`, e?.message || e); }
+          if (closed && closed.finalized) {
+            // Dedup in the USER'S local day (today === notifCtx.localDateStr). The bare dateStr() is
+            // server-local (UTC on Fly), which mismatches for non-UTC users near midnight → false negative
+            // → duplicate message. Use the tz-aware helper with the user's offset.
+            const tzDateStr = require('./lib/range-helpers').dateStr;
+            const alreadySent = recentMessages.some(m => m.proactive_type === 'fast_autocompleted' &&
+              (m.created_at?.toDate ? tzDateStr(m.created_at.toDate(), notifCtx.utcOffsetMinutes || 0) : '') === today);
+            if (!alreadySent) {
+              const chatRef = chatsCol(deviceId).doc();
+              await db().runTransaction(async (tx) => {
+                tx.set(chatRef, {
+                  role:           'assistant',
+                  content:        buildAutoCompleteCoachMessage(closed),
+                  is_proactive:   true,
+                  proactive_type: 'fast_autocompleted',
+                  is_unread:      true,
+                  created_at:     admin.firestore.FieldValue.serverTimestamp(),
+                });
+                tx.update(fastingDoc(deviceId), {
+                  last_proactive_date:    today,
+                  proactive_count_today:  storedCount + 1,
+                  unread_proactive_count: admin.firestore.FieldValue.increment(1),
+                });
+              });
+              invalidateCtx(deviceId);
+            }
+            continue; // fast is finalized — nothing else to nudge about this hour
           }
         }
 
@@ -2973,10 +3054,10 @@ const _fastingCronTick = async () => {
           content = `${round(targetHours - elapsedHours, 1)}h left. ${round(elapsedHours, 1)}h already in. Ketones rising -- this is the window you trained for. Finish it.`;
         }
 
-        // 3. GOAL REACHED
+        // 3. GOAL REACHED (still fasting — the coach checks in; user may keep going)
         else if (activeId && elapsedHours >= targetHours && !alreadyFiredToday('goal_reached') && !todayCompleted) {
           proactiveType = 'goal_reached';
-          content = `${targetHours}h done. Metabolic switch complete${elapsedHours >= 18 ? ', autophagy active' : ''}. Break your fast with protein + fat first -- not carbs alone. Eating window closes at ${minsToLabel(windowEnd)}.`;
+          content = buildGoalReachedCoachMessage(targetHours, elapsedHours, currentStreak);
           updates.last_goal_reached_date = today;
         }
 
@@ -3028,8 +3109,9 @@ const _fastingCronTick = async () => {
 
         if (!proactiveType || !content) continue;
 
-        // Local notifications already cover these moments better than chat cards.
-        if (['halfway_mark', 'almost_there', 'goal_reached', 'first_meal_reminder'].includes(proactiveType)) continue;
+        // Local notifications already cover these moments better than chat cards. (goal_reached
+        // is intentionally NOT here — the coach DOES check in on completion, per product intent.)
+        if (['halfway_mark', 'almost_there', 'first_meal_reminder'].includes(proactiveType)) continue;
 
         // Dedup check
         const alreadyExists = recentMessages.some(m => {

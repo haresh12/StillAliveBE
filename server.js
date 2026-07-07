@@ -102,6 +102,12 @@ app.use((req, res, next) => {
 app.use('/api/alive-check', aliveCheckRoutes);
 // CheckWriter (separate app, no backend of its own) — write-only support inbox.
 app.use('/api/checkwriter/support', require('./checkwriter-support.route'));
+// ⚠️ ORDER IS LOAD-BEARING for every double-mounted agent below (mind/sleep/nutrition/water/fasting):
+// the `.bc.agent` router MUST be mounted BEFORE its legacy `.agent` sibling. Express uses first-match,
+// so the bc router wins the shared paths (/log, /today, /analysis, DELETE /log/:id) while the legacy
+// router only catches the paths bc doesn't define (describe/vision/setup/chat). Reordering ANY pair
+// silently swaps in the legacy handler — which returns a DIFFERENT response shape and breaks the FE.
+// Do NOT reorder these lines. (See the API-contract audit.)
 app.use('/api/mind',      require('./mind.bc.agent')); // bc owns log/today/analysis/describe/reframe
 app.use('/api/mind',      require('./mind.agent'));
 // Big-change sleep owns log/today/analysis (bc namespace); mounted FIRST so it wins those routes.
@@ -119,12 +125,17 @@ app.use('/api/water',     require('./water.bc.agent')); // bc owns log/today/ana
 app.use('/api/water',     require('./water.agent'));
 app.use('/api/fasting',   require('./fasting.bc.agent')); // bc owns session/today/analysis
 app.use('/api/fasting',   require('./fasting.agent'));
+// big-change: Breath — the 7th agent (chat-first breathwork). Standalone bc namespace
+// (agents/breath/breath_sessions); moment-first, honest score, registration-anchored. No legacy router.
+app.use('/api/breath',    require('./breath.bc.agent'));
 app.use('/api/fitness',   require('./fitness.agent'));
 app.use('/api/personalize', require('./personalize.agent'));
 app.use('/api/community', require('./community'));
 app.use('/api/wellness',  require('./wellness.cross'));
 // big-change: the Combined (cross-agent) analysis — score-free, dynamic, on wellness_bc_*.
 app.use('/api/wellness-combined', require('./wellness-combined.bc.agent'));
+// big-change: Health Intelligence Fusion — our-data × their-data impacts, readiness, evening briefing.
+app.use('/api/wellness-fusion', require('./wellness-fusion.bc.agent'));
 app.use('/api/wellness/v2', require('./wellness-cross-v2'));
 app.use('/webhooks/revenuecat', require('./lib/revenuecat-webhook'));
 app.use('/api/analytics', require('./lib/analytics-api'));
@@ -1744,6 +1755,45 @@ app.post('/api/account/delete', getDeviceId, async (req, res) => {
     const alertDeletes = alertsSnapshot.docs.map(doc => doc.ref.delete());
     await Promise.all(alertDeletes);
 
+    // ── DELETE ALL WELLNESS DATA (the real store) ────────────────────────────
+    // The legacy deletes above only cover the old `users`/`watching`/`checkins`
+    // collections. ALL current user data lives under wellness_* / wellness_bc_*
+    // (device-ID keyed, with agents/* subcollections under the user doc). Apple
+    // (5.1.1(v)) + GDPR require the account-delete to actually remove server data,
+    // not just local state. recursiveDelete nukes the doc AND its subcollections;
+    // it is a safe no-op when the doc doesn't exist. Each delete is isolated so a
+    // single failure never leaves the whole request half-done silently — we collect
+    // errors and still report which parts succeeded.
+    const WELLNESS_BASES = [
+      'users', 'onboarding', 'meta', 'snapshots', 'reports', 'journal',
+      'feedback', 'assistant_memory', 'aggregates', 'summary', 'label',
+      'score', 'score_baseline',
+      'fitness', 'nutrition', 'mind', 'sleep', 'water', 'fasting', 'breath',
+    ];
+    const wellnessRefs = [];
+    for (const base of WELLNESS_BASES) {
+      // Both the live namespace (wellness_<base>) and the big-change namespace
+      // (wellness_bc_<base>) so we don't strand data on whichever is active.
+      wellnessRefs.push(db.collection(`wellness_${base}`).doc(deviceId));
+      wellnessRefs.push(db.collection(`wellness_bc_${base}`).doc(deviceId));
+    }
+    const wellnessErrors = [];
+    let wellnessDeleted = 0;
+    await Promise.all(wellnessRefs.map(async (ref) => {
+      try {
+        await db.recursiveDelete(ref);
+        wellnessDeleted++;
+      } catch (e) {
+        wellnessErrors.push(`${ref.path}: ${e && e.message ? e.message : 'error'}`);
+      }
+    }));
+    if (wellnessErrors.length) {
+      log.error('Delete account — some wellness deletes failed:', wellnessErrors);
+    }
+    // Bust per-user caches so nothing stale is served after deletion.
+    try { require('./lib/user-anchor').invalidateAnchor(deviceId); } catch {}
+    try { require('./lib/voice-realtime').invalidateBriefing(deviceId); } catch {}
+
     res.json({
       success: true,
       deleted: {
@@ -1752,7 +1802,10 @@ app.post('/api/account/delete', getDeviceId, async (req, res) => {
         watchingEntriesWatcher: watchingAsWatcherSnap.size,
         checkins: checkinsSnapshot.size,
         alerts: alertsSnapshot.size,
+        wellnessDocs: wellnessDeleted,
       },
+      // Surface partial failures instead of pretending success — the FE can retry.
+      wellnessErrors: wellnessErrors.length ? wellnessErrors : undefined,
     });
   } catch (error) {
     log.error('Delete account error:', error);

@@ -50,8 +50,15 @@ router.post('/complete', async (req, res) => {
         ? [profile.primary_goal]
         : [...new Set([...asArr(profile.needs), ...asArr(profile.fitness_goal), ...asArr(profile.nutrition_goal), ...asArr(profile.mind_focus)])];
 
+    // All the doc writes below are independent (different docs) — we accumulate them into ONE Firestore
+    // batch and commit a SINGLE round-trip at the end. Previously these were 8 sequential awaited .set()
+    // calls (≈9 round-trips incl. the read), which is why onboarding "Save" hung ~10–15s on a warm-but-far
+    // Fly↔Firestore hop (and worse on a cold machine). Only the read below stays sequential (needed for the
+    // registration anchor). Batch stays well under Firestore's 500-op limit.
+    const batch = admin.firestore().batch();
+
     // 1) Full onboarding answers.
-    await onboardingDoc(id).set(
+    batch.set(onboardingDoc(id),
       {
         deviceId: id,
         ...profile,
@@ -88,7 +95,15 @@ router.post('/complete', async (req, res) => {
       // Previously asked-but-dropped — now persisted + queryable (sleep coach, briefing, notifications).
       sleep_schedule: { bedtime: profile.sleep_bedtime || null, wake: profile.sleep_wake || null },
       reminder_time: profile.reminder_time || existing?.reminder_time || null,
-      notifications_enabled: typeof profile.notifications_enabled === 'boolean' ? profile.notifications_enabled : (existing?.notifications_enabled ?? null),
+      // Accept a real boolean OR the string 'true'/'false' the FE step sends — coerce so the
+      // user's onboarding notification choice actually reaches the canonical field the crons read.
+      notifications_enabled: (() => {
+        const v = profile.notifications_enabled;
+        if (typeof v === 'boolean') return v;
+        if (v === 'true') return true;
+        if (v === 'false') return false;
+        return existing?.notifications_enabled ?? null;
+      })(),
       registration_date: existing?.registration_date || dateStr(new Date(), regTz),
       registration_tz_offset: regTz,
       // IANA zone (e.g. "America/Los_Angeles") — DST-correct local-time scheduling for daily report /
@@ -106,9 +121,7 @@ router.post('/complete', async (req, res) => {
     if (!snap.exists) {
       userPatch.createdAt = serverTimestamp();
     }
-    await userDoc(id).set(userPatch, { merge: true });
-    // Bust the 5-min anchor cache so the FIRST post-onboarding /analysis sees the fresh anchor.
-    try { require('./lib/user-anchor').invalidateAnchor(id); } catch { /* non-fatal */ }
+    batch.set(userDoc(id), userPatch, { merge: true });
 
     // 3) Initialise the FITNESS agent doc so it ALWAYS exists before the first log. Without this,
     //    the very first /log (and action generation, readiness, etc.) call `.update()` on a doc
@@ -127,10 +140,7 @@ router.post('/complete', async (req, res) => {
       injury_notes: 'none',
       days_per_week: 3,
     };
-    await userDoc(id)
-      .collection('agents')
-      .doc('fitness')
-      .set(
+    batch.set(userDoc(id).collection('agents').doc('fitness'),
         { setup: fitnessSetup, setup_completed: true, created_at: serverTimestamp() },
         { merge: true },
       );
@@ -146,10 +156,7 @@ router.post('/complete', async (req, res) => {
     const fat_target = Math.round((cal * 0.27) / 9); // ~27% of calories from fat
     const carb_target = Math.max(0, Math.round((cal - prot * 4 - fat_target * 9) / 4)); // remainder → carbs
     const water_cups = Number(t.water) > 0 ? Math.max(4, Math.round(Number(t.water) / 0.25)) : 8;
-    await userDoc(id)
-      .collection('agents')
-      .doc('nutrition')
-      .set(
+    batch.set(userDoc(id).collection('agents').doc('nutrition'),
         {
           calorie_target: cal,
           protein_target: prot,
@@ -172,10 +179,7 @@ router.post('/complete', async (req, res) => {
     const targetSleepHours = Number(t.sleep_hours) > 0 ? Number(t.sleep_hours) : 8;
     const targetBedtime = profile.target_bedtime || profile.sleep_bedtime || '23:00';
     const targetWake = profile.target_wake || profile.sleep_wake || '07:00'; // was asked but dropped — now used
-    await userDoc(id)
-      .collection('agents')
-      .doc('sleep')
-      .set(
+    batch.set(userDoc(id).collection('agents').doc('sleep'),
         {
           target_sleep_hours: targetSleepHours,
           target_bedtime: targetBedtime,
@@ -194,10 +198,7 @@ router.post('/complete', async (req, res) => {
     const fastingProtocol = profile.fasting_protocol || profile.protocol || '16:8';
     const protoHours = { '12:12': 12, '14:10': 14, '16:8': 16, '18:6': 18, '20:4': 20, 'omad': 23, '5:2': 16 };
     const targetFastHours = Number(protoHours[fastingProtocol]) || 16;
-    await userDoc(id)
-      .collection('agents')
-      .doc('fasting')
-      .set(
+    batch.set(userDoc(id).collection('agents').doc('fasting'),
         {
           setup: { protocol: fastingProtocol, target_fast_hours: targetFastHours },
           target_fast_hours: targetFastHours,
@@ -214,10 +215,7 @@ router.post('/complete', async (req, res) => {
     // 7) Initialise the WATER agent doc so the first log / analysis never hits a missing doc.
     //    daily_goal_ml from onboarding water target (liters → ml), clamped to a sane range.
     const waterGoalMl = Number(t.water) > 0 ? Math.min(6000, Math.max(1000, Math.round((Number(t.water) * 1000) / 50) * 50)) : 2500;
-    await userDoc(id)
-      .collection('agents')
-      .doc('water')
-      .set(
+    batch.set(userDoc(id).collection('agents').doc('water'),
         {
           setup: { daily_goal_ml: waterGoalMl, recommended_goal_ml: waterGoalMl, activity_level: profile.activity_level || 'moderate', climate: profile.climate || 'temperate', weight_kg: Number(profile.weight_kg) || null },
           daily_goal_ml: waterGoalMl,
@@ -230,10 +228,7 @@ router.post('/complete', async (req, res) => {
       );
 
     // 8) Initialise the MIND/MOOD agent doc so the first check-in / analysis never hits a missing doc.
-    await userDoc(id)
-      .collection('agents')
-      .doc('mind')
-      .set(
+    batch.set(userDoc(id).collection('agents').doc('mind'),
         {
           setup: { reminder_time_min: 20 * 60 },
           checkin_count: 0,
@@ -245,7 +240,30 @@ router.post('/complete', async (req, res) => {
         { merge: true },
       );
 
-    return res.json({ ok: true, deviceId: id, focus, namespace: DATA_NAMESPACE });
+    // 9) Initialise the BREATH agent doc (7th agent) so the first session / analysis never hits a
+    // missing doc. Moment-first breathwork; defaults are neutral — the app picks a moment each time.
+    batch.set(userDoc(id).collection('agents').doc('breath'),
+        {
+          setup: { daily_target_minutes: 5, week_day_target: 4 },
+          session_count: 0,
+          last_moment: null,
+          setup_completed: true,
+          created_at: serverTimestamp(),
+        },
+        { merge: true },
+      );
+
+    // ONE commit for all 9 writes — the single network hop that replaces the old sequential ones.
+    await batch.commit();
+    // Bust the 5-min anchor cache so the FIRST post-onboarding /analysis sees the fresh anchor.
+    try { require('./lib/user-anchor').invalidateAnchor(id); } catch { /* non-fatal */ }
+    // Bust the voice briefing cache too: profile/body metrics/goals are voice-critical and should be
+    // reflected in the very next call, not after the short prewarm TTL expires.
+    try { require('./lib/voice-realtime').invalidateBriefing(id); } catch { /* non-fatal */ }
+
+    // Return the registration anchor so the FE can seed AsyncStorage('registrationDate') at
+    // onboarding completion — the day-one-value SSoT that streaks/widgets/scoring clamp to.
+    return res.json({ ok: true, deviceId: id, focus, namespace: DATA_NAMESPACE, registration_date: userPatch.registration_date, anchor_date: userPatch.registration_date });
   } catch (e) {
     if (globalThis.log && globalThis.log.error) {
       globalThis.log.error('[bc-onboarding] complete failed', e);

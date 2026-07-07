@@ -1,13 +1,14 @@
 'use strict';
 
 // ═══════════════════════════════════════════════════════════════
-// NUTRITION AGENT — Pulse Backend
+// NUTRITION AGENT — Wellness OS Backend
 // All routes, AI food recognition, chat, proactive cron.
 // Mounted at /api/nutrition in server.js
 // ═══════════════════════════════════════════════════════════════
 
 const express = require('express');
 const router  = express.Router();
+const requireAccess = require('./lib/require-access'); // server-side premium gate for LLM endpoints
 const admin   = require('firebase-admin');
 const { OpenAI } = require('openai');
 const cron    = require('node-cron');
@@ -16,6 +17,7 @@ const { MODELS, OPENAI_TIMEOUT_MS, safeJSON, assertImageSize, openaiStrict } = r
 const { callGeminiVision, isGeminiAvailable, VISION_MODEL_PRIMARY, hashImages } = require('./lib/vision-router');
 const { resolveLanguage, appendLanguageInstruction } = require('./lib/i18n-prompt');
 const { withCron, shouldRunCron } = require('./lib/cron-helper');
+const { getUserNotifContext } = require('./lib/cron-user-context');
 const { resolveAnchor } = require('./lib/user-anchor');
 const { assertLoggableDate, sendLogGuardError } = require('./lib/log-guard');
 
@@ -43,7 +45,10 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, timeout: OPENAI_
 const db = () => admin.firestore();
 
 // ─── Firestore path helpers ───────────────────────────────────
-const userDoc  = (id) => db().collection('wellness_users').doc(id);
+// bc-aware: resolves wellness_bc_users/{id} (was legacy wellness_users) so the
+// proactive cron + fall-through handlers operate on big-change users. Same
+// subcollection names → all downstream helpers "just work" on bc.
+const userDoc  = (id) => require('./lib/collections').userDoc(id);
 const nutDoc   = (id) => userDoc(id).collection('agents').doc('nutrition');
 const logsCol  = (id) => nutDoc(id).collection('food_logs');
 const chatsCol = (id) => nutDoc(id).collection('nutrition_chats');
@@ -755,7 +760,7 @@ async function buildNutritionContext(deviceId) {
   const avgCals7d  = daysLogged.length ? Math.round(daysLogged.reduce((s, d) => s + last7Days[d].cals, 0) / daysLogged.length) : null;
   const protHitDays = daysLogged.filter(d => last7Days[d].prot >= protTarget * 0.9).length;
 
-  return `You are the Nutrition Coach in Pulse — a deeply personal AI nutrition coach. You are not ChatGPT. You have been privately observing ${name}'s eating patterns and you know their data in detail.
+  return `You are the Nutrition Coach in Wellness OS — a deeply personal AI nutrition coach. You are not ChatGPT. You have been privately observing ${name}'s eating patterns and you know their data in detail.
 
 Your rule: if you say something a stranger could have said, you have failed. Every sentence must reflect their specific NUTRITION data, their specific goals, their specific patterns.
 
@@ -2159,7 +2164,7 @@ async function _multiShotVision(shotsBase64, userCtx, hasDepth, hasFiducial) {
 }
 
 // ─── POST /vision/analyze — full pipeline ──
-router.post('/vision/analyze', async (req, res) => {
+router.post('/vision/analyze', requireAccess, async (req, res) => {
   const t0 = Date.now();
   try {
     const {
@@ -3377,7 +3382,7 @@ router.post('/describe/transcribe', async (req, res) => {
   }
 });
 
-router.post('/describe', async (req, res) => {
+router.post('/describe', requireAccess, async (req, res) => {
   const { deviceId } = req.body || {};
   if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
   if (!_acquireLock(deviceId)) {
@@ -3722,18 +3727,31 @@ Return ONLY valid JSON: ["insight 1", "insight 2", "insight 3"]`;
 // ═══════════════════════════════════════════════════════════════
 async function runProactiveChecks() {
   try {
+    // bc users have no user-doc nutrition_setup_complete flag; enumerate all bc
+    // users and rely on the per-user nutDoc.setup_completed + focus gates below.
     const usersSnap = await db()
-      .collection('wellness_users')
-      .where('nutrition_setup_complete', '==', true)
+      .collection(require('./lib/collections').ns('users'))
       .get();
 
     if (usersSnap.empty) return;
 
-    const today = dateStr();
+    // Hourly cron; each user gated to their OWN local morning (~8am). No-timezone users fall back to the
+    // historical 07:00 UTC slot so their behaviour is unchanged.
+    const serverHour = new Date().getUTCHours();
+    const MORNING_LOCAL_HOUR = 8;
 
     for (const uDoc of usersSnap.docs) {
       const deviceId = uDoc.id;
       const userData = uDoc.data();
+      // Only reach out about agents the user actually unlocked at onboarding.
+      if (Array.isArray(userData.focus_domains) && userData.focus_domains.length &&
+          !userData.focus_domains.includes('nutrition')) continue;
+
+      const ctx = await getUserNotifContext(db(), deviceId).catch(() => null);
+      const fireNow = ctx && ctx.hasUserTimezone ? ctx.localHour === MORNING_LOCAL_HOUR : serverHour === 7;
+      if (!fireNow) continue;
+      const today = ctx && ctx.hasUserTimezone ? ctx.localDateStr : dateStr();
+      const localDow = ctx && ctx.hasUserTimezone ? ctx.localNow.getUTCDay() : new Date().getUTCDay();
 
       if (userData.last_nutrition_proactive_date === today) continue;
 
@@ -3748,8 +3766,8 @@ async function runProactiveChecks() {
         let msg  = null;
         let type = null;
 
-        // Weekly protein summary (Monday morning)
-        if (!msg && new Date().getDay() === 1) {
+        // Weekly protein summary (Monday morning — user's LOCAL Monday)
+        if (!msg && localDow === 1) {
           const weekStart = dateStr(new Date(Date.now() - 7 * 86400000));
           const weekLogsSnap = await logsCol(deviceId)
             .where('date_str', '>=', weekStart).get();
@@ -3812,18 +3830,30 @@ async function runProactiveChecks() {
 // ─── Evening streak reminders — 8pm ──────────────────────────
 async function runStreakReminders() {
   try {
+    // bc users have no user-doc nutrition_setup_complete flag; enumerate all bc
+    // users and rely on the per-user nutDoc.setup_completed + focus gates below.
     const usersSnap = await db()
-      .collection('wellness_users')
-      .where('nutrition_setup_complete', '==', true)
+      .collection(require('./lib/collections').ns('users'))
       .get();
 
     if (usersSnap.empty) return;
 
-    const today = dateStr();
+    // Hourly cron; each user gated to their OWN local evening (~8pm). No-timezone users fall back to the
+    // historical 20:00 UTC slot so their behaviour is unchanged.
+    const serverHour = new Date().getUTCHours();
+    const EVENING_LOCAL_HOUR = 20;
 
     for (const uDoc of usersSnap.docs) {
       const deviceId = uDoc.id;
       const userData = uDoc.data();
+      // Only reach out about agents the user actually unlocked at onboarding.
+      if (Array.isArray(userData.focus_domains) && userData.focus_domains.length &&
+          !userData.focus_domains.includes('nutrition')) continue;
+
+      const ctx = await getUserNotifContext(db(), deviceId).catch(() => null);
+      const fireNow = ctx && ctx.hasUserTimezone ? ctx.localHour === EVENING_LOCAL_HOUR : serverHour === 20;
+      if (!fireNow) continue;
+      const today = ctx && ctx.hasUserTimezone ? ctx.localDateStr : dateStr();
 
       if (userData.last_nutrition_streak_reminder === today) continue;
 
@@ -4468,10 +4498,12 @@ router.post('/analysis/refresh', async (req, res) => {
 });
 
 if (shouldRunCron()) {
-  cron.schedule('0 7 * * *', withCron('nutrition:morning-proactive', async () => {
+  // Hourly — the handlers gate each user to their own local morning (8am) / evening (8pm); users without a
+  // stored timezone fall back to the original 07:00 / 20:00 UTC slots (byte-identical to before).
+  cron.schedule('0 * * * *', withCron('nutrition:morning-proactive', async () => {
     await runProactiveChecks();
   }, { ttlMs: 20 * 60_000 }), { timezone: 'UTC' });
-  cron.schedule('0 20 * * *', withCron('nutrition:evening-streak', async () => {
+  cron.schedule('0 * * * *', withCron('nutrition:evening-streak', async () => {
     await runStreakReminders();
   }, { ttlMs: 20 * 60_000 }), { timezone: 'UTC' });
 }
